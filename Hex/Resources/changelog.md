@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026.7.160
+
+### Minor Changes
+
+- Add direct OpenAI and Claude refinement providers with account-specific model selection and screen-aware image analysis.
+
+### Patch Changes
+
+- Reorganize refinement controls, set Option as the default refinement hotkey, and streamline supporting copy.
+- Require Screen Recording permission before enabling Screen-aware Dictation, with a direct route to the system setting.
+
 ## 2026.7.150
 
 ### Patch Changes
