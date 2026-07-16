@@ -37,6 +37,7 @@ struct AppFeature {
     var microphonePermission: PermissionStatus = .notDetermined
     var accessibilityPermission: PermissionStatus = .notDetermined
     var inputMonitoringPermission: PermissionStatus = .notDetermined
+    var screenRecordingPermission = false
   }
 
   enum Action: BindableAction {
@@ -50,7 +51,7 @@ struct AppFeature {
 
     // Permission actions
     case checkPermissions
-    case permissionsUpdated(mic: PermissionStatus, acc: PermissionStatus, input: PermissionStatus)
+    case permissionsUpdated(mic: PermissionStatus, acc: PermissionStatus, input: PermissionStatus, screenRecording: Bool)
     case appActivated
     case modelStatusEvaluated(Bool)
   }
@@ -138,6 +139,17 @@ struct AppFeature {
           }
         }
 
+      case .settings(.requestScreenRecording):
+        return .run { send in
+          let granted = await permissions.requestScreenRecording()
+          await send(.settings(.screenRecordingPermissionResponse(granted)))
+        }
+
+      case .settings(.openScreenRecordingSettings):
+        return .run { _ in
+          await permissions.openScreenRecordingSettings()
+        }
+
       case .settings:
         return .none
 
@@ -156,13 +168,21 @@ struct AppFeature {
           async let mic = permissions.microphoneStatus()
           async let acc = permissions.accessibilityStatus()
           async let input = permissions.inputMonitoringStatus()
-          await send(.permissionsUpdated(mic: mic, acc: acc, input: input))
+          async let screenRecording = permissions.screenRecordingStatus()
+          await send(.permissionsUpdated(mic: mic, acc: acc, input: input, screenRecording: screenRecording))
         }
 
-      case let .permissionsUpdated(mic, acc, input):
+      case let .permissionsUpdated(mic, acc, input, screenRecording):
         state.microphonePermission = mic
         state.accessibilityPermission = acc
         state.inputMonitoringPermission = input
+        state.screenRecordingPermission = screenRecording
+        if screenRecording {
+          state.settings.needsScreenRecordingPermission = false
+        } else if state.hexSettings.screenAwareDictationEnabled {
+          state.$hexSettings.withLock { $0.screenAwareDictationEnabled = false }
+          state.settings.needsScreenRecordingPermission = true
+        }
         return .none
 
       case .appActivated:

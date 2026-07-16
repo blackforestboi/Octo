@@ -6,7 +6,7 @@ public struct RefinementRequest: Equatable, Sendable {
 	public let mode: RefinementMode
 	public let instructions: String
 	public let provider: RefinementProvider
-	/// The OpenRouter model identifier. Other providers ignore this value.
+	/// The selected remote-provider model identifier.
 	public let modelID: String?
 	/// Optional screenshot and locally recognized text for screen-aware requests.
 	public let screenContext: ScreenContext?

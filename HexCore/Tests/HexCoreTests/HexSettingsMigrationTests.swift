@@ -34,7 +34,7 @@ final class HexSettingsMigrationTests: XCTestCase {
 			XCTAssertNil(decoded.openRouterModelID)
 			XCTAssertNil(decoded.screenAwareOpenRouterModelID)
 			XCTAssertEqual(decoded.screenAwareInputSource, .localOCR)
-		XCTAssertNil(decoded.refinedHotkey)
+		XCTAssertEqual(decoded.refinedHotkey, HotKey(key: nil, modifiers: [.option]))
 		XCTAssertTrue(decoded.includeSelectedTextInRefinement)
 	}
 
@@ -48,6 +48,14 @@ final class HexSettingsMigrationTests: XCTestCase {
 	func testNewSettingsEnableSuperFastModeByDefault() {
 		XCTAssertTrue(HexSettings().superFastModeEnabled)
 		XCTAssertEqual(HexSettings().stopDelayMilliseconds, 0)
+	}
+
+	func testNewSettingsUseOptionForRefinementHotkeyByDefault() {
+		XCTAssertEqual(HexSettings().refinedHotkey, HotKey(key: nil, modifiers: [.option]))
+	}
+
+	func testNewSettingsDisableScreenAwareDictationByDefault() {
+		XCTAssertFalse(HexSettings().screenAwareDictationEnabled)
 	}
 
 	func testInitNormalizesDoubleTapOnlyWhenLockDisabled() {

@@ -136,7 +136,7 @@ public struct HexSettings: Codable, Equatable, Sendable {
 				text: spokenRequest,
 				mode: .refined,
 				instructions: refinementInstructions.trimmingCharacters(in: .whitespacesAndNewlines),
-				provider: usesUploadedImage ? .openRouter : refinementProvider,
+			provider: usesUploadedImage && !refinementProvider.supportsImageInput ? .openRouter : refinementProvider,
 				modelID: usesUploadedImage ? (imageModelID ?? screenAwareOpenRouterModelID) : openRouterModelID,
 				screenContext: context,
 				screenAwareInputSource: inputSource
@@ -185,9 +185,9 @@ public struct HexSettings: Codable, Equatable, Sendable {
 			refinementInstructions: String = HexSettings.defaultRefinementInstructions,
 			openRouterModelID: String? = nil,
 			screenAwareOpenRouterModelID: String? = nil,
-			screenAwareDictationEnabled: Bool = true,
+			screenAwareDictationEnabled: Bool = false,
 			screenAwareInputSource: ScreenAwareInputSource = .localOCR,
-			refinedHotkey: HotKey? = nil,
+			refinedHotkey: HotKey? = .init(key: nil, modifiers: [.option]),
 		refinedDoubleTapLockEnabled: Bool = true,
 		refinedUseDoubleTapOnly: Bool = false,
 		refinedMinimumKeyTime: Double = HexCoreConstants.defaultMinimumKeyTime,
@@ -248,6 +248,17 @@ public struct HexSettings: Codable, Equatable, Sendable {
 		var container = encoder.container(keyedBy: HexSettingKey.self)
 		for field in HexSettingsSchema.fields {
 			try field.encode(self, into: &container)
+		}
+	}
+}
+
+private extension RefinementProvider {
+	var supportsImageInput: Bool {
+		switch self {
+		case .openRouter, .openAI, .anthropic:
+			true
+		case .apple, .gemini:
+			false
 		}
 	}
 }

@@ -729,17 +729,25 @@ final class RecordingRaceTests: XCTestCase {
 		await store.finish()
 	}
 
-	func testScreenAwareCountdownEligibilityRequiresHoldModelAndKey() {
-		var settings = HexSettings()
-		settings.screenAwareOpenRouterModelID = "vision-model"
+	func testScreenAwareCountdownEligibilityAllowsLocalOCRWithoutOpenRouter() {
+		var settings = HexSettings(screenAwareDictationEnabled: true)
 
 		XCTAssertTrue(ScreenAwareActivation.shouldStartCountdown(
 			isPressAndHold: true,
 			settings: settings,
-			hasOpenRouterKey: true
+			hasOpenRouterKey: false
 		))
 		XCTAssertFalse(ScreenAwareActivation.shouldStartCountdown(
 			isPressAndHold: false,
+			settings: settings,
+			hasOpenRouterKey: false
+		))
+
+		settings.screenAwareInputSource = .image
+		settings.screenAwareOpenRouterModelID = "vision-model"
+
+		XCTAssertTrue(ScreenAwareActivation.shouldStartCountdown(
+			isPressAndHold: true,
 			settings: settings,
 			hasOpenRouterKey: true
 		))

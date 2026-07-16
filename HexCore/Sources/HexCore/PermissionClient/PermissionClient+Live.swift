@@ -15,12 +15,15 @@ extension PermissionClient: DependencyKey {
       microphoneStatus: { await live.microphoneStatus() },
       accessibilityStatus: { live.accessibilityStatus() },
       inputMonitoringStatus: { live.inputMonitoringStatus() },
+      screenRecordingStatus: { live.screenRecordingStatus() },
       requestMicrophone: { await live.requestMicrophone() },
       requestAccessibility: { await live.requestAccessibility() },
       requestInputMonitoring: { await live.requestInputMonitoring() },
+      requestScreenRecording: { await live.requestScreenRecording() },
       openMicrophoneSettings: { await live.openMicrophoneSettings() },
       openAccessibilitySettings: { await live.openAccessibilitySettings() },
       openInputMonitoringSettings: { await live.openInputMonitoringSettings() },
+      openScreenRecordingSettings: { await live.openScreenRecordingSettings() },
       observeAppActivation: { live.observeAppActivation() }
     )
   }
@@ -102,6 +105,38 @@ actor PermissionClientLive {
     await MainActor.run {
       _ = NSWorkspace.shared.open(
         URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")!
+      )
+    }
+  }
+
+  // MARK: - Screen Recording Permissions
+
+  nonisolated func screenRecordingStatus() -> Bool {
+    CGPreflightScreenCaptureAccess()
+  }
+
+  func requestScreenRecording() async -> Bool {
+    guard !screenRecordingStatus() else {
+      logger.info("Screen Recording permission already granted")
+      return true
+    }
+
+    logger.info("Requesting Screen Recording permission...")
+    let granted = await MainActor.run { CGRequestScreenCaptureAccess() }
+    logger.info("Screen Recording permission granted: \(granted)")
+
+    if !granted {
+      await openScreenRecordingSettings()
+    }
+
+    return granted
+  }
+
+  func openScreenRecordingSettings() async {
+    logger.info("Opening Screen Recording settings in System Settings...")
+    await MainActor.run {
+      _ = NSWorkspace.shared.open(
+        URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!
       )
     }
   }

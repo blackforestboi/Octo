@@ -38,10 +38,34 @@ enum ScreenAwareActivation {
 	}
 
 	private static func isAvailable(settings: HexSettings, hasOpenRouterKey: Bool) -> Bool {
-		guard settings.isScreenAwareDictationConfigured, hasOpenRouterKey else { return false }
-		guard settings.screenAwareInputSource.uploadsScreenshot else { return true }
-		return OpenRouterModelCatalog.selectedImageCapableModelID(for: settings) != nil
-			|| settings.hasScreenAwareImageFallbackModel
+		guard settings.isScreenAwareDictationConfigured else { return false }
+		// Local OCR is refined by the selected provider; it does not need a vision
+		// model, but remote providers still need their own credential.
+		guard settings.screenAwareInputSource.uploadsScreenshot else {
+			switch settings.refinementProvider {
+			case .apple:
+				return true
+			case .gemini:
+				return !(GeminiAPIKeyStore.read() ?? "").isEmpty
+			case .openRouter:
+				return hasOpenRouterKey
+			case .openAI:
+				return !(OpenAIAPIKeyStore.read() ?? "").isEmpty
+			case .anthropic:
+				return !(AnthropicAPIKeyStore.read() ?? "").isEmpty
+			}
+		}
+		guard settings.hasScreenAwareImageFallbackModel else { return false }
+		switch settings.refinementProvider {
+		case .openAI:
+			return !(OpenAIAPIKeyStore.read() ?? "").isEmpty
+		case .anthropic:
+			return !(AnthropicAPIKeyStore.read() ?? "").isEmpty
+		case .openRouter:
+			return hasOpenRouterKey
+		case .apple, .gemini:
+			return hasOpenRouterKey
+		}
 	}
 }
 
@@ -554,12 +578,10 @@ private extension TranscriptionFeature {
 		let refinedHotkey = hexSettings.refinedHotkey
 		let shouldMonitorRefinedHotkey = refinedHotkey.map { !$0.conflicts(with: hexSettings.hotkey) } ?? false
 		if let refinedHotkey, shouldMonitorRefinedHotkey {
-			let hasOpenRouterKey = !(OpenRouterAPIKeyStore.read() ?? "").isEmpty
 			refinedHotKeyProcessor.hotkey = refinedHotkey
 			refinedHotKeyProcessor.doubleTapLockEnabled = hexSettings.refinedDoubleTapLockEnabled
 			let usesScreenAwareDoubleTapActivation = hexSettings.refinedDoubleTapLockEnabled
-				&& hexSettings.isScreenAwareDictationConfigured
-				&& hasOpenRouterKey
+				&& ScreenAwareActivation.isAvailable(with: hexSettings)
 			// Screen Aware reserves the held second tap. This deliberately makes the
 			// first tap inert even when the separate "Use double-tap only" preference
 			// is off, so double-tap lock has one unambiguous Screen Aware sequence.

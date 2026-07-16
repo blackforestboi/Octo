@@ -5,4 +5,6 @@ public enum RefinementProvider: String, Codable, CaseIterable, Equatable, Sendab
 	case apple
 	case gemini
 	case openRouter
+	case openAI
+	case anthropic
 }

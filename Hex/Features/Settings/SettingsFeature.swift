@@ -65,6 +65,8 @@ struct SettingsFeature {
     // Model Management
     var modelDownload = ModelDownloadFeature.State()
     var shouldFlashModelSection = false
+    var needsScreenRecordingPermission = false
+    var isRequestingScreenRecordingPermission = false
 
   }
 
@@ -99,6 +101,10 @@ struct SettingsFeature {
     case requestMicrophone
     case requestAccessibility
     case requestInputMonitoring
+    case requestScreenRecording
+    case screenRecordingPermissionResponse(Bool)
+    case setScreenAwareDictationEnabled(Bool)
+    case openScreenRecordingSettings
 
     // Microphone selection
     case loadAvailableInputDevices
@@ -265,6 +271,25 @@ struct SettingsFeature {
           }
         }
 
+        return .none
+
+      case let .setScreenAwareDictationEnabled(isEnabled):
+        guard isEnabled else {
+          state.$hexSettings.withLock { $0.screenAwareDictationEnabled = false }
+          state.needsScreenRecordingPermission = false
+          return .none
+        }
+
+        guard !state.isRequestingScreenRecordingPermission else { return .none }
+        state.isRequestingScreenRecordingPermission = true
+        return .send(.requestScreenRecording)
+
+      case let .screenRecordingPermissionResponse(isGranted):
+        state.isRequestingScreenRecordingPermission = false
+        state.needsScreenRecordingPermission = !isGranted
+        if isGranted {
+          state.$hexSettings.withLock { $0.screenAwareDictationEnabled = true }
+        }
         return .none
 
       case .task:
@@ -568,6 +593,14 @@ struct SettingsFeature {
 
       case .requestInputMonitoring:
         settingsLogger.info("User requested input monitoring permission from settings")
+        return .none
+
+      case .requestScreenRecording:
+        settingsLogger.info("User requested Screen Recording permission from settings")
+        return .none
+
+      case .openScreenRecordingSettings:
+        settingsLogger.info("User requested Screen Recording settings from settings")
         return .none
 
       // Model Management

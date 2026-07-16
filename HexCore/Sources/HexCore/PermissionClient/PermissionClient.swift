@@ -2,7 +2,7 @@ import Dependencies
 import DependenciesMacros
 import Foundation
 
-/// A client for managing system permissions (microphone, accessibility) in a composable way.
+/// A client for managing microphone, accessibility, input monitoring, and Screen Recording permissions.
 ///
 /// This client provides a unified interface for checking permission status, requesting permissions,
 /// and monitoring app activation events to reactively update permission state.
@@ -43,6 +43,9 @@ public struct PermissionClient: Sendable {
   /// Uses `IOHIDCheckAccess` to determine whether we can listen for global keyboard events.
   public var inputMonitoringStatus: @Sendable () -> PermissionStatus = { .notDetermined }
 
+  /// Check whether Screen Recording permission is currently granted.
+  public var screenRecordingStatus: @Sendable () -> Bool = { false }
+
   /// Request microphone permission from the user.
   ///
   /// If permission is `.notDetermined`, this will show the system permission dialog.
@@ -62,6 +65,12 @@ public struct PermissionClient: Sendable {
   /// Triggers the consent dialog introduced in macOS Sequoia when listening for keyboard events.
   public var requestInputMonitoring: @Sendable () async -> Bool = { false }
 
+  /// Request Screen Recording permission from the user.
+  ///
+  /// This registers Hex with the system permission service, then opens the Screen Recording
+  /// privacy panel when the user still needs to enable it manually.
+  public var requestScreenRecording: @Sendable () async -> Bool = { false }
+
   /// Open System Settings to the microphone privacy panel.
   ///
   /// Useful when permission is denied and the user needs to manually change it.
@@ -74,6 +83,9 @@ public struct PermissionClient: Sendable {
 
   /// Open System Settings to the Input Monitoring privacy panel.
   public var openInputMonitoringSettings: @Sendable () async -> Void = {}
+
+  /// Open System Settings to the Screen Recording privacy panel.
+  public var openScreenRecordingSettings: @Sendable () async -> Void = {}
 
   /// Observe app activation events.
   ///

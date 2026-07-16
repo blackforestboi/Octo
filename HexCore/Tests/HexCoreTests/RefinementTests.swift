@@ -319,6 +319,29 @@ final class RefinementTests: XCTestCase {
 		XCTAssertTrue(HexSettings(screenAwareOpenRouterModelID: "provider/vision-model").isScreenAwareDictationConfigured)
 	}
 
+	func testDirectProviderRequestUsesTheSelectedModel() {
+		let settings = HexSettings(refinementProvider: .openAI, openRouterModelID: "gpt-5.6")
+
+		let request = settings.refinementRequest(for: "clean this", mode: .refined)
+
+		XCTAssertEqual(request.provider, .openAI)
+		XCTAssertEqual(request.modelID, "gpt-5.6")
+	}
+
+	func testDirectProviderUsesScreenAwareImageModel() {
+		let context = ScreenContext(imagePNGData: Data(), recognizedText: "", pixelWidth: 1, pixelHeight: 1, cursorX: 0, cursorY: 0)
+		let settings = HexSettings(
+			refinementProvider: .anthropic,
+			screenAwareOpenRouterModelID: "claude-sonnet-latest",
+			screenAwareInputSource: .image
+		)
+
+		let request = settings.screenAwareRequest(for: "describe this", context: context)
+
+		XCTAssertEqual(request.provider, .anthropic)
+		XCTAssertEqual(request.modelID, "claude-sonnet-latest")
+	}
+
 	func testModifierOnlyHotkeyConflictIsDetected() {
 		let regular = HotKey(key: nil, modifiers: [.option])
 		let refined = HotKey(key: .space, modifiers: [.option])

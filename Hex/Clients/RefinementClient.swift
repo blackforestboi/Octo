@@ -82,6 +82,28 @@ extension RefinementClient: DependencyKey {
 					screenContext: request.screenContext,
 					screenAwareInputSource: request.screenAwareInputSource
 				)
+		case .openAI:
+			guard let apiKey = OpenAIAPIKeyStore.read(), !apiKey.isEmpty,
+				  let modelID = request.modelID, !modelID.isEmpty
+			else { throw RefinementError.missingConfiguration }
+			return try await openAIProcess(
+				prompt: prompt,
+				apiKey: apiKey,
+				modelID: modelID,
+				screenContext: request.screenContext,
+				screenAwareInputSource: request.screenAwareInputSource
+			)
+		case .anthropic:
+			guard let apiKey = AnthropicAPIKeyStore.read(), !apiKey.isEmpty,
+				  let modelID = request.modelID, !modelID.isEmpty
+			else { throw RefinementError.missingConfiguration }
+			return try await anthropicProcess(
+				prompt: prompt,
+				apiKey: apiKey,
+				modelID: modelID,
+				screenContext: request.screenContext,
+				screenAwareInputSource: request.screenAwareInputSource
+			)
 		}
 	}
 
@@ -178,9 +200,99 @@ extension RefinementClient: DependencyKey {
 		}
 	}
 
+	private static func openAIProcess(
+		prompt: RefinementPrompt,
+		apiKey: String,
+		modelID: String,
+		screenContext: ScreenContext?,
+		screenAwareInputSource: ScreenAwareInputSource
+	) async throws -> String {
+		let imageUpload = ScreenAwareImageUpload.upload(for: screenContext, source: screenAwareInputSource)
+		var request = URLRequest(url: URL(string: "https://api.openai.com/v1/responses")!)
+		request.httpMethod = "POST"
+		request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+		request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+		request.httpBody = try JSONEncoder().encode(
+			OpenAIResponseRequest(
+				model: modelID,
+				instruction: prompt.systemInstruction,
+				text: prompt.sourceText,
+				imageData: imageUpload?.data,
+				imageMIMEType: imageUpload?.mimeType
+			)
+		)
+		return try await remoteResult(
+			request,
+			provider: "OpenAI",
+			decode: { try JSONDecoder().decode(OpenAIResponse.self, from: $0).text }
+		)
+	}
+
+	private static func anthropicProcess(
+		prompt: RefinementPrompt,
+		apiKey: String,
+		modelID: String,
+		screenContext: ScreenContext?,
+		screenAwareInputSource: ScreenAwareInputSource
+	) async throws -> String {
+		let imageUpload = ScreenAwareImageUpload.upload(for: screenContext, source: screenAwareInputSource)
+		var request = URLRequest(url: URL(string: "https://api.anthropic.com/v1/messages")!)
+		request.httpMethod = "POST"
+		request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+		request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+		request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+		request.httpBody = try JSONEncoder().encode(
+			AnthropicMessagesRequest(
+				model: modelID,
+				instruction: prompt.systemInstruction,
+				text: prompt.sourceText,
+				imageData: imageUpload?.data,
+				imageMIMEType: imageUpload?.mimeType
+			)
+		)
+		return try await remoteResult(
+			request,
+			provider: "Anthropic",
+			decode: { try JSONDecoder().decode(AnthropicMessagesResponse.self, from: $0).text }
+		)
+	}
+
+	private static func remoteResult(
+		_ request: URLRequest,
+		provider: String,
+		decode: (Data) throws -> String?
+	) async throws -> String {
+		do {
+			let (data, response) = try await longRunningRefinementSession.data(for: request)
+			guard let response = response as? HTTPURLResponse, response.statusCode == 200 else {
+				let statusCode = (response as? HTTPURLResponse)?.statusCode
+				let providerMessage = RemoteProviderError.message(from: data)
+				refinementLogger.error("\(provider, privacy: .public) request failed status=\(statusCode ?? -1) message=\(providerMessage ?? "none", privacy: .private)")
+				throw RefinementError.requestFailed(statusCode: statusCode, message: providerMessage)
+			}
+			guard let result = try decode(data) else { throw RefinementError.invalidResponse }
+			return result
+		} catch let error as RefinementError {
+			throw error
+		} catch {
+			refinementLogger.error("\(provider, privacy: .public) transport request failed: \(error.localizedDescription, privacy: .private)")
+			throw RefinementError.transportFailed(error.localizedDescription)
+		}
+	}
+
 	/// Keeps the stored PNG for History while sending a smaller, same-dimension
 	/// JPEG to the provider. If conversion fails, the original PNG remains valid input.
 	private enum ScreenAwareImageUpload {
+		static func upload(for context: ScreenContext?, source: ScreenAwareInputSource) -> (data: Data, mimeType: String)? {
+			context.flatMap { context in
+				guard source.uploadsScreenshot else { return nil }
+				if let jpegData = jpegData(from: context.imagePNGData), jpegData.count < context.imagePNGData.count {
+					return (data: jpegData, mimeType: "image/jpeg")
+				}
+				return (data: context.imagePNGData, mimeType: "image/png")
+			}
+		}
+
 		static func jpegData(from pngData: Data) -> Data? {
 			guard let image = NSImage(data: pngData),
 				  let tiffData = image.tiffRepresentation,
@@ -324,6 +436,131 @@ private struct OpenRouterRequest: Encodable {
 
 private enum RefinementOutput {
 	static let maximumTokens = 2_048
+}
+
+private struct OpenAIResponseRequest: Encodable {
+	let model: String
+	let instructions: String
+	let input: [Input]
+	let maxOutputTokens = RefinementOutput.maximumTokens
+
+	init(model: String, instruction: String, text: String, imageData: Data?, imageMIMEType: String?) {
+		self.model = model
+		instructions = instruction
+		var content: [Input.Content] = [.text(text)]
+		if let imageData, let imageMIMEType {
+			content.append(.image("data:\(imageMIMEType);base64,\(imageData.base64EncodedString())"))
+		}
+		input = [.init(content: content)]
+	}
+
+	struct Input: Encodable {
+		let role = "user"
+		let content: [Content]
+
+		struct Content: Encodable {
+			let type: String
+			let text: String?
+			let imageURL: String?
+
+			static func text(_ text: String) -> Self { .init(type: "input_text", text: text, imageURL: nil) }
+			static func image(_ url: String) -> Self { .init(type: "input_image", text: nil, imageURL: url) }
+
+			enum CodingKeys: String, CodingKey {
+				case type, text
+				case imageURL = "image_url"
+			}
+		}
+	}
+
+	enum CodingKeys: String, CodingKey {
+		case model, instructions, input
+		case maxOutputTokens = "max_output_tokens"
+	}
+}
+
+private struct OpenAIResponse: Decodable {
+	let outputText: String?
+	let output: [Output]?
+
+	var text: String? {
+		outputText ?? output?.lazy.compactMap(\.content).joined().first(where: { $0.type == "output_text" })?.text
+	}
+
+	struct Output: Decodable { let content: [Content]? }
+	struct Content: Decodable { let type: String; let text: String? }
+
+	enum CodingKeys: String, CodingKey {
+		case outputText = "output_text"
+		case output
+	}
+}
+
+private struct AnthropicMessagesRequest: Encodable {
+	let model: String
+	let system: String
+	let messages: [Message]
+	let maxTokens = RefinementOutput.maximumTokens
+
+	init(model: String, instruction: String, text: String, imageData: Data?, imageMIMEType: String?) {
+		self.model = model
+		system = instruction
+		var content: [Message.Content] = [.text(text)]
+		if let imageData, let imageMIMEType {
+			content.append(.image(data: imageData.base64EncodedString(), mimeType: imageMIMEType))
+		}
+		messages = [.init(content: content)]
+	}
+
+	struct Message: Encodable {
+		let role = "user"
+		let content: [Content]
+
+		struct Content: Encodable {
+			let type: String
+			let text: String?
+			let source: Source?
+
+			static func text(_ text: String) -> Self { .init(type: "text", text: text, source: nil) }
+			static func image(data: String, mimeType: String) -> Self {
+				.init(type: "image", text: nil, source: .init(type: "base64", mediaType: mimeType, data: data))
+			}
+
+			struct Source: Encodable {
+				let type: String
+				let mediaType: String
+				let data: String
+
+				enum CodingKeys: String, CodingKey {
+					case type, data
+					case mediaType = "media_type"
+				}
+			}
+		}
+	}
+
+	enum CodingKeys: String, CodingKey {
+		case model, system, messages
+		case maxTokens = "max_tokens"
+	}
+}
+
+private struct AnthropicMessagesResponse: Decodable {
+	let content: [Content]
+	var text: String? { content.first(where: { $0.type == "text" })?.text }
+	struct Content: Decodable { let type: String; let text: String? }
+}
+
+private struct RemoteProviderError: Decodable {
+	let error: Detail?
+	let message: String?
+
+	struct Detail: Decodable { let message: String? }
+
+	static func message(from data: Data) -> String? {
+		let response = try? JSONDecoder().decode(Self.self, from: data)
+		return response?.error?.message ?? response?.message
+	}
 }
 
 private struct OpenRouterResponse: Decodable {
