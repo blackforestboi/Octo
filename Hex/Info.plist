@@ -7,7 +7,7 @@
 	<key>CFBundleIconFile</key>
 	<string>LegacyAppIcon</string>
 	<key>CFBundleShortVersionString</key>
-	<string>2026.7.160</string>
+	<string>2026.8.0</string>
 	<key>CFBundleVersion</key>
 	<string>90</string>
 	<key>NSAccessibilityUsageDescription</key>

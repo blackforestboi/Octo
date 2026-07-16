@@ -1,17 +1,32 @@
 # Changelog
 
-## 2026.7.160
+## 2026.8.0
 
 ### Minor Changes
 
-- Add direct OpenAI and Claude refinement providers with account-specific model selection and screen-aware image analysis.
+- 54fa065: Add screen-aware dictation with OCR, vision analysis, an active-mode indicator, a dedicated enable toggle, and activation-time capture. Choose a fast local Apple Vision OCR mode that keeps screenshots on-device, or upload a compressed analysis copy for visual questions while retaining the stored PNG locally. Local OCR follows the selected refinement model; uploads use it when it supports images and otherwise use an explicit fallback image model. Screen-aware requests return a direct answer to the spoken request without an app-imposed LLM timeout or leaked thinking markup. History now persists the screenshot at capture, audio before transcription, local transcript before AI processing, and final answer or errors immediately as each step completes; it keeps each run's playable audio, raw transcript, selected text, screen context, image size, output generation time, result, and processing errors, with controls to redo transcription or replay the full run. When refined double-tap lock is enabled, the first tap is inert, releasing the second starts normal refinement, and holding it activates Screen Aware.
+- 95681fb: Add optional transcript and selected-text refinement with Apple Intelligence, Gemini, or OpenRouter (#191). The refined hotkey supports optional spoken instructions, source-text replacement, configurable selected-text capture, and shared provider prompts while preserving recording, cancellation, persistence, and audio ownership behavior. Inspired by upstream PR #191 by Rohit Lal Chandani.
 
 ### Patch Changes
 
-- Reorganize refinement controls, set Option as the default refinement hotkey, and streamline supporting copy.
-- Require Screen Recording permission before enabling Screen-aware Dictation, with a direct route to the system setting.
+- 9c53738: Add configurable transcription stop delay
+- 7262490: Remove saved OpenRouter credentials when the API key is cleared
+- 6736023: Keep OpenRouter model controls together in the picker header and separate refinement hotkey settings into icon-labelled rows
+- 643d14d: Use a human-focused default refinement prompt
+- 8739929: Overhaul audio engine lifecycle: recover recordings across device/route changes instead of silently capturing nothing (#251, #252, #218, #226), rebuild the warm capture engine immediately when devices change while idle instead of leaving a stale engine running (#209), suspend the warm microphone while the screen is locked or asleep and rearm on wake, stop the sound-effects engine when idle (#209), and fix a crash on quit caused by racy audio teardown (#245)
+- 873efce: Allow modifier-only hotkeys to use double-tap-only mode and hide inactive hold controls (#78)
+- 2c5d8ae: Add Whisper Large v3 Turbo (632MB) to the model library: near large-v3 accuracy at several times the speed (#185). Whisper models are now labeled by their real sizes (Tiny, Base) instead of Small/Medium.
+- 0ae9a0b: Preserve final microphone audio when recordings stop
+- 54fa065: Cancel hotkey capture when clicking away from a shortcut field.
+- 9aeb40e: Clarify transcription refinement settings and shortcut controls
+- d5b9db7: Fix Gemini refinement requests, show an empty state for OpenRouter model searches, and harden release tag handling (#257).
+- 9f51a59: Make history audio playback seekable with pause and resume controls.
+- a57f0ca: Keep the original transcript in history when refinement creates a new version.
+- 2e48ac1: Let the refinement hotkey finish a transcript-only recording and refine the resulting text.
+- 041e01a: Keep the Transcription Refinement description left-aligned on one line.
+- a5df951: Ensure released Hex builds include the app icon.
 
-## 2026.7.150
+## 0.8.3
 
 ### Patch Changes
 
