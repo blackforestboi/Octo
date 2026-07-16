@@ -248,9 +248,14 @@ struct RefinementSectionView: View {
 					}
 					.frame(maxWidth: .infinity, alignment: .leading)
 		} header: {
-			Text("Transcription Refinement")
-		} footer: {
-			Text("Rewrite or clean up your transcriptions and/or selected text with custom prompts")
+			VStack(alignment: .leading, spacing: 4) {
+				Text("Transcription Refinement")
+				Text("Rewrite or clean up your transcriptions and/or selected text with custom prompts")
+					.lineLimit(1)
+					.truncationMode(.tail)
+					.frame(maxWidth: .infinity, alignment: .leading)
+			}
+			.frame(maxWidth: .infinity, alignment: .leading)
 		}
 		.task {
 			geminiAPIKey = GeminiAPIKeyStore.read() ?? ""
