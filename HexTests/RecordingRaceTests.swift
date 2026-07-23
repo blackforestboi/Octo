@@ -637,8 +637,8 @@ final class RecordingRaceTests: XCTestCase {
 			refinementInstructions,
 			"Preserve Markdown.\n\nSpoken instruction:\nmake it shorter"
 		)
-		XCTAssertEqual(refinedPaste, "shorter draft")
-		XCTAssertNil(rawPaste)
+		XCTAssertNil(refinedPaste)
+		XCTAssertEqual(rawPaste, "shorter draft")
 	}
 
 	func testDiscardCancelsParallelSelectionLookupWithoutStartingRefinementLater() async {
@@ -701,6 +701,7 @@ final class RecordingRaceTests: XCTestCase {
 			TranscriptionFeature()
 		} withDependencies: {
 			$0.date.now = Date(timeIntervalSince1970: 1_234)
+			$0.pasteboard.paste = { text in await refinementProbe.recordPaste(text) }
 			$0.refinement.refine = { request in
 				await refinementProbe.recordInput(request.text)
 				await refinementProbe.recordInstructions(request.instructions)
@@ -764,6 +765,7 @@ final class RecordingRaceTests: XCTestCase {
 			TranscriptionFeature()
 		} withDependencies: {
 			$0.date.now = Date(timeIntervalSince1970: 1_234)
+			$0.pasteboard.paste = { text in await refinementProbe.recordPaste(text) }
 			$0.refinement.refine = { request in
 				await refinementProbe.recordInput(request.text)
 				await refinementProbe.recordInstructions(request.instructions)

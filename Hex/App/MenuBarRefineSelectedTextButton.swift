@@ -39,14 +39,7 @@ struct MenuBarRefineSelectedTextButton: View {
         hexSettings.refinementRequest(for: selectedText.text, mode: .refined)
       )
 
-      switch await selectedText.replace(with: refinedText) {
-      case .replaced:
-        break
-      case .clipboardChanged:
-        message = "Couldn't replace the selection because the source app or clipboard changed."
-      case .pasteFailed:
-        message = "Couldn't replace the selection. The refined text is on your clipboard."
-      }
+      await pasteboard.paste(refinedText)
     } catch is CancellationError {
       selectedText.cancel()
       return

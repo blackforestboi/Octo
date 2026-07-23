@@ -645,19 +645,13 @@ struct TranscriptionFeature {
 				.cancellable(id: CancelID.selectedTextOnlyRefinement, cancelInFlight: true)
 
 			case let .selectedTextOnlyRefinementResult(result):
-				guard let selectedText = state.selectedTextForRefinement else { return .none }
+				guard state.selectedTextForRefinement != nil else { return .none }
 				state.selectedTextForRefinement = nil
 				state.isRefining = false
 				state.outputGenerationStartTime = nil
-				return .run { _ in
-					switch await selectedText.replace(with: result) {
-					case .replaced:
-						soundEffect.play(.pasteTranscript)
-					case .clipboardChanged:
-						transcriptionFeatureLogger.notice("Skipped selected-text replacement because the source app or clipboard changed")
-					case .pasteFailed:
-						transcriptionFeatureLogger.warning("Selected-text refinement paste failed")
-					}
+				return .run { [pasteboard] _ in
+					await pasteboard.paste(result)
+					soundEffect.play(.pasteTranscript)
 				}
 
 			case let .selectedTextOnlyRefinementFailed(message):
@@ -1735,12 +1729,6 @@ private extension TranscriptionFeature {
   ) async {
     @Shared(.hexSettings) var hexSettings: HexSettings
 
-	let selectionReplacementResult: SelectedTextReplacementResult? = if let selectedText {
-		await selectedText.replace(with: result)
-	} else {
-		nil
-	}
-
     if let historyCheckpointID {
 		var screenshotPath: URL?
 		if let screenshotData {
@@ -1802,22 +1790,10 @@ private extension TranscriptionFeature {
       RecordingRecoveryStore.releaseSource(forFinalAudioURL: audioURL)
     }
 
-	if selectedText == nil {
-		await pasteboard.paste(result)
-		soundEffect.play(.pasteTranscript)
-		return
-	}
-
-	switch selectionReplacementResult {
-	case .replaced:
-		soundEffect.play(.pasteTranscript)
-	case .clipboardChanged:
-		transcriptionFeatureLogger.notice("Skipped selected-text replacement because the source app or clipboard changed")
-	case .pasteFailed:
-		transcriptionFeatureLogger.warning("Selected-text replacement failed after refinement")
-	case nil:
-		break
-	}
+	// Selected text is refinement context only. Always paste the generated output
+	// at the insertion point that is active when processing completes.
+	await pasteboard.paste(result)
+	soundEffect.play(.pasteTranscript)
   }
 
   /// Persist an entry in history (move audio + insert + prune to maxHistoryEntries).
