@@ -3,6 +3,7 @@ import Dependencies
 import DependenciesMacros
 import Foundation
 import HexCore
+import Sharing
 
 #if canImport(FoundationModels)
 import FoundationModels
@@ -35,6 +36,19 @@ extension RefinementClient: DependencyKey {
 	}
 
 	private static func safeRefine(_ request: RefinementRequest) async throws -> String {
+		do {
+			return try await refine(request)
+		} catch {
+			guard isUnsupportedReasoning(error), let fallback = request.reasoningEffort.nextHigher else { throw error }
+			let fallbackRequest = request.with(reasoningEffort: fallback)
+			let result = try await refine(fallbackRequest)
+			@Shared(.hexSettings) var settings: HexSettings
+			$settings.withLock { $0.refinementReasoningEffort = fallback }
+			return result
+		}
+	}
+
+	private static func refine(_ request: RefinementRequest) async throws -> String {
 			let prompt = if let screenContext = request.screenContext {
 				ScreenAwarePromptBuilder.prompt(request: request, context: screenContext)
 			} else {
@@ -49,6 +63,12 @@ extension RefinementClient: DependencyKey {
 			throw RefinementError.invalidResponse
 		}
 		return validatedResult
+	}
+
+	private static func isUnsupportedReasoning(_ error: Error) -> Bool {
+		let message = error.localizedDescription.lowercased()
+		return message.contains("reasoning")
+			&& (message.contains("not supported") || message.contains("unsupported") || message.contains("invalid"))
 	}
 
 	private static func validated(_ output: String) -> String? {
@@ -70,16 +90,17 @@ extension RefinementClient: DependencyKey {
 			throw RefinementError.providerUnavailable
 		case .gemini:
 			guard let apiKey = GeminiAPIKeyStore.read(), !apiKey.isEmpty else { throw RefinementError.missingConfiguration }
-			return try await geminiProcess(prompt: prompt, apiKey: apiKey)
+			return try await geminiProcess(prompt: prompt, apiKey: apiKey, reasoningEffort: request.reasoningEffort)
 		case .openRouter:
 			guard let apiKey = OpenRouterAPIKeyStore.read(), !apiKey.isEmpty,
 				  let modelID = request.modelID, !modelID.isEmpty
 			else { throw RefinementError.missingConfiguration }
 				return try await openRouterProcess(
 					prompt: prompt,
-					apiKey: apiKey,
-					modelID: modelID,
-					screenContext: request.screenContext,
+				apiKey: apiKey,
+				modelID: modelID,
+				reasoningEffort: request.reasoningEffort,
+				screenContext: request.screenContext,
 					screenAwareInputSource: request.screenAwareInputSource
 				)
 		case .openAI:
@@ -90,6 +111,7 @@ extension RefinementClient: DependencyKey {
 				prompt: prompt,
 				apiKey: apiKey,
 				modelID: modelID,
+				reasoningEffort: request.reasoningEffort,
 				screenContext: request.screenContext,
 				screenAwareInputSource: request.screenAwareInputSource
 			)
@@ -104,6 +126,10 @@ extension RefinementClient: DependencyKey {
 				screenContext: request.screenContext,
 				screenAwareInputSource: request.screenAwareInputSource
 			)
+		case .codexCLI:
+			return try await CLIRefinementClient.refine(provider: .codex, prompt: prompt, modelID: request.modelID, reasoningEffort: request.reasoningEffort)
+		case .claudeCLI:
+			return try await CLIRefinementClient.refine(provider: .claude, prompt: prompt, modelID: request.modelID, reasoningEffort: request.reasoningEffort)
 		}
 	}
 
@@ -117,7 +143,7 @@ extension RefinementClient: DependencyKey {
 	}
 	#endif
 
-	private static func geminiProcess(prompt: RefinementPrompt, apiKey: String) async throws -> String {
+	private static func geminiProcess(prompt: RefinementPrompt, apiKey: String, reasoningEffort: RefinementReasoningEffort) async throws -> String {
 		let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent")!
 		var request = URLRequest(url: url)
 		request.httpMethod = "POST"
@@ -126,7 +152,8 @@ extension RefinementClient: DependencyKey {
 		request.httpBody = try JSONEncoder().encode(
 			GeminiRequest(
 				instruction: prompt.systemInstruction,
-				text: prompt.sourceText
+				text: prompt.sourceText,
+				reasoningEffort: reasoningEffort
 			)
 		)
 		let (data, response) = try await longRunningRefinementSession.data(for: request)
@@ -144,6 +171,7 @@ extension RefinementClient: DependencyKey {
 			prompt: RefinementPrompt,
 			apiKey: String,
 			modelID: String,
+			reasoningEffort: RefinementReasoningEffort,
 			screenContext: ScreenContext?,
 			screenAwareInputSource: ScreenAwareInputSource
 	) async throws -> String {
@@ -171,7 +199,7 @@ extension RefinementClient: DependencyKey {
 					text: prompt.sourceText,
 					imageData: imageUpload?.data,
 					imageMIMEType: imageUpload?.mimeType,
-					reasoning: OpenRouterModelCatalog.reasoningConfiguration(for: modelID)
+					reasoning: OpenRouterModelCatalog.reasoningConfiguration(for: modelID, requestedEffort: reasoningEffort)
 				)
 		)
 		do {
@@ -204,6 +232,7 @@ extension RefinementClient: DependencyKey {
 		prompt: RefinementPrompt,
 		apiKey: String,
 		modelID: String,
+		reasoningEffort: RefinementReasoningEffort,
 		screenContext: ScreenContext?,
 		screenAwareInputSource: ScreenAwareInputSource
 	) async throws -> String {
@@ -218,7 +247,8 @@ extension RefinementClient: DependencyKey {
 				instruction: prompt.systemInstruction,
 				text: prompt.sourceText,
 				imageData: imageUpload?.data,
-				imageMIMEType: imageUpload?.mimeType
+				imageMIMEType: imageUpload?.mimeType,
+				reasoningEffort: reasoningEffort
 			)
 		)
 		return try await remoteResult(
@@ -330,11 +360,12 @@ extension RefinementClient: DependencyKey {
 private struct GeminiRequest: Encodable {
 	let systemInstruction: Content
 	let contents: [Content]
-	let generationConfig = GenerationConfig()
+	let generationConfig: GenerationConfig
 
-	init(instruction: String, text: String) {
+	init(instruction: String, text: String, reasoningEffort: RefinementReasoningEffort) {
 		systemInstruction = .init(parts: [.init(text: instruction)])
 		contents = [.init(parts: [.init(text: text)])]
+		generationConfig = .init(reasoningEffort: reasoningEffort)
 	}
 
 	struct Content: Encodable { let parts: [Part] }
@@ -342,6 +373,20 @@ private struct GeminiRequest: Encodable {
 	struct GenerationConfig: Encodable {
 		let temperature = 0.2
 		let maxOutputTokens = RefinementOutput.maximumTokens
+		let thinkingConfig: ThinkingConfig?
+
+		init(reasoningEffort: RefinementReasoningEffort) {
+			thinkingConfig = reasoningEffort == .none ? nil : .init(thinkingLevel: reasoningEffort.rawValue)
+		}
+
+		struct ThinkingConfig: Encodable {
+			let thinkingLevel: String
+		}
+
+		enum CodingKeys: String, CodingKey {
+			case temperature, thinkingConfig
+			case maxOutputTokens = "maxOutputTokens"
+		}
 	}
 }
 
@@ -443,8 +488,9 @@ private struct OpenAIResponseRequest: Encodable {
 	let instructions: String
 	let input: [Input]
 	let maxOutputTokens = RefinementOutput.maximumTokens
+	let reasoning: Reasoning?
 
-	init(model: String, instruction: String, text: String, imageData: Data?, imageMIMEType: String?) {
+	init(model: String, instruction: String, text: String, imageData: Data?, imageMIMEType: String?, reasoningEffort: RefinementReasoningEffort) {
 		self.model = model
 		instructions = instruction
 		var content: [Input.Content] = [.text(text)]
@@ -452,7 +498,18 @@ private struct OpenAIResponseRequest: Encodable {
 			content.append(.image("data:\(imageMIMEType);base64,\(imageData.base64EncodedString())"))
 		}
 		input = [.init(content: content)]
+		reasoning = Self.supportsReasoning(model: model, effort: reasoningEffort) ? .init(effort: reasoningEffort.rawValue) : nil
 	}
+
+	private static func supportsReasoning(model: String, effort: RefinementReasoningEffort) -> Bool {
+		let model = model.lowercased()
+		if effort == .none {
+			return model.hasPrefix("gpt-5.1") || model.hasPrefix("gpt-5.2") || model.hasPrefix("gpt-5.3") || model.hasPrefix("gpt-5.4") || model.hasPrefix("gpt-5.5") || model.hasPrefix("gpt-5.6")
+		}
+		return model.hasPrefix("gpt-5") || model.hasPrefix("o")
+	}
+
+	struct Reasoning: Encodable { let effort: String }
 
 	struct Input: Encodable {
 		let role = "user"
@@ -474,7 +531,7 @@ private struct OpenAIResponseRequest: Encodable {
 	}
 
 	enum CodingKeys: String, CodingKey {
-		case model, instructions, input
+		case model, instructions, input, reasoning
 		case maxOutputTokens = "max_output_tokens"
 	}
 }

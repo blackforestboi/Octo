@@ -14,6 +14,7 @@ struct RefinementSectionView: View {
 	@State private var isShowingOpenRouterModelPicker = false
 	@State private var isShowingScreenAwareModelPicker = false
 	@State private var directModelPickerTarget: DirectModelPickerTarget?
+	@State private var subscriptionModelPickerTarget: SubscriptionModelPickerTarget?
 
 	private enum DirectModelPickerTarget: Identifiable {
 		case refinement
@@ -22,58 +23,22 @@ struct RefinementSectionView: View {
 		var id: Self { self }
 	}
 
+	private enum SubscriptionModelPickerTarget: Identifiable {
+		case codex
+		case claude
+
+		var id: Self { self }
+
+		var provider: CLIRefinementClient.Provider {
+			switch self {
+			case .codex: .codex
+			case .claude: .claude
+			}
+		}
+	}
+
 	var body: some View {
 		Section {
-			let refinedHotkey = store.hexSettings.refinedHotkey ?? .init(key: nil, modifiers: [])
-			let refinedKey = store.isSettingRefinedHotKey ? nil : refinedHotkey.key
-			let refinedModifiers = store.isSettingRefinedHotKey ? store.currentRefinedModifiers : refinedHotkey.modifiers
-
-			VStack(alignment: .leading, spacing: 14) {
-				RefinedHotKeyIntroduction(
-					hasConflict: store.hexSettings.refinedHotkey?.conflicts(with: store.hexSettings.hotkey) ?? false
-				)
-
-				HStack {
-					Spacer()
-					HotKeyView(modifiers: refinedModifiers, key: refinedKey, isActive: store.isSettingRefinedHotKey)
-					Spacer()
-				}
-				.contentShape(Rectangle())
-				.onTapGesture { store.send(.startSettingRefinedHotKey) }
-			}
-			.listRowSeparator(.hidden)
-
-			if !store.isSettingRefinedHotKey, refinedHotkey.key == nil, !refinedHotkey.modifiers.isEmpty {
-				ModifierSideControls(modifiers: refinedHotkey.modifiers) { kind, side in
-					store.send(.setRefinedModifierSide(kind, side))
-				}
-				.listRowSeparator(.hidden, edges: .top)
-			}
-
-			Label {
-				Toggle("Enable double-tap lock", isOn: $store.hexSettings.refinedDoubleTapLockEnabled)
-			} icon: {
-				Image(systemName: "hand.tap")
-			}
-
-			if store.hexSettings.refinedDoubleTapLockEnabled {
-				Label {
-					Toggle("Use double-tap only", isOn: $store.hexSettings.refinedUseDoubleTapOnly)
-				} icon: {
-					Image(systemName: "hand.tap.fill")
-				}
-			}
-
-			if refinedHotkey.key == nil, !(store.hexSettings.refinedDoubleTapLockEnabled && store.hexSettings.refinedUseDoubleTapOnly) {
-				Label {
-					Slider(value: $store.hexSettings.refinedMinimumKeyTime, in: 0 ... 2, step: 0.1) {
-						Text("Ignore below \(store.hexSettings.refinedMinimumKeyTime, specifier: "%.1f")s")
-					}
-				} icon: {
-					Image(systemName: "clock")
-				}
-			}
-
 			Label {
 				Toggle("Include selected text", isOn: $store.hexSettings.includeSelectedTextInRefinement)
 			} icon: {
@@ -83,18 +48,39 @@ struct RefinementSectionView: View {
 			Label {
 				Picker("Provider", selection: $store.hexSettings.refinementProvider) {
 					Text("Apple Intelligence").tag(RefinementProvider.apple)
-					Text("Gemini Flash").tag(RefinementProvider.gemini)
-					Text("OpenRouter").tag(RefinementProvider.openRouter)
-					Text("OpenAI / Codex").tag(RefinementProvider.openAI)
-					Text("Claude (Anthropic)").tag(RefinementProvider.anthropic)
+					Text("Gemini Flash API").tag(RefinementProvider.gemini)
+					Text("OpenRouter API").tag(RefinementProvider.openRouter)
+					Text("OpenAI API").tag(RefinementProvider.openAI)
+					Text("Claude API").tag(RefinementProvider.anthropic)
+					Text("OpenAI Subscription").tag(RefinementProvider.codexCLI)
+					Text("Claude Subscription").tag(RefinementProvider.claudeCLI)
 				}
 			} icon: {
 				Image(systemName: "cpu")
 			}
 
+			Label {
+				Picker("Reasoning", selection: $store.hexSettings.refinementReasoningEffort) {
+					ForEach(RefinementReasoningEffort.allCases, id: \.self) { effort in
+						Text(effort.displayName).tag(effort)
+					}
+				}
+			} icon: {
+				Image(systemName: "brain")
+			}
+			Text("Sets the requested thinking level for refinement. Availability varies by provider and selected model.")
+				.font(.caption)
+				.foregroundStyle(.secondary)
+
 				if store.hexSettings.refinementProvider == .apple {
+					LabeledContent("Model") {
+						Text("Apple Intelligence default")
+					}
+					Text("Uses Apple Intelligence on your Mac; audio is never sent.")
+						.font(.caption)
+						.foregroundStyle(.secondary)
 					if #unavailable(macOS 26.0) {
-						Text("Apple Intelligence refinement requires macOS 26 or later. Until then, Hex keeps the processed transcript unchanged.")
+						Text("Apple Intelligence refinement requires macOS 26 or later. Until then, Octo keeps the processed transcript unchanged.")
 							.font(.caption)
 							.foregroundStyle(.secondary)
 					}
@@ -108,13 +94,15 @@ struct RefinementSectionView: View {
 							persistOpenAIAPIKey()
 							directModelPickerTarget = .refinement
 						} label: {
-							LabeledContent("Default Model") {
-								Text(store.hexSettings.openRouterModelID ?? "Select a model")
-									.foregroundStyle(store.hexSettings.openRouterModelID == nil ? .secondary : .primary)
+							LabeledContent("Model") {
+								Text(store.hexSettings.openAIModelID ?? store.hexSettings.openRouterModelID ?? "Select a model")
+									.foregroundStyle(store.hexSettings.openAIModelID == nil && store.hexSettings.openRouterModelID == nil ? .secondary : .primary)
 							}
 						}
+						.frame(maxWidth: .infinity, alignment: .leading)
+						.contentShape(Rectangle())
 						.disabled(openAIAPIKey.isEmpty)
-						Text("Your key is stored securely in Keychain. Hex refreshes the models available to this key when you open the picker. OpenAI receives the completed transcript, or a screen image when enabled; audio is never sent.")
+						Text("Uses your OpenAI API key. Octo sends the completed refinement prompt, or a screen image when enabled; audio is never sent.")
 							.font(.caption)
 							.foregroundStyle(.secondary)
 					}
@@ -129,13 +117,15 @@ struct RefinementSectionView: View {
 							persistAnthropicAPIKey()
 							directModelPickerTarget = .refinement
 						} label: {
-							LabeledContent("Default Model") {
-								Text(store.hexSettings.openRouterModelID ?? "Select a model")
-									.foregroundStyle(store.hexSettings.openRouterModelID == nil ? .secondary : .primary)
+							LabeledContent("Model") {
+								Text(store.hexSettings.anthropicModelID ?? store.hexSettings.openRouterModelID ?? "Select a model")
+									.foregroundStyle(store.hexSettings.anthropicModelID == nil && store.hexSettings.openRouterModelID == nil ? .secondary : .primary)
 							}
 						}
+						.frame(maxWidth: .infinity, alignment: .leading)
+						.contentShape(Rectangle())
 						.disabled(anthropicAPIKey.isEmpty)
-						Text("Your key is stored securely in Keychain. Hex refreshes the models available to this key when you open the picker. Anthropic receives the completed transcript, or a screen image when enabled; audio is never sent.")
+						Text("Uses your Claude API key. Octo sends the completed refinement prompt, or a screen image when enabled; audio is never sent.")
 							.font(.caption)
 							.foregroundStyle(.secondary)
 					}
@@ -145,10 +135,10 @@ struct RefinementSectionView: View {
 				if store.hexSettings.refinementProvider == .gemini {
 					SecureField("Gemini API Key", text: $geminiAPIKey)
 						.onSubmit(persistGeminiAPIKey)
-					Text("Stored securely in Keychain. Without a key, Hex pastes the processed transcript unchanged.")
-						.font(.caption)
-						.foregroundStyle(.secondary)
-					Text("Gemini sends the completed, locally transformed transcript text to Google. Audio is never sent.")
+					LabeledContent("Model") {
+						Text("Gemini 3.1 Flash Lite")
+					}
+					Text("Uses your Gemini API key. Octo sends the completed refinement prompt to Google; audio is never sent.")
 						.font(.caption)
 						.foregroundStyle(.secondary)
 				}
@@ -161,17 +151,53 @@ struct RefinementSectionView: View {
 							persistOpenRouterAPIKey()
 							isShowingOpenRouterModelPicker = true
 						} label: {
-							LabeledContent("Default Model") {
-								Text(store.hexSettings.openRouterModelID ?? "Select a model")
-									.foregroundStyle(store.hexSettings.openRouterModelID == nil ? .secondary : .primary)
+								LabeledContent("Model") {
+									Text(store.hexSettings.openRouterModelID ?? "Select a model")
+										.foregroundStyle(store.hexSettings.openRouterModelID == nil ? .secondary : .primary)
+								}
 							}
-						}
+						.frame(maxWidth: .infinity, alignment: .leading)
+						.contentShape(Rectangle())
 						.disabled(openRouterAPIKey.isEmpty)
-						Text("Your key is stored securely in Keychain. Choose any text model from the cached OpenRouter catalog. OpenRouter sends the completed, locally transformed transcript text to the selected model; audio is never sent.")
+						Text("Uses your OpenRouter API key. Octo sends the completed refinement prompt to the selected model; audio is never sent.")
 							.font(.caption)
 							.foregroundStyle(.secondary)
 					}
 					.listRowSeparator(.hidden)
+				}
+
+				if store.hexSettings.refinementProvider == .codexCLI {
+					VStack(alignment: .leading, spacing: 8) {
+						Button {
+							subscriptionModelPickerTarget = .codex
+						} label: {
+							LabeledContent("Model") {
+								Text(store.hexSettings.codexCLIModelID ?? "Codex default")
+							}
+						}
+						.frame(maxWidth: .infinity, alignment: .leading)
+						.contentShape(Rectangle())
+						Text("Uses your signed-in OpenAI subscription through the local Codex CLI. Octo sends only the completed refinement prompt; audio is never sent.")
+							.font(.caption)
+							.foregroundStyle(.secondary)
+					}
+				}
+
+				if store.hexSettings.refinementProvider == .claudeCLI {
+					VStack(alignment: .leading, spacing: 8) {
+						Button {
+							subscriptionModelPickerTarget = .claude
+						} label: {
+							LabeledContent("Model") {
+								Text(store.hexSettings.claudeCLIModelID ?? "Claude default")
+							}
+						}
+						.frame(maxWidth: .infinity, alignment: .leading)
+						.contentShape(Rectangle())
+						Text("Uses your signed-in Claude subscription through the local Claude Code CLI. Octo sends only the completed refinement prompt; audio is never sent.")
+							.font(.caption)
+							.foregroundStyle(.secondary)
+					}
 				}
 
 			VStack(alignment: .leading, spacing: 8) {
@@ -196,7 +222,7 @@ struct RefinementSectionView: View {
 								.disabled(store.isRequestingScreenRecordingPermission)
 						}
 						if store.needsScreenRecordingPermission {
-							Text("Screen Recording permission is required. Enable Hex in Privacy & Security → Screen Recording, then try again.")
+							Text("Screen Recording permission is required. Enable Octo in Privacy & Security → Screen Recording, then try again.")
 								.font(.caption)
 								.foregroundStyle(.secondary)
 							Button("Open Screen Recording Settings") {
@@ -204,7 +230,7 @@ struct RefinementSectionView: View {
 							}
 						}
 						if store.hexSettings.screenAwareDictationEnabled {
-							Text("Long-press the refinement hotkey to capture the display under the cursor as Screen-aware mode activates. With double-tap lock enabled, release the second tap for regular refinement or keep holding it for Screen-aware mode.")
+								Text("Quick-tap the recording hotkey once, then hold the second press to capture the display under the cursor. Screen-aware recordings always use refinement.")
 								.font(.caption)
 								.foregroundStyle(.secondary)
 							Picker("Analysis source", selection: $store.hexSettings.screenAwareInputSource) {
@@ -220,21 +246,22 @@ struct RefinementSectionView: View {
 								SecureField("OpenRouter API Key", text: $openRouterAPIKey)
 									.onSubmit(persistOpenRouterAPIKey)
 							}
-							Button {
-								if selectedImageProvider == .openRouter {
-									persistOpenRouterAPIKey()
-									isShowingScreenAwareModelPicker = true
-								} else {
-									persistSelectedDirectAPIKey()
-									directModelPickerTarget = .screenAware
-								}
-							} label: {
-								LabeledContent(selectedImageProvider == .openRouter ? "Fallback Image Model" : "Screen-aware Model") {
-										Text(store.hexSettings.screenAwareOpenRouterModelID ?? "Select a model")
-											.foregroundStyle(store.hexSettings.screenAwareOpenRouterModelID == nil ? .secondary : .primary)
+							if !selectedImageAPIKey.isEmpty {
+								Button {
+									if selectedImageProvider == .openRouter {
+										persistOpenRouterAPIKey()
+										isShowingScreenAwareModelPicker = true
+									} else {
+										persistSelectedDirectAPIKey()
+										directModelPickerTarget = .screenAware
 									}
-								}
-							.disabled(selectedImageAPIKey.isEmpty)
+								} label: {
+									LabeledContent(selectedImageProvider == .openRouter ? "Fallback Image Model" : "Screen-aware Model") {
+											Text(store.hexSettings.screenAwareOpenRouterModelID ?? "Select a model")
+											.foregroundStyle(store.hexSettings.screenAwareOpenRouterModelID == nil ? .secondary : .primary)
+										}
+									}
+							}
 							Text(selectedImageProvider == .openRouter ? "Used only when the selected refinement model cannot accept image input." : "Choose a model that supports image input for screen-aware dictation.")
 									.font(.caption)
 									.foregroundStyle(.secondary)
@@ -251,8 +278,8 @@ struct RefinementSectionView: View {
 			VStack(alignment: .leading, spacing: 4) {
 				Text("Transcription Refinement")
 				Text("Rewrite or clean up your transcriptions and/or selected text with custom prompts")
-					.lineLimit(1)
-					.truncationMode(.tail)
+					.font(.footnote)
+					.foregroundColor(.secondary)
 					.frame(maxWidth: .infinity, alignment: .leading)
 			}
 			.frame(maxWidth: .infinity, alignment: .leading)
@@ -268,6 +295,7 @@ struct RefinementSectionView: View {
 			if oldProvider == .openRouter { persistOpenRouterAPIKey() }
 			if oldProvider == .openAI { persistOpenAIAPIKey() }
 			if oldProvider == .anthropic { persistAnthropicAPIKey() }
+			store.send(.refinementProviderChanged(store.hexSettings.refinementProvider))
 		}
 		.onChange(of: openRouterAPIKey) { _, key in
 			// Clearing the field explicitly opts out of the saved Keychain credential.
@@ -307,6 +335,12 @@ struct RefinementSectionView: View {
 					requiredInputModality: target == .screenAware ? .image : .text
 				)
 			}
+			.sheet(item: $subscriptionModelPickerTarget) { target in
+				SubscriptionModelPickerView(
+					selectedModelID: subscriptionModelBinding(for: target),
+					provider: target.provider
+				)
+			}
 		.enableInjection()
 	}
 
@@ -333,15 +367,27 @@ struct RefinementSectionView: View {
 
 	private func modelBinding(for target: DirectModelPickerTarget) -> Binding<String?> {
 		switch target {
-		case .refinement: $store.hexSettings.openRouterModelID
+		case .refinement:
+			switch store.hexSettings.refinementProvider {
+			case .openAI: $store.hexSettings.openAIModelID
+			case .anthropic: $store.hexSettings.anthropicModelID
+			case .apple, .gemini, .openRouter, .codexCLI, .claudeCLI: $store.hexSettings.openRouterModelID
+			}
 		case .screenAware: $store.hexSettings.screenAwareOpenRouterModelID
+		}
+	}
+
+	private func subscriptionModelBinding(for target: SubscriptionModelPickerTarget) -> Binding<String?> {
+		switch target {
+		case .codex: $store.hexSettings.codexCLIModelID
+		case .claude: $store.hexSettings.claudeCLIModelID
 		}
 	}
 
 	private var selectedImageProvider: RefinementProvider {
 		switch store.hexSettings.refinementProvider {
 		case .openAI, .anthropic, .openRouter: store.hexSettings.refinementProvider
-		case .apple, .gemini: .openRouter
+		case .apple, .gemini, .codexCLI, .claudeCLI: .openRouter
 		}
 	}
 
@@ -349,7 +395,7 @@ struct RefinementSectionView: View {
 		switch selectedImageProvider {
 		case .openAI: openAIAPIKey
 		case .anthropic: anthropicAPIKey
-		case .openRouter, .apple, .gemini: openRouterAPIKey
+		case .openRouter, .apple, .gemini, .codexCLI, .claudeCLI: openRouterAPIKey
 		}
 	}
 
@@ -360,15 +406,16 @@ struct RefinementSectionView: View {
 		case .openRouter: "OpenRouter"
 		case .apple: "Apple Intelligence"
 		case .gemini: "Gemini"
+		case .codexCLI, .claudeCLI: "OpenRouter"
 		}
 	}
 
 	private var screenAwareSourceDescription: String {
 		switch store.hexSettings.screenAwareInputSource {
 		case .localOCR:
-			"Fastest and most private: Apple Vision extracts text on your Mac, then Hex uses your selected refinement model with that text and your spoken request. Best for documents, email, and other text-based screens."
+			"Fastest and most private: Apple Vision extracts text on your Mac, then Octo uses your selected refinement model with that text and your spoken request. Best for documents, email, and other text-based screens."
 		case .image:
-			"Best for layout, charts, icons, imagery, or other visual details: Hex sends a compressed analysis copy of the screenshot to the selected image-capable provider."
+			"Best for layout, charts, icons, imagery, or other visual details: Octo sends a compressed analysis copy of the screenshot to the selected image-capable provider."
 		}
 	}
 
@@ -394,24 +441,5 @@ struct RefinementSectionView: View {
 			get: { store.hexSettings.screenAwareDictationEnabled },
 			set: { store.send(.setScreenAwareDictationEnabled($0)) }
 		)
-	}
-}
-
-private struct RefinedHotKeyIntroduction: View {
-	let hasConflict: Bool
-
-	var body: some View {
-		VStack(alignment: .leading, spacing: 8) {
-			Label("Refined Transcription Hotkey", systemImage: "keyboard")
-				.font(.headline)
-			Text("Records normally, then always runs refinement using the instructions above.")
-				.font(.caption)
-				.foregroundStyle(.secondary)
-			if hasConflict {
-				Text("Choose a non-overlapping shortcut. A modifier-only shortcut cannot share a prefix with the regular shortcut.")
-					.font(.caption)
-					.foregroundStyle(.orange)
-			}
-		}
 	}
 }

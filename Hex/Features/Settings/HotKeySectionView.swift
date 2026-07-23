@@ -109,8 +109,123 @@ struct HotKeySectionView: View {
                     Image(systemName: "timer")
                 }
             }
+
+            HStack(spacing: 16) {
+                Label("Hotkey Sequences", systemImage: "command")
+                    .font(.headline)
+
+                Spacer(minLength: 12)
+
+                HStack(spacing: 8) {
+                    HotKeyPressPill(kind: .long, showsLabel: true)
+                    HotKeyPressPill(kind: .short, showsLabel: true)
+                }
+            }
+            .padding(.top, 8)
+
+            ForEach(Array(hotKeySequences.enumerated()), id: \.offset) { _, sequence in
+                LabeledContent {
+                    HStack(spacing: 6) {
+                        ForEach(Array(sequence.presses.enumerated()), id: \.offset) { _, press in
+                            HotKeyPressPill(kind: press)
+                        }
+                    }
+                } label: {
+                    Text(sequence.title)
+                }
+            }
         }
         .enableInjection()
+    }
+
+    private var hotKeySequences: [HotKeySequence] {
+        if store.hexSettings.doubleTapLockEnabled {
+            [
+                HotKeySequence(title: String(localized: "Start on-demand transcription"), presses: [.long]),
+                HotKeySequence(title: String(localized: "Start hands-free transcription"), presses: [.short, .short]),
+                HotKeySequence(title: String(localized: "Start screen-aware transcription"), presses: [.short, .long]),
+                HotKeySequence(title: String(localized: "Finish normally"), presses: [.short]),
+                HotKeySequence(title: String(localized: "Finish with refinement"), presses: [.long]),
+            ]
+        } else {
+            [
+                HotKeySequence(title: String(localized: "Transcribe while held"), presses: [.long]),
+                HotKeySequence(title: String(localized: "Start screen-aware transcription"), presses: [.short, .long]),
+                HotKeySequence(title: String(localized: "Refine the last transcription"), presses: [.long, .short]),
+            ]
+        }
+    }
+}
+
+private struct HotKeySequence {
+    let title: String
+    let presses: [HotKeyPressKind]
+}
+
+private enum HotKeyPressKind {
+    case long
+    case short
+
+    var label: String {
+        switch self {
+        case .long:
+            String(localized: "Long")
+        case .short:
+            String(localized: "Short")
+        }
+    }
+
+    var width: CGFloat {
+        switch self {
+        case .long:
+            54
+        case .short:
+            28
+        }
+    }
+
+    var labeledWidth: CGFloat {
+        switch self {
+        case .long:
+            64
+        case .short:
+            44
+        }
+    }
+}
+
+private struct HotKeyPressPill: View {
+    let kind: HotKeyPressKind
+    var showsLabel = false
+
+    var body: some View {
+        Group {
+            if showsLabel {
+                Text(kind.label)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+            } else {
+                Capsule()
+                    .fill(.secondary.opacity(0.45))
+            }
+        }
+        .frame(
+            width: showsLabel ? kind.labeledWidth : kind.width,
+            height: showsLabel ? 20 : 10
+        )
+        .background {
+            if showsLabel {
+                Capsule()
+                    .fill(.secondary.opacity(0.12))
+            }
+        }
+        .overlay {
+            if showsLabel {
+                Capsule()
+                    .stroke(.secondary.opacity(0.22), lineWidth: 1)
+            }
+        }
+        .accessibilityLabel(Text(kind.label))
     }
 }
 

@@ -29,6 +29,10 @@ struct DirectProviderModelPickerView: View {
 					}
 					.buttonStyle(.borderedProminent)
 					.disabled(isRefreshing)
+					Button("Close") {
+						dismiss()
+					}
+					.buttonStyle(.bordered)
 				}
 				.padding()
 				Divider()
@@ -55,11 +59,13 @@ struct DirectProviderModelPickerView: View {
 									Image(systemName: "checkmark").foregroundStyle(.tint)
 								}
 							}
+							.contentShape(Rectangle())
 						}
 						.buttonStyle(.plain)
 					}
 				}
 			}
+			.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
 			.alert("Couldn’t Refresh Models", isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })) {
 				Button("OK", role: .cancel) {}
 			} message: { Text(errorMessage ?? "Unknown error") }

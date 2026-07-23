@@ -10,6 +10,7 @@ let package = Package(
     dependencies: [
         .package(url: "https://github.com/Clipy/Sauce", branch: "master"),
         .package(url: "https://github.com/pointfreeco/swift-dependencies", from: "1.11.0"),
+        .package(url: "https://github.com/pointfreeco/xctest-dynamic-overlay", from: "1.8.0"),
         .package(url: "https://github.com/apple/swift-log", from: "1.9.1"),
     ],
     targets: [
@@ -19,6 +20,7 @@ let package = Package(
 	            "Sauce",
 	            .product(name: "Dependencies", package: "swift-dependencies"),
 	            .product(name: "DependenciesMacros", package: "swift-dependencies"),
+	            .product(name: "IssueReporting", package: "xctest-dynamic-overlay"),
 	            .product(name: "Logging", package: "swift-log"),
 	        ],
 	        path: "Sources/HexCore",

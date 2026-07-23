@@ -10,7 +10,7 @@ actor ParakeetClient {
   private var currentVariant: ParakeetModel?
   private let logger = HexLog.parakeet
   private let vendorDirs = [
-    // Our app-specific cache path convention (under XDG or com.kitlangton.Hex/cache)
+    // Our app-specific cache path convention (under XDG or io.github.blackforestboi.Octo/cache)
     "fluidaudio/Models",
     "FluidAudio/Models"
   ]
@@ -204,7 +204,7 @@ actor ParakeetClient {
     throw NSError(
       domain: "Parakeet",
       code: -2,
-      userInfo: [NSLocalizedDescriptionKey: "Parakeet support not linked. Add Swift Package: https://github.com/FluidInference/FluidAudio.git and link FluidAudio to Hex."]
+      userInfo: [NSLocalizedDescriptionKey: "Parakeet support not linked. Add Swift Package: https://github.com/FluidInference/FluidAudio.git and link FluidAudio to Octo."]
     )
   }
   func transcribe(_ url: URL) async throws -> String { throw NSError(domain: "Parakeet", code: -3, userInfo: [NSLocalizedDescriptionKey: "Parakeet not available"]) }

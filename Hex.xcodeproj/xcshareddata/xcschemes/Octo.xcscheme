@@ -16,8 +16,8 @@
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "47E05DED2D444EC600D26DA6"
-               BuildableName = "Hex.app"
-               BlueprintName = "Hex"
+               BuildableName = "Octo.app"
+               BlueprintName = "Octo"
                ReferencedContainer = "container:Hex.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
@@ -36,8 +36,8 @@
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "478637A42D48725900319BFA"
-               BuildableName = "HexTests.xctest"
-               BlueprintName = "HexTests"
+               BuildableName = "OctoTests.xctest"
+               BlueprintName = "OctoTests"
                ReferencedContainer = "container:Hex.xcodeproj">
             </BuildableReference>
          </TestableReference>
@@ -58,8 +58,8 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "47E05DED2D444EC600D26DA6"
-            BuildableName = "Hex.app"
-            BlueprintName = "Hex"
+            BuildableName = "Octo.app"
+            BlueprintName = "Octo"
             ReferencedContainer = "container:Hex.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
@@ -87,8 +87,8 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "47E05DED2D444EC600D26DA6"
-            BuildableName = "Hex.app"
-            BlueprintName = "Hex"
+            BuildableName = "Octo.app"
+            BlueprintName = "Octo"
             ReferencedContainer = "container:Hex.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>

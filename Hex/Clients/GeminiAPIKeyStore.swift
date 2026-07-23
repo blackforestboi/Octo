@@ -51,7 +51,7 @@ private enum RefinementAPIKeyStore {
 
 /// Stores the optional Gemini credential outside the JSON settings file.
 enum GeminiAPIKeyStore {
-	private static let service = "com.kitlangton.Hex.gemini"
+	private static let service = "io.github.blackforestboi.Octo.gemini"
 
 	static func read() -> String? { RefinementAPIKeyStore.read(service: service) }
 	static func save(_ key: String) throws { try RefinementAPIKeyStore.save(key, service: service) }
@@ -60,7 +60,7 @@ enum GeminiAPIKeyStore {
 
 /// Stores the optional OpenRouter credential outside the JSON settings file.
 enum OpenRouterAPIKeyStore {
-	private static let service = "com.kitlangton.Hex.openrouter"
+	private static let service = "io.github.blackforestboi.Octo.openrouter"
 
 	static func read() -> String? { RefinementAPIKeyStore.read(service: service) }
 	static func save(_ key: String) throws { try RefinementAPIKeyStore.save(key, service: service) }
@@ -69,7 +69,7 @@ enum OpenRouterAPIKeyStore {
 
 /// Stores the direct OpenAI credential outside the JSON settings file.
 enum OpenAIAPIKeyStore {
-	private static let service = "com.kitlangton.Hex.openai"
+	private static let service = "io.github.blackforestboi.Octo.openai"
 
 	static func read() -> String? { RefinementAPIKeyStore.read(service: service) }
 	static func save(_ key: String) throws { try RefinementAPIKeyStore.save(key, service: service) }
@@ -78,7 +78,7 @@ enum OpenAIAPIKeyStore {
 
 /// Stores the direct Anthropic credential outside the JSON settings file.
 enum AnthropicAPIKeyStore {
-	private static let service = "com.kitlangton.Hex.anthropic"
+	private static let service = "io.github.blackforestboi.Octo.anthropic"
 
 	static func read() -> String? { RefinementAPIKeyStore.read(service: service) }
 	static func save(_ key: String) throws { try RefinementAPIKeyStore.save(key, service: service) }

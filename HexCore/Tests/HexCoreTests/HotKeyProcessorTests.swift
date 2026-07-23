@@ -263,8 +263,9 @@ struct HotKeyProcessorTests {
                 ScenarioStep(time: 0.2, key: .a, modifiers: [.command], expectedOutput: .startRecording, expectedIsMatched: true),
                 // Second release (should stay recording)
                 ScenarioStep(time: 0.3, key: nil, modifiers: [.command], expectedOutput: nil, expectedIsMatched: true, expectedState: .doubleTapLock),
-                // Third tap to stop recording
-                ScenarioStep(time: 1.0, key: .a, modifiers: [.command], expectedOutput: .stopRecording, expectedIsMatched: false),
+                // Terminal tap is resolved on release so a hold can select refinement.
+                ScenarioStep(time: 1.0, key: .a, modifiers: [.command], expectedOutput: nil, expectedIsMatched: true, expectedState: .endingHold(startTime: Date(timeIntervalSince1970: 1.0))),
+                ScenarioStep(time: 1.1, key: nil, modifiers: [.command], expectedOutput: .stopRecording, expectedIsMatched: false),
             ]
         )
     }
@@ -282,8 +283,9 @@ struct HotKeyProcessorTests {
                 ScenarioStep(time: 0.2, key: nil, modifiers: [.option], expectedOutput: .startRecording, expectedIsMatched: true),
                 // Second release (should stay recording)
                 ScenarioStep(time: 0.3, key: nil, modifiers: [], expectedOutput: nil, expectedIsMatched: true, expectedState: .doubleTapLock),
-                // Third tap to stop recording
-                ScenarioStep(time: 1.0, key: nil, modifiers: [.option], expectedOutput: .stopRecording, expectedIsMatched: false),
+                // Terminal tap is resolved on release so a hold can select refinement.
+                ScenarioStep(time: 1.0, key: nil, modifiers: [.option], expectedOutput: nil, expectedIsMatched: true, expectedState: .endingHold(startTime: Date(timeIntervalSince1970: 1.0))),
+                ScenarioStep(time: 1.1, key: nil, modifiers: [], expectedOutput: .stopRecording, expectedIsMatched: false),
             ]
         )
     }
@@ -326,13 +328,13 @@ struct HotKeyProcessorTests {
     // MARK: - Double-Tap Only (Key + Modifier)
 
     @Test
-    func doubleTapOnly_standard_singlePressIgnored() throws {
+    func doubleTapOnly_standard_quickSinglePressDiscards() throws {
         runScenario(
             hotkey: HotKey(key: .a, modifiers: [.command]),
             useDoubleTapOnly: true,
             steps: [
-                ScenarioStep(time: 0.0, key: .a, modifiers: [.command], expectedOutput: nil, expectedIsMatched: false),
-                ScenarioStep(time: 0.1, key: nil, modifiers: [.command], expectedOutput: nil, expectedIsMatched: false),
+                ScenarioStep(time: 0.0, key: .a, modifiers: [.command], expectedOutput: .armPendingPressAndHold, expectedIsMatched: false),
+                ScenarioStep(time: 0.1, key: nil, modifiers: [.command], expectedOutput: .cancelPendingPressAndHold, expectedIsMatched: false),
                 ScenarioStep(time: 0.2, key: nil, modifiers: [], expectedOutput: nil, expectedIsMatched: false)
             ]
         )
@@ -344,8 +346,8 @@ struct HotKeyProcessorTests {
             hotkey: HotKey(key: .a, modifiers: [.command]),
             useDoubleTapOnly: true,
             steps: [
-                ScenarioStep(time: 0.0, key: .a, modifiers: [.command], expectedOutput: nil, expectedIsMatched: false),
-                ScenarioStep(time: 0.1, key: nil, modifiers: [.command], expectedOutput: nil, expectedIsMatched: false),
+                ScenarioStep(time: 0.0, key: .a, modifiers: [.command], expectedOutput: .armPendingPressAndHold, expectedIsMatched: false),
+                ScenarioStep(time: 0.1, key: nil, modifiers: [.command], expectedOutput: .cancelPendingPressAndHold, expectedIsMatched: false),
                 ScenarioStep(time: 0.2, key: .a, modifiers: [.command], expectedOutput: .startRecording, expectedIsMatched: true, expectedState: .doubleTapLock)
             ]
         )
@@ -357,12 +359,13 @@ struct HotKeyProcessorTests {
             hotkey: HotKey(key: .a, modifiers: [.command]),
             useDoubleTapOnly: true,
             steps: [
-                ScenarioStep(time: 0.0, key: .a, modifiers: [.command], expectedOutput: nil, expectedIsMatched: false),
-                ScenarioStep(time: 0.1, key: nil, modifiers: [.command], expectedOutput: nil, expectedIsMatched: false),
+                ScenarioStep(time: 0.0, key: .a, modifiers: [.command], expectedOutput: .armPendingPressAndHold, expectedIsMatched: false),
+                ScenarioStep(time: 0.1, key: nil, modifiers: [.command], expectedOutput: .cancelPendingPressAndHold, expectedIsMatched: false),
                 ScenarioStep(time: 0.2, key: .a, modifiers: [.command], expectedOutput: .startRecording, expectedIsMatched: true, expectedState: .doubleTapLock),
                 ScenarioStep(time: 0.3, key: nil, modifiers: [.command], expectedOutput: nil, expectedIsMatched: true, expectedState: .doubleTapLock),
                 ScenarioStep(time: 0.4, key: nil, modifiers: [], expectedOutput: nil, expectedIsMatched: true, expectedState: .doubleTapLock),
-                ScenarioStep(time: 1.0, key: .a, modifiers: [.command], expectedOutput: .stopRecording, expectedIsMatched: false)
+                ScenarioStep(time: 1.0, key: .a, modifiers: [.command], expectedOutput: nil, expectedIsMatched: true),
+                ScenarioStep(time: 1.1, key: nil, modifiers: [.command], expectedOutput: .stopRecording, expectedIsMatched: false)
             ]
         )
     }
@@ -375,10 +378,10 @@ struct HotKeyProcessorTests {
             hotkey: HotKey(key: nil, modifiers: [.command]),
             useDoubleTapOnly: true,
             steps: [
-                // First press — no recording yet
-                ScenarioStep(time: 0.0, key: nil, modifiers: [.command], expectedOutput: nil, expectedIsMatched: false),
-                // First release — still no recording, just records release time
-                ScenarioStep(time: 0.1, key: nil, modifiers: [], expectedOutput: nil, expectedIsMatched: false),
+                // The first press arms a delayed hold recording.
+                ScenarioStep(time: 0.0, key: nil, modifiers: [.command], expectedOutput: .armPendingPressAndHold, expectedIsMatched: false),
+                // A quick release cancels it and arms the lock gesture.
+                ScenarioStep(time: 0.1, key: nil, modifiers: [], expectedOutput: .cancelPendingPressAndHold, expectedIsMatched: false),
                 // Second press within threshold — starts recording in lock mode
                 ScenarioStep(time: 0.2, key: nil, modifiers: [.command], expectedOutput: .startRecording, expectedIsMatched: true)
             ]
@@ -391,58 +394,56 @@ struct HotKeyProcessorTests {
             hotkey: HotKey(key: nil, modifiers: [.command]),
             useDoubleTapOnly: true,
             steps: [
-                ScenarioStep(time: 0.0, key: nil, modifiers: [.command], expectedOutput: nil, expectedIsMatched: false),
-                ScenarioStep(time: 0.1, key: nil, modifiers: [], expectedOutput: nil, expectedIsMatched: false),
+                ScenarioStep(time: 0.0, key: nil, modifiers: [.command], expectedOutput: .armPendingPressAndHold, expectedIsMatched: false),
+                ScenarioStep(time: 0.1, key: nil, modifiers: [], expectedOutput: .cancelPendingPressAndHold, expectedIsMatched: false),
                 ScenarioStep(time: 0.2, key: nil, modifiers: [.command], expectedOutput: .startRecording, expectedIsMatched: true),
                 // Release after lock — should NOT stop (modifier-only lock persists)
                 ScenarioStep(time: 0.3, key: nil, modifiers: [], expectedOutput: nil, expectedIsMatched: true),
-                // Third press — stops recording
-                ScenarioStep(time: 0.5, key: nil, modifiers: [.command], expectedOutput: .stopRecording, expectedIsMatched: false)
+                // Third tap — stops on release after giving a hold time to select refinement.
+                ScenarioStep(time: 0.5, key: nil, modifiers: [.command], expectedOutput: nil, expectedIsMatched: true),
+                ScenarioStep(time: 0.6, key: nil, modifiers: [], expectedOutput: .stopRecording, expectedIsMatched: false)
             ]
         )
     }
 
     @Test
-    func doubleTapOnly_modifierOnly_slowDoubleTapIgnored() throws {
+    func doubleTapOnly_modifierOnly_slowSecondPressStartsNewHold() throws {
         runScenario(
             hotkey: HotKey(key: nil, modifiers: [.command]),
             useDoubleTapOnly: true,
             steps: [
                 // First press
-                ScenarioStep(time: 0.0, key: nil, modifiers: [.command], expectedOutput: nil, expectedIsMatched: false),
+                ScenarioStep(time: 0.0, key: nil, modifiers: [.command], expectedOutput: .armPendingPressAndHold, expectedIsMatched: false),
                 // First release
-                ScenarioStep(time: 0.1, key: nil, modifiers: [], expectedOutput: nil, expectedIsMatched: false),
-                // Second press too slow (> 0.3s after release)
-                ScenarioStep(time: 0.5, key: nil, modifiers: [.command], expectedOutput: nil, expectedIsMatched: false),
-                // Release — nothing happens
-                ScenarioStep(time: 0.6, key: nil, modifiers: [], expectedOutput: nil, expectedIsMatched: false)
+                ScenarioStep(time: 0.1, key: nil, modifiers: [], expectedOutput: .cancelPendingPressAndHold, expectedIsMatched: false),
+                // A second press outside the window is a new temporary hold.
+                ScenarioStep(time: 0.5, key: nil, modifiers: [.command], expectedOutput: .armPendingPressAndHold, expectedIsMatched: false),
+                ScenarioStep(time: 0.6, key: nil, modifiers: [], expectedOutput: .cancelPendingPressAndHold, expectedIsMatched: false)
             ]
         )
     }
 
     @Test
-    func doubleTapOnly_modifierOnly_singlePressIgnored() throws {
+    func doubleTapOnly_modifierOnly_quickSinglePressDiscards() throws {
         runScenario(
             hotkey: HotKey(key: nil, modifiers: [.command]),
             useDoubleTapOnly: true,
             steps: [
-                // Single press — no recording
-                ScenarioStep(time: 0.0, key: nil, modifiers: [.command], expectedOutput: nil, expectedIsMatched: false),
-                // Release — no recording
-                ScenarioStep(time: 0.1, key: nil, modifiers: [], expectedOutput: nil, expectedIsMatched: false)
+                ScenarioStep(time: 0.0, key: nil, modifiers: [.command], expectedOutput: .armPendingPressAndHold, expectedIsMatched: false),
+                ScenarioStep(time: 0.1, key: nil, modifiers: [], expectedOutput: .cancelPendingPressAndHold, expectedIsMatched: false)
             ]
         )
     }
 
     @Test
-    func doubleTapOnly_modifierOnly_slowFirstHoldDoesNotArm() throws {
+    func doubleTapOnly_modifierOnly_longFirstHoldRecordsWithoutArmingLock() throws {
         runScenario(
             hotkey: HotKey(key: nil, modifiers: [.command]),
             useDoubleTapOnly: true,
             steps: [
-                ScenarioStep(time: 0.0, key: nil, modifiers: [.command], expectedOutput: nil, expectedIsMatched: false),
-                ScenarioStep(time: 0.5, key: nil, modifiers: [], expectedOutput: nil, expectedIsMatched: false),
-                ScenarioStep(time: 0.6, key: nil, modifiers: [.command], expectedOutput: nil, expectedIsMatched: false)
+                ScenarioStep(time: 0.0, key: nil, modifiers: [.command], expectedOutput: .armPendingPressAndHold, expectedIsMatched: false),
+                ScenarioStep(time: 0.5, key: nil, modifiers: [], expectedOutput: .stopRecording, expectedIsMatched: false),
+                ScenarioStep(time: 0.6, key: nil, modifiers: [.command], expectedOutput: .armPendingPressAndHold, expectedIsMatched: false)
             ]
         )
     }
@@ -454,8 +455,8 @@ struct HotKeyProcessorTests {
             useDoubleTapOnly: true,
             steps: [
                 ScenarioStep(time: 0.0, key: nil, modifiers: [.option], expectedOutput: nil, expectedIsMatched: false),
-                ScenarioStep(time: 0.1, key: nil, modifiers: [.option, .command], expectedOutput: nil, expectedIsMatched: false),
-                ScenarioStep(time: 0.2, key: nil, modifiers: [.option], expectedOutput: nil, expectedIsMatched: false),
+                ScenarioStep(time: 0.1, key: nil, modifiers: [.option, .command], expectedOutput: .armPendingPressAndHold, expectedIsMatched: false),
+                ScenarioStep(time: 0.2, key: nil, modifiers: [.option], expectedOutput: .cancelPendingPressAndHold, expectedIsMatched: false),
                 ScenarioStep(time: 0.3, key: nil, modifiers: [.option, .command], expectedOutput: .startRecording, expectedIsMatched: true, expectedState: .doubleTapLock),
                 ScenarioStep(time: 0.4, key: nil, modifiers: [.option], expectedOutput: nil, expectedIsMatched: true, expectedState: .doubleTapLock)
             ]
@@ -757,14 +758,14 @@ struct HotKeyProcessorTests {
 	}
 
 	@Test
-	func doubleTapOnly_firstHeldTapStaysInert() {
+	func doubleTapOnly_firstHeldTapRecordsOnDemand() {
 		runScenario(
 			hotkey: HotKey(key: nil, modifiers: [.option]),
 			useDoubleTapOnly: true,
 			lockingHoldDuration: 0.75,
 			steps: [
-				ScenarioStep(time: 0.0, key: nil, modifiers: [.option], expectedOutput: nil, expectedIsMatched: false),
-				ScenarioStep(time: 1.0, key: nil, modifiers: [], expectedOutput: nil, expectedIsMatched: false),
+				ScenarioStep(time: 0.0, key: nil, modifiers: [.option], expectedOutput: .armPendingPressAndHold, expectedIsMatched: false),
+				ScenarioStep(time: 1.0, key: nil, modifiers: [], expectedOutput: .stopRecording, expectedIsMatched: false),
 			]
 		)
 	}
@@ -776,11 +777,12 @@ struct HotKeyProcessorTests {
 			useDoubleTapOnly: true,
 			lockingHoldDuration: 0.75,
 			steps: [
-				ScenarioStep(time: 0.0, key: nil, modifiers: [.option], expectedOutput: nil, expectedIsMatched: false),
-				ScenarioStep(time: 0.1, key: nil, modifiers: [], expectedOutput: nil, expectedIsMatched: false),
+				ScenarioStep(time: 0.0, key: nil, modifiers: [.option], expectedOutput: .armPendingPressAndHold, expectedIsMatched: false),
+				ScenarioStep(time: 0.1, key: nil, modifiers: [], expectedOutput: .cancelPendingPressAndHold, expectedIsMatched: false),
 				ScenarioStep(time: 0.2, key: nil, modifiers: [.option], expectedOutput: .startRecording, expectedIsMatched: true),
 				ScenarioStep(time: 0.3, key: nil, modifiers: [], expectedOutput: .locked, expectedIsMatched: true, expectedState: .doubleTapLock, expectedIsLongPressLocked: false),
-				ScenarioStep(time: 0.4, key: nil, modifiers: [.option], expectedOutput: .stopRecording, expectedIsMatched: false),
+				ScenarioStep(time: 0.4, key: nil, modifiers: [.option], expectedOutput: .armTerminalRefinement, expectedIsMatched: true),
+				ScenarioStep(time: 0.5, key: nil, modifiers: [], expectedOutput: .stopRecording, expectedIsMatched: false),
 			]
 		)
 	}
@@ -792,11 +794,12 @@ struct HotKeyProcessorTests {
 			useDoubleTapOnly: true,
 			lockingHoldDuration: 0.75,
 			steps: [
-				ScenarioStep(time: 0.0, key: nil, modifiers: [.option], expectedOutput: nil, expectedIsMatched: false),
-				ScenarioStep(time: 0.1, key: nil, modifiers: [], expectedOutput: nil, expectedIsMatched: false),
+				ScenarioStep(time: 0.0, key: nil, modifiers: [.option], expectedOutput: .armPendingPressAndHold, expectedIsMatched: false),
+				ScenarioStep(time: 0.1, key: nil, modifiers: [], expectedOutput: .cancelPendingPressAndHold, expectedIsMatched: false),
 				ScenarioStep(time: 0.2, key: nil, modifiers: [.option], expectedOutput: .startRecording, expectedIsMatched: true, expectedState: .pressAndHold(startTime: Date(timeIntervalSince1970: 0.2))),
 				ScenarioStep(time: 1.0, key: nil, modifiers: [], expectedOutput: .locked, expectedIsMatched: true, expectedState: .doubleTapLock, expectedIsLongPressLocked: true),
-				ScenarioStep(time: 1.2, key: nil, modifiers: [.option], expectedOutput: .stopRecording, expectedIsMatched: false, expectedState: .idle),
+				ScenarioStep(time: 1.2, key: nil, modifiers: [.option], expectedOutput: .armTerminalRefinement, expectedIsMatched: true),
+				ScenarioStep(time: 1.3, key: nil, modifiers: [], expectedOutput: .stopRecording, expectedIsMatched: false, expectedState: .idle),
 			]
 		)
 	}
@@ -810,8 +813,9 @@ struct HotKeyProcessorTests {
 				ScenarioStep(time: 0.0, key: nil, modifiers: [.option], expectedOutput: .startRecording, expectedIsMatched: true),
 				ScenarioStep(time: 0.1, key: nil, modifiers: [], expectedOutput: .stopRecording, expectedIsMatched: false),
 				ScenarioStep(time: 0.2, key: nil, modifiers: [.option], expectedOutput: .startRecording, expectedIsMatched: true, expectedState: .pressAndHold(startTime: Date(timeIntervalSince1970: 0.2))),
-				ScenarioStep(time: 1.0, key: nil, modifiers: [], expectedOutput: .locked, expectedIsMatched: true, expectedState: .doubleTapLock),
-				ScenarioStep(time: 1.2, key: nil, modifiers: [.option], expectedOutput: .stopRecording, expectedIsMatched: false, expectedState: .idle),
+				ScenarioStep(time: 1.0, key: nil, modifiers: [], expectedOutput: .locked, expectedIsMatched: true, expectedState: .doubleTapLock, expectedIsLongPressLocked: true),
+				ScenarioStep(time: 1.2, key: nil, modifiers: [.option], expectedOutput: .armTerminalRefinement, expectedIsMatched: true),
+				ScenarioStep(time: 1.3, key: nil, modifiers: [], expectedOutput: .stopRecording, expectedIsMatched: false, expectedState: .idle),
 			]
 		)
 	}
@@ -860,11 +864,78 @@ struct ScenarioStep {
     }
 }
 
+@Test
+func doubleTapLock_terminalHoldSelectsRefinement() {
+	runScenario(
+		hotkey: HotKey(key: nil, modifiers: [.option]),
+		useDoubleTapOnly: true,
+		lockingHoldDuration: 0.75,
+		steps: [
+			ScenarioStep(time: 0.0, modifiers: [.option], expectedOutput: .armPendingPressAndHold, expectedIsMatched: false),
+			ScenarioStep(time: 0.1, modifiers: [], expectedOutput: .cancelPendingPressAndHold, expectedIsMatched: false),
+			ScenarioStep(time: 0.2, modifiers: [.option], expectedOutput: .startRecording, expectedIsMatched: true),
+			ScenarioStep(time: 0.3, modifiers: [], expectedOutput: .locked, expectedIsMatched: true),
+			ScenarioStep(time: 1.0, modifiers: [.option], expectedOutput: .armTerminalRefinement, expectedIsMatched: true),
+			ScenarioStep(time: 1.75, modifiers: [], expectedOutput: .stopRecordingWithRefinement, expectedIsMatched: false)
+		]
+	)
+}
+
+@Test
+func doubleTapLock_standardModeTerminalHoldSelectsRefinement() {
+	runScenario(
+		hotkey: HotKey(key: nil, modifiers: [.option]),
+		lockingHoldDuration: 0.75,
+		steps: [
+			ScenarioStep(time: 0.0, modifiers: [.option], expectedOutput: .startRecording),
+			ScenarioStep(time: 0.1, modifiers: [], expectedOutput: .stopRecording),
+			ScenarioStep(time: 0.2, modifiers: [.option], expectedOutput: .startRecording),
+			ScenarioStep(time: 0.3, modifiers: [], expectedOutput: .locked, expectedState: .doubleTapLock),
+			ScenarioStep(time: 1.0, modifiers: [.option], expectedOutput: .armTerminalRefinement),
+			ScenarioStep(time: 1.75, modifiers: [], expectedOutput: .stopRecordingWithRefinement)
+		]
+	)
+}
+
+@Test
+func pressAndHold_quickSecondTapRefinesCompletedTranscript() {
+	runScenario(
+		hotkey: HotKey(key: nil, modifiers: [.option]),
+		doubleTapLockEnabled: false,
+		lockingHoldDuration: 0.75,
+		postHoldRefinementEnabled: true,
+		steps: [
+			ScenarioStep(time: 0.0, modifiers: [.option], expectedOutput: .startRecording),
+			ScenarioStep(time: 1.0, modifiers: [], expectedOutput: .stopRecording),
+			ScenarioStep(time: 1.1, modifiers: [.option], expectedOutput: .refineMostRecentTranscription),
+			ScenarioStep(time: 1.2, modifiers: [])
+		]
+	)
+}
+
+@Test
+func pressAndHold_heldSecondTapCapturesScreenContext() {
+	runScenario(
+		hotkey: HotKey(key: nil, modifiers: [.option]),
+		doubleTapLockEnabled: false,
+		lockingHoldDuration: 0.75,
+		screenAwareSecondTapEnabled: true,
+		steps: [
+			ScenarioStep(time: 0.0, modifiers: [.option], expectedOutput: .startRecording),
+			ScenarioStep(time: 0.1, modifiers: [], expectedOutput: .stopRecording),
+			ScenarioStep(time: 0.2, modifiers: [.option], expectedOutput: .startRecordingAndArmScreenAware),
+			ScenarioStep(time: 1.0, modifiers: [], expectedOutput: .stopRecordingWithScreenContext)
+		]
+	)
+}
+
 func runScenario(
     hotkey: HotKey,
     useDoubleTapOnly: Bool = false,
-    doubleTapLockEnabled: Bool = true,
+	doubleTapLockEnabled: Bool = true,
 	lockingHoldDuration: TimeInterval? = nil,
+	screenAwareSecondTapEnabled: Bool = false,
+	postHoldRefinementEnabled: Bool = false,
     steps: [ScenarioStep]
 ) {
     // Sort steps by time, just in case they're not in ascending order
@@ -884,6 +955,8 @@ func runScenario(
         )
     }
 	processor.lockingHoldDuration = lockingHoldDuration
+	processor.screenAwareSecondTapEnabled = screenAwareSecondTapEnabled
+	processor.postHoldRefinementEnabled = postHoldRefinementEnabled
 
     // We'll step through each event
     for step in sortedSteps {

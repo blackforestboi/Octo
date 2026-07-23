@@ -74,7 +74,6 @@ struct SettingsView: View {
 	private var isCapturingHotKey: Bool {
 		store.isSettingHotKey
 			|| store.isSettingPasteLastTranscriptHotkey
-			|| store.isSettingRefinedHotKey
 	}
 }
 

@@ -25,8 +25,27 @@ extension ScreenCaptureClient: DependencyKey {
 
 			let target = try await MainActor.run { try CaptureTarget.displayUnderCursor() }
 			try Task.checkCancellation()
-			guard let image = CGDisplayCreateImage(target.displayID) else {
+			let selection = try await ScreenCaptureSelectionOverlay.selectRegion(
+				on: target.screenFrame,
+				backingScaleFactor: target.backingScaleFactor
+			)
+			try Task.checkCancellation()
+			guard let displayImage = CGDisplayCreateImage(target.displayID) else {
 				throw ScreenCaptureError.captureFailed
+			}
+			let image: CGImage
+			if let selection {
+				guard let pixelRect = ScreenCaptureSelection.pixelRect(
+					for: selection,
+					displayPointSize: target.screenFrame.size,
+					backingScaleFactor: target.backingScaleFactor,
+					imageSize: CGSize(width: displayImage.width, height: displayImage.height)
+				), let croppedImage = displayImage.cropping(to: pixelRect) else {
+					throw ScreenCaptureError.captureFailed
+				}
+				image = croppedImage
+			} else {
+				image = displayImage
 			}
 			try Task.checkCancellation()
 			await frameCaptured()
@@ -114,6 +133,8 @@ private struct CaptureTarget: Sendable {
 	let displayID: CGDirectDisplayID
 	let cursorX: Double
 	let cursorY: Double
+	let screenFrame: CGRect
+	let backingScaleFactor: CGFloat
 
 	@MainActor
 	static func displayUnderCursor() throws -> Self {
@@ -127,7 +148,9 @@ private struct CaptureTarget: Sendable {
 		return .init(
 			displayID: CGDirectDisplayID(displayNumber.uint32Value),
 			cursorX: (cursor.x - screen.frame.minX) * screen.backingScaleFactor,
-			cursorY: (cursor.y - screen.frame.minY) * screen.backingScaleFactor
+			cursorY: (cursor.y - screen.frame.minY) * screen.backingScaleFactor,
+			screenFrame: screen.frame,
+			backingScaleFactor: screen.backingScaleFactor
 		)
 	}
 }

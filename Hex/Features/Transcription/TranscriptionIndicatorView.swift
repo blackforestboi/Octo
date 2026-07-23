@@ -12,7 +12,7 @@ import SwiftUI
 struct TranscriptionIndicatorView: View {
   @ObserveInjection var inject
   
-  enum Status {
+  enum Status: Equatable {
     case hidden
     case optionKeyPressed
     case recording
@@ -20,6 +20,7 @@ struct TranscriptionIndicatorView: View {
     case transcribing
 	case refining
     case prewarming
+	case error(String)
   }
 
   var status: Status
@@ -36,6 +37,7 @@ struct TranscriptionIndicatorView: View {
     case .transcribing: return mixedColor(.blue, with: .black, by: 0.5)
 	case .refining: return mixedColor(.purple, with: .black, by: 0.5)
     case .prewarming: return mixedColor(.blue, with: .black, by: 0.5)
+	case .error: return mixedColor(.systemRed, with: .black, by: 0.4)
     }
   }
 
@@ -48,6 +50,7 @@ struct TranscriptionIndicatorView: View {
     case .transcribing: return mixedColor(.blue, with: .white, by: 0.1).opacity(0.6)
 	case .refining: return mixedColor(.purple, with: .white, by: 0.1).opacity(0.6)
     case .prewarming: return mixedColor(.blue, with: .white, by: 0.1).opacity(0.6)
+	case .error: return mixedColor(.systemRed, with: .white, by: 0.2).opacity(0.8)
     }
   }
 
@@ -69,6 +72,7 @@ struct TranscriptionIndicatorView: View {
     case .transcribing: return transcribeBaseColor
 	case .refining: return .purple
     case .prewarming: return transcribeBaseColor
+	case .error: return .red
     }
   }
 
@@ -81,6 +85,7 @@ struct TranscriptionIndicatorView: View {
 		switch status {
 		case .screenAware: screenAwareWidth
 		case .recording: expandedWidth
+		case .error: 300
 		default: baseWidth
 		}
 	}
@@ -94,6 +99,7 @@ struct TranscriptionIndicatorView: View {
 		case .transcribing: "Transcribing"
 		case .refining: "Refining"
 		case .prewarming: "Model prewarming"
+		case let .error(message): "Error: \(message)"
 		}
 	}
 
@@ -146,6 +152,16 @@ struct TranscriptionIndicatorView: View {
 			  .foregroundStyle(.white)
 			  .lineLimit(1)
 		  }
+		}
+		.overlay {
+			if case let .error(message) = status {
+				Label(message, systemImage: "exclamationmark.triangle.fill")
+					.font(.system(size: 10, weight: .semibold))
+					.foregroundStyle(.white)
+					.lineLimit(2)
+					.multilineTextAlignment(.center)
+					.padding(.horizontal, 10)
+			}
 		}
         .cornerRadius(cornerRadius)
         .shadow(

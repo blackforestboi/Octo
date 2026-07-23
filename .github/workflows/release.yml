@@ -13,6 +13,8 @@ on:
 
 permissions:
   contents: write
+  pages: write
+  id-token: write
 
 jobs:
   release:
@@ -38,11 +40,11 @@ jobs:
           set -euo pipefail
           mkdir -p build
           xcodebuild \
-            -scheme Hex \
+            -scheme Octo \
             -configuration Release \
             -skipMacroValidation \
             -skipPackagePluginValidation \
-            -archivePath "$RUNNER_TEMP/Hex.xcarchive" \
+            -archivePath "$RUNNER_TEMP/Octo.xcarchive" \
             CODE_SIGN_STYLE=Manual \
             CODE_SIGN_IDENTITY="Developer ID Application" \
             DEVELOPMENT_TEAM="$TEAM_ID" \
@@ -63,8 +65,8 @@ jobs:
           </dict></plist>
           PLIST
           xcodebuild -exportArchive \
-            -archivePath "$RUNNER_TEMP/Hex.xcarchive" \
-            -exportPath "$RUNNER_TEMP/Hex-export" \
+            -archivePath "$RUNNER_TEMP/Octo.xcarchive" \
+            -exportPath "$RUNNER_TEMP/Octo-export" \
             -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist"
 
       - name: Prepare App Store Connect API key
@@ -83,13 +85,13 @@ jobs:
       - name: Notarize app
         run: |
           set -euo pipefail
-          ditto -c -k --keepParent "$RUNNER_TEMP/Hex-export/Hex.app" "$RUNNER_TEMP/Hex-notarization.zip"
-          xcrun notarytool submit "$RUNNER_TEMP/Hex-notarization.zip" \
+          ditto -c -k --keepParent "$RUNNER_TEMP/Octo-export/Octo.app" "$RUNNER_TEMP/Octo-notarization.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/Octo-notarization.zip" \
             --key "$APPLE_API_KEY_PATH" \
             --key-id "$APPLE_API_KEY_ID" \
             --issuer "$APPLE_API_ISSUER" \
             --wait
-          xcrun stapler staple "$RUNNER_TEMP/Hex-export/Hex.app"
+          xcrun stapler staple "$RUNNER_TEMP/Octo-export/Octo.app"
 
       - name: Package release assets
         id: package
@@ -97,22 +99,22 @@ jobs:
           INPUT_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
-          VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$RUNNER_TEMP/Hex-export/Hex.app/Contents/Info.plist")
+          VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$RUNNER_TEMP/Octo-export/Octo.app/Contents/Info.plist")
           TAG="$INPUT_TAG"
           if [ "$VERSION" != "${TAG#v}" ]; then
             echo "Tag $TAG does not match app version $VERSION" >&2
             exit 1
           fi
           mkdir -p dist
-          ditto -c -k --keepParent "$RUNNER_TEMP/Hex-export/Hex.app" "dist/Hex-$VERSION.zip"
-          hdiutil create -volname "Hex $VERSION" -srcfolder "$RUNNER_TEMP/Hex-export/Hex.app" -ov -format UDZO "dist/Hex-$VERSION.dmg"
-          xcrun notarytool submit "dist/Hex-$VERSION.dmg" \
+          ditto -c -k --keepParent "$RUNNER_TEMP/Octo-export/Octo.app" "dist/Octo-$VERSION.zip"
+          hdiutil create -volname "Octo $VERSION" -srcfolder "$RUNNER_TEMP/Octo-export/Octo.app" -ov -format UDZO "dist/Octo-$VERSION.dmg"
+          xcrun notarytool submit "dist/Octo-$VERSION.dmg" \
             --key "$APPLE_API_KEY_PATH" \
             --key-id "$APPLE_API_KEY_ID" \
             --issuer "$APPLE_API_ISSUER" \
             --wait
-          xcrun stapler staple "dist/Hex-$VERSION.dmg"
-          xcrun stapler validate "dist/Hex-$VERSION.dmg"
+          xcrun stapler staple "dist/Octo-$VERSION.dmg"
+          xcrun stapler validate "dist/Octo-$VERSION.dmg"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Publish GitHub Release
@@ -124,7 +126,39 @@ jobs:
           TAG="$INPUT_TAG"
           gh release create "$TAG" \
             --verify-tag \
-            --title "Hex ${{ steps.package.outputs.version }}" \
+            --title "Octo ${{ steps.package.outputs.version }}" \
             --generate-notes \
-            "dist/Hex-${{ steps.package.outputs.version }}.dmg" \
-            "dist/Hex-${{ steps.package.outputs.version }}.zip"
+            "dist/Octo-${{ steps.package.outputs.version }}.dmg" \
+            "dist/Octo-${{ steps.package.outputs.version }}.zip"
+
+      - name: Generate signed Sparkle appcast
+        env:
+          INPUT_TAG: ${{ inputs.tag || github.ref_name }}
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$SPARKLE_PRIVATE_KEY"
+          GENERATE_APPCAST=$(find "$HOME/Library/Developer/Xcode/DerivedData" -path '*/Sparkle/bin/generate_appcast' -type f -print -quit)
+          test -n "$GENERATE_APPCAST"
+          mkdir update-site
+          if ! curl --fail --location --output update-site/appcast.xml \
+            https://blackforestboi.github.io/Octo/appcast.xml; then
+            cp docs/updates/appcast.xml update-site/appcast.xml
+          fi
+          cp "dist/Octo-${{ steps.package.outputs.version }}.dmg" update-site/
+          printf '%s' "$SPARKLE_PRIVATE_KEY" | "$GENERATE_APPCAST" \
+            --ed-key-file - \
+            --download-url-prefix "https://github.com/$GITHUB_REPOSITORY/releases/download/$INPUT_TAG/" \
+            --maximum-versions 0 \
+            --maximum-deltas 0 \
+            -o update-site/appcast.xml \
+            update-site
+
+      - name: Upload update feed
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: update-site
+
+      - name: Publish update feed
+        id: deployment
+        uses: actions/deploy-pages@v4

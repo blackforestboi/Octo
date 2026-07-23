@@ -10,7 +10,7 @@ public extension URL {
 				appropriateFor: nil,
 				create: true
 			)
-			let hexDirectory = appSupport.appendingPathComponent("com.kitlangton.Hex", isDirectory: true)
+			let hexDirectory = appSupport.appendingPathComponent("io.github.blackforestboi.Octo", isDirectory: true)
 			try fm.createDirectory(at: hexDirectory, withIntermediateDirectories: true)
 			return hexDirectory
 		}

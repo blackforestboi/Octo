@@ -2,7 +2,7 @@ import ComposableArchitecture
 import HexCore
 import XCTest
 
-@testable import Hex
+@testable import Octo
 
 @MainActor
 final class ModelDownloadFeatureTests: XCTestCase {

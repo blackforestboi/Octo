@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1200" viewBox="0 0 1200 1200">
+  <rect width="1200" height="1200" rx="220" fill="#40B7B8"/>
+  <defs>
+    <g id="arm">
+      <!-- The broad arm. Reusing it at eight rotations keeps the body unified. -->
+      <path d="M600 600 C595 500 584 410 600 325 C612 258 671 222 716 257 C758 290 744 350 696 365"
+            fill="none" stroke="#003A54" stroke-width="102" stroke-linecap="round" stroke-linejoin="round"/>
+      <!-- Seven cups trace one offset curve parallel to the concave inner rim. -->
+      <g fill="#FFFFFF">
+        <circle cx="600" cy="278" r="14"/>
+        <circle cx="627" cy="254" r="14"/>
+        <circle cx="660" cy="248" r="14"/>
+        <circle cx="690" cy="261" r="14"/>
+        <circle cx="712" cy="285" r="14"/>
+        <circle cx="720" cy="316" r="14"/>
+        <circle cx="710" cy="345" r="14"/>
+      </g>
+    </g>
+  </defs>
+  <g>
+    <use href="#arm"/>
+    <use href="#arm" transform="rotate(45 600 600)"/>
+    <use href="#arm" transform="rotate(90 600 600)"/>
+    <use href="#arm" transform="rotate(135 600 600)"/>
+    <use href="#arm" transform="rotate(180 600 600)"/>
+    <use href="#arm" transform="rotate(225 600 600)"/>
+    <use href="#arm" transform="rotate(270 600 600)"/>
+    <use href="#arm" transform="rotate(315 600 600)"/>
+  </g>
+  <circle cx="600" cy="600" r="112" fill="#003A54"/>
+</svg>

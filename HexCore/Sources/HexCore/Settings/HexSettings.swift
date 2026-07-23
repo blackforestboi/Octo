@@ -75,6 +75,15 @@ public struct HexSettings: Codable, Equatable, Sendable {
 	/// Optional post-processing is deliberately separate from the transcription pipeline.
 	public var refinementMode: RefinementMode
 	public var refinementProvider: RefinementProvider
+	/// Controls how much reasoning the refinement provider should use when supported.
+	public var refinementReasoningEffort: RefinementReasoningEffort
+	/// Prevents a one-time fresh-install check from overriding a user's provider choice later.
+	public var hasCompletedRefinementProviderDetection: Bool
+	/// Model selections are kept per provider so changing providers never reuses an incompatible ID.
+	public var openAIModelID: String?
+	public var anthropicModelID: String?
+	public var codexCLIModelID: String?
+	public var claudeCLIModelID: String?
 	/// User-authored instructions appended to Hex's refinement contract.
 	public var refinementInstructions: String
 	public var openRouterModelID: String?
@@ -85,12 +94,7 @@ public struct HexSettings: Codable, Equatable, Sendable {
 	public var screenAwareDictationEnabled: Bool
 	/// Chooses whether Screen Aware sends a screenshot to OpenRouter or uses local OCR only.
 	public var screenAwareInputSource: ScreenAwareInputSource
-	/// Optional second recording shortcut that always runs the refinement stage.
-	public var refinedHotkey: HotKey?
-	public var refinedDoubleTapLockEnabled: Bool
-	public var refinedUseDoubleTapOnly: Bool
-	public var refinedMinimumKeyTime: Double
-	/// Whether the refined-transcription hotkey captures selected text as the source material.
+	/// Whether recording captures selected text as refinement source material.
 	public var includeSelectedTextInRefinement: Bool
 
 	public var isScreenAwareDictationConfigured: Bool {
@@ -120,7 +124,8 @@ public struct HexSettings: Codable, Equatable, Sendable {
 			mode: mode,
 			instructions: instructions,
 			provider: refinementProvider,
-			modelID: openRouterModelID
+			reasoningEffort: refinementReasoningEffort,
+			modelID: selectedRefinementModelID
 			)
 		}
 
@@ -135,9 +140,10 @@ public struct HexSettings: Codable, Equatable, Sendable {
 			return RefinementRequest(
 				text: spokenRequest,
 				mode: .refined,
-				instructions: refinementInstructions.trimmingCharacters(in: .whitespacesAndNewlines),
+			instructions: refinementInstructions.trimmingCharacters(in: .whitespacesAndNewlines),
 			provider: usesUploadedImage && !refinementProvider.supportsImageInput ? .openRouter : refinementProvider,
-				modelID: usesUploadedImage ? (imageModelID ?? screenAwareOpenRouterModelID) : openRouterModelID,
+			reasoningEffort: refinementReasoningEffort,
+			modelID: usesUploadedImage ? (imageModelID ?? screenAwareOpenRouterModelID) : selectedRefinementModelID,
 				screenContext: context,
 				screenAwareInputSource: inputSource
 			)
@@ -147,8 +153,22 @@ public struct HexSettings: Codable, Equatable, Sendable {
 		if !doubleTapLockEnabled {
 			useDoubleTapOnly = false
 		}
-		if !refinedDoubleTapLockEnabled {
-			refinedUseDoubleTapOnly = false
+	}
+
+	private var selectedRefinementModelID: String? {
+		switch refinementProvider {
+		case .openRouter:
+			openRouterModelID
+		case .openAI:
+			openAIModelID ?? openRouterModelID // Retains selections made before per-provider storage.
+		case .anthropic:
+			anthropicModelID ?? openRouterModelID // Retains selections made before per-provider storage.
+		case .codexCLI:
+			codexCLIModelID
+		case .claudeCLI:
+			claudeCLIModelID
+		case .apple, .gemini:
+			nil
 		}
 	}
 
@@ -182,15 +202,17 @@ public struct HexSettings: Codable, Equatable, Sendable {
 		removePunctuation: Bool = false,
 		refinementMode: RefinementMode = .raw,
 		refinementProvider: RefinementProvider = .apple,
+		refinementReasoningEffort: RefinementReasoningEffort = .none,
+		hasCompletedRefinementProviderDetection: Bool = false,
+		openAIModelID: String? = nil,
+		anthropicModelID: String? = nil,
+		codexCLIModelID: String? = nil,
+		claudeCLIModelID: String? = nil,
 			refinementInstructions: String = HexSettings.defaultRefinementInstructions,
 			openRouterModelID: String? = nil,
 			screenAwareOpenRouterModelID: String? = nil,
 			screenAwareDictationEnabled: Bool = false,
 			screenAwareInputSource: ScreenAwareInputSource = .localOCR,
-			refinedHotkey: HotKey? = .init(key: nil, modifiers: [.option]),
-		refinedDoubleTapLockEnabled: Bool = true,
-		refinedUseDoubleTapOnly: Bool = false,
-		refinedMinimumKeyTime: Double = HexCoreConstants.defaultMinimumKeyTime,
 		includeSelectedTextInRefinement: Bool = true
 	) {
 		self.soundEffectsEnabled = soundEffectsEnabled
@@ -222,15 +244,17 @@ public struct HexSettings: Codable, Equatable, Sendable {
 		self.removePunctuation = removePunctuation
 		self.refinementMode = refinementMode
 		self.refinementProvider = refinementProvider
+		self.refinementReasoningEffort = refinementReasoningEffort
+		self.hasCompletedRefinementProviderDetection = hasCompletedRefinementProviderDetection
+		self.openAIModelID = openAIModelID
+		self.anthropicModelID = anthropicModelID
+		self.codexCLIModelID = codexCLIModelID
+		self.claudeCLIModelID = claudeCLIModelID
 			self.refinementInstructions = refinementInstructions
 			self.openRouterModelID = openRouterModelID
 			self.screenAwareOpenRouterModelID = screenAwareOpenRouterModelID
 			self.screenAwareDictationEnabled = screenAwareDictationEnabled
 			self.screenAwareInputSource = screenAwareInputSource
-		self.refinedHotkey = refinedHotkey
-		self.refinedDoubleTapLockEnabled = refinedDoubleTapLockEnabled
-		self.refinedUseDoubleTapOnly = refinedUseDoubleTapOnly
-		self.refinedMinimumKeyTime = refinedMinimumKeyTime
 		self.includeSelectedTextInRefinement = includeSelectedTextInRefinement
 		normalizeDoubleTapSettings()
 	}
@@ -238,8 +262,14 @@ public struct HexSettings: Codable, Equatable, Sendable {
 	public init(from decoder: Decoder) throws {
 		self.init()
 		let container = try decoder.container(keyedBy: HexSettingKey.self)
+		let hasStoredRefinementProviderDetection = container.contains(.hasCompletedRefinementProviderDetection)
 		for field in HexSettingsSchema.fields {
 			try field.decode(into: &self, from: container)
+		}
+		// Existing installations already have a provider choice. Only a fresh
+		// settings store should receive the automatic subscription selection.
+		if !hasStoredRefinementProviderDetection {
+			hasCompletedRefinementProviderDetection = true
 		}
 		normalizeDoubleTapSettings()
 	}
@@ -257,7 +287,7 @@ private extension RefinementProvider {
 		switch self {
 		case .openRouter, .openAI, .anthropic:
 			true
-		case .apple, .gemini:
+		case .apple, .gemini, .codexCLI, .claudeCLI:
 			false
 		}
 	}
@@ -296,15 +326,17 @@ private enum HexSettingKey: String, CodingKey, CaseIterable {
 	case removePunctuation
 	case refinementMode
 	case refinementProvider
-		case refinementInstructions
+	case refinementReasoningEffort
+	case hasCompletedRefinementProviderDetection
+	case openAIModelID
+	case anthropicModelID
+	case codexCLIModelID
+	case claudeCLIModelID
+	case refinementInstructions
 		case openRouterModelID
 		case screenAwareOpenRouterModelID
 		case screenAwareDictationEnabled
 		case screenAwareInputSource
-		case refinedHotkey
-	case refinedDoubleTapLockEnabled
-	case refinedUseDoubleTapOnly
-	case refinedMinimumKeyTime
 	case includeSelectedTextInRefinement
 }
 
@@ -444,6 +476,36 @@ private enum HexSettingsSchema {
 		SettingsField(.removePunctuation, keyPath: \.removePunctuation, default: defaults.removePunctuation).eraseToAny(),
 		SettingsField(.refinementMode, keyPath: \.refinementMode, default: defaults.refinementMode).eraseToAny(),
 		SettingsField(.refinementProvider, keyPath: \.refinementProvider, default: defaults.refinementProvider).eraseToAny(),
+		SettingsField(.refinementReasoningEffort, keyPath: \.refinementReasoningEffort, default: defaults.refinementReasoningEffort).eraseToAny(),
+		SettingsField(
+			.hasCompletedRefinementProviderDetection,
+			keyPath: \.hasCompletedRefinementProviderDetection,
+			default: defaults.hasCompletedRefinementProviderDetection
+		).eraseToAny(),
+		SettingsField(
+			.openAIModelID,
+			keyPath: \.openAIModelID,
+			default: defaults.openAIModelID,
+			encode: { container, key, value in try container.encodeIfPresent(value, forKey: key) }
+		).eraseToAny(),
+		SettingsField(
+			.anthropicModelID,
+			keyPath: \.anthropicModelID,
+			default: defaults.anthropicModelID,
+			encode: { container, key, value in try container.encodeIfPresent(value, forKey: key) }
+		).eraseToAny(),
+		SettingsField(
+			.codexCLIModelID,
+			keyPath: \.codexCLIModelID,
+			default: defaults.codexCLIModelID,
+			encode: { container, key, value in try container.encodeIfPresent(value, forKey: key) }
+		).eraseToAny(),
+		SettingsField(
+			.claudeCLIModelID,
+			keyPath: \.claudeCLIModelID,
+			default: defaults.claudeCLIModelID,
+			encode: { container, key, value in try container.encodeIfPresent(value, forKey: key) }
+		).eraseToAny(),
 		SettingsField(.refinementInstructions, keyPath: \.refinementInstructions, default: defaults.refinementInstructions).eraseToAny(),
 			SettingsField(
 				.openRouterModelID,
@@ -459,15 +521,6 @@ private enum HexSettingsSchema {
 		).eraseToAny(),
 		SettingsField(.screenAwareDictationEnabled, keyPath: \.screenAwareDictationEnabled, default: defaults.screenAwareDictationEnabled).eraseToAny(),
 		SettingsField(.screenAwareInputSource, keyPath: \.screenAwareInputSource, default: defaults.screenAwareInputSource).eraseToAny(),
-		SettingsField(
-			.refinedHotkey,
-			keyPath: \.refinedHotkey,
-			default: defaults.refinedHotkey,
-			encode: { container, key, value in try container.encodeIfPresent(value, forKey: key) }
-		).eraseToAny(),
-		SettingsField(.refinedDoubleTapLockEnabled, keyPath: \.refinedDoubleTapLockEnabled, default: defaults.refinedDoubleTapLockEnabled).eraseToAny(),
-		SettingsField(.refinedUseDoubleTapOnly, keyPath: \.refinedUseDoubleTapOnly, default: defaults.refinedUseDoubleTapOnly).eraseToAny(),
-		SettingsField(.refinedMinimumKeyTime, keyPath: \.refinedMinimumKeyTime, default: defaults.refinedMinimumKeyTime).eraseToAny(),
 		SettingsField(.includeSelectedTextInRefinement, keyPath: \.includeSelectedTextInRefinement, default: defaults.includeSelectedTextInRefinement).eraseToAny()
 	]
 }

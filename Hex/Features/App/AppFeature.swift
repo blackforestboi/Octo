@@ -15,6 +15,7 @@ import SwiftUI
 struct AppFeature {
 	private enum CancelID {
 		case modelMissingFlash
+		case subscriptionProviderDetection
 	}
 
   enum ActiveTab: Equatable {
@@ -48,17 +49,20 @@ struct AppFeature {
     case setActiveTab(ActiveTab)
     case task
     case pasteLastTranscript
+    case interruptedRecordingsRecovered([RecoveredRecording])
 
     // Permission actions
     case checkPermissions
     case permissionsUpdated(mic: PermissionStatus, acc: PermissionStatus, input: PermissionStatus, screenRecording: Bool)
-    case appActivated
-    case modelStatusEvaluated(Bool)
+		case appActivated
+		case modelStatusEvaluated(Bool)
+		case preferredSubscriptionProviderDetected(RefinementProvider?)
   }
 
   @Dependency(\.keyEventMonitor) var keyEventMonitor
   @Dependency(\.pasteboard) var pasteboard
   @Dependency(\.transcription) var transcription
+  @Dependency(\.recording) var recording
   @Dependency(\.permissions) var permissions
 
   var body: some ReducerOf<Self> {
@@ -82,20 +86,81 @@ struct AppFeature {
         return .none
         
       case .task:
-        return .merge(
+        let startupEffects: [Effect<Action>] = [
           startPasteLastTranscriptMonitoring(),
           ensureSelectedModelReadiness(),
-          startPermissionMonitoring()
+          startPermissionMonitoring(),
+          .run { [recording] send in
+            await send(.interruptedRecordingsRecovered(await recording.recoverInterruptedRecordings()))
+          }
+        ]
+        guard !state.hexSettings.hasCompletedRefinementProviderDetection,
+              state.hexSettings.refinementProvider == .apple
+        else {
+          return .merge(startupEffects)
+        }
+        return .merge(
+          startupEffects + [
+            .run { send in
+				let provider = await CLIRefinementClient.preferredAuthenticatedProvider()
+				await send(.preferredSubscriptionProviderDetected(
+					provider == .codex ? .codexCLI : provider == .claude ? .claudeCLI : nil
+				))
+            }
+            .cancellable(id: CancelID.subscriptionProviderDetection, cancelInFlight: true)
+          ]
         )
         
       case .pasteLastTranscript:
         @Shared(.transcriptionHistory) var transcriptionHistory: TranscriptionHistory
-        guard let lastTranscript = transcriptionHistory.history.first?.text else {
+        guard let lastTranscript = transcriptionHistory.history.first(where: {
+          $0.recoverySessionID == nil && !$0.text.isEmpty
+        })?.text else {
           return .none
         }
         return .run { _ in
           await pasteboard.paste(lastTranscript)
         }
+
+      case let .interruptedRecordingsRecovered(recordings):
+        guard !recordings.isEmpty else { return .none }
+        state.history.$transcriptionHistory.withLock { history in
+          for recovered in recordings where !history.history.contains(where: { $0.recoverySessionID == recovered.sessionID }) {
+            history.history.insert(
+              Transcript(
+                timestamp: recovered.createdAt,
+                text: "Recovered audio from an interrupted recording.",
+                audioPath: recovered.audioURL,
+                duration: recovered.duration,
+                status: .failed,
+                processingErrors: [
+                  .init(
+                    stage: .audio,
+                    message: "Octo restarted before this recording was transcribed. The recovered audio is available here."
+                  )
+                ],
+                recoverySessionID: recovered.sessionID
+              ),
+              at: 0
+            )
+          }
+        }
+        return .run { [recording] _ in
+          for recovered in recordings {
+            await recording.releaseRecordingSource(recovered.audioURL)
+          }
+        }
+
+      case let .preferredSubscriptionProviderDetected(provider):
+        guard !state.hexSettings.hasCompletedRefinementProviderDetection else {
+          return .none
+        }
+        state.$hexSettings.withLock { settings in
+          settings.hasCompletedRefinementProviderDetection = true
+          guard settings.refinementProvider == .apple, let provider else { return }
+			settings.refinementProvider = provider
+        }
+        return .none
         
       case .transcription(.modelMissing):
         HexLog.app.notice("Model missing - activating app and switching to settings")
@@ -149,6 +214,19 @@ struct AppFeature {
         return .run { _ in
           await permissions.openScreenRecordingSettings()
         }
+
+		case let .settings(.refinementProviderChanged(provider)):
+			switch provider {
+			case .codexCLI, .claudeCLI:
+				let cliProvider: CLIRefinementClient.Provider = provider == .codexCLI ? .codex : .claude
+				return .run { send in
+					if let message = await CLIRefinementClient.authenticationError(for: cliProvider) {
+						await send(.transcription(.showError(message)))
+					}
+				}
+			default:
+				return .send(.transcription(.dismissError))
+			}
 
       case .settings:
         return .none

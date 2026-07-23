@@ -1,29 +1,29 @@
-# Hex – Dev Notes for Agents
+# Octo – Dev Notes for Agents
 
 This file provides guidance for coding agents working in this repo.
 
 ## Project Overview
 
-Hex is a macOS menu bar application for on‑device voice‑to‑text. It supports Whisper (Core ML via WhisperKit) and Parakeet TDT v3 (Core ML via FluidAudio). Users activate transcription with hotkeys; text can be auto‑pasted into the active app.
+Octo is a macOS menu bar application for on‑device voice‑to‑text. It supports Whisper (Core ML via WhisperKit) and Parakeet TDT v3 (Core ML via FluidAudio). Users activate transcription with hotkeys; text can be auto‑pasted into the active app.
 
 ## Build & Development Commands
 
 ```bash
 # Local development build (the default for feature work): builds an unsigned Debug .app.
 # Do not run tests, archives, signing, DMGs, or release builds unless explicitly requested.
-xcodebuild -scheme Hex -configuration Debug \
+xcodebuild -scheme Octo -configuration Debug \
   -skipMacroValidation -skipPackagePluginValidation \
   CODE_SIGNING_ALLOWED=NO build
 
 # Launch the locally built bundle
-open ~/Library/Developer/Xcode/DerivedData/Hex-*/Build/Products/Debug/'Hex Debug.app'
+open ~/Library/Developer/Xcode/DerivedData/Hex-*/Build/Products/Debug/'Octo Debug.app'
 
 # Tests are opt-in only: run them only when the user explicitly asks.
 # Unit tests (must be run from HexCore directory)
 cd HexCore && swift test
 
 # Or run all tests via Xcode
-xcodebuild test -scheme Hex
+xcodebuild test -scheme Octo
 
 # Open in Xcode (recommended for development)
 open Hex.xcodeproj
@@ -64,7 +64,7 @@ The app uses **The Composable Architecture (TCA)** for state management. Key arc
 - **WhisperKit**: Core ML transcription (tracking main branch)
 - **FluidAudio (Parakeet)**: Core ML ASR (multilingual) default model
 - **Sauce**: Keyboard event monitoring
-- **Sparkle**: Auto-updates (feed: https://hex-updates.s3.amazonaws.com/appcast.xml)
+- **Sparkle**: Auto-updates (feed: https://blackforestboi.github.io/Octo/appcast.xml)
 - **Swift Composable Architecture**: State management
 - **Inject** Hot Reloading for SwiftUI
 
@@ -95,10 +95,10 @@ The app uses **The Composable Architecture (TCA)** for state management. Key arc
 ### Storage Locations
 
 - WhisperKit models
-  - `~/Library/Application Support/com.kitlangton.Hex/models/argmaxinc/whisperkit-coreml/<model>`
+  - `~/Library/Application Support/io.github.blackforestboi.Octo/models/argmaxinc/whisperkit-coreml/<model>`
 - Parakeet (FluidAudio)
   - We set `XDG_CACHE_HOME` on launch so Parakeet caches under the app container:
-  - `~/Library/Containers/com.kitlangton.Hex/Data/Library/Application Support/FluidAudio/Models/parakeet-tdt-0.6b-v3-coreml`
+  - `~/Library/Containers/io.github.blackforestboi.Octo/Data/Library/Application Support/FluidAudio/Models/parakeet-tdt-0.6b-v3-coreml`
   - Legacy `~/.cache/fluidaudio/Models/…` is not visible to the sandbox; re‑download or import.
 
 ### Progress + Availability
@@ -128,7 +128,7 @@ The app uses **The Composable Architecture (TCA)** for state management. Key arc
 Set at app launch and logged:
 
 ```
-XDG_CACHE_HOME = ~/Library/Containers/com.kitlangton.Hex/Data/Library/Application Support/com.kitlangton.Hex/cache
+XDG_CACHE_HOME = ~/Library/Containers/io.github.blackforestboi.Octo/Data/Library/Application Support/io.github.blackforestboi.Octo/cache
 ```
 
 FluidAudio models reside under `Application Support/FluidAudio/Models`.
@@ -212,7 +212,7 @@ Releases are automated via a local CLI tool that handles building, signing, nota
 9. Creates and signs DMG
 10. Notarizes DMG
 11. Generates Sparkle appcast
-12. Uploads to S3 (versioned DMG + `hex-latest.dmg` + appcast.xml)
+12. Publishes the signed appcast to GitHub Pages and links it to GitHub release assets
 13. Commits version changes, creates git tag, pushes
 14. Creates GitHub release with DMG and ZIP attachments
 
@@ -225,9 +225,8 @@ The tool will prompt you to either:
 ### Artifacts
 
 Each release produces:
-- `Hex-{version}.dmg` - Signed, notarized DMG
-- `Hex-{version}.zip` - For Homebrew cask
-- `hex-latest.dmg` - Always points to latest
+- `Octo-{version}.dmg` - Signed, notarized DMG
+- `Octo-{version}.zip` - For Homebrew cask
 - `appcast.xml` - Sparkle update feed
 
 ### Troubleshooting

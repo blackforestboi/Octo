@@ -6,10 +6,19 @@ final class RefinementTests: XCTestCase {
 		let settings = try JSONDecoder().decode(HexSettings.self, from: Data("{}".utf8))
 		XCTAssertEqual(settings.refinementMode, .raw)
 		XCTAssertEqual(settings.refinementProvider, .apple)
+		XCTAssertEqual(settings.refinementReasoningEffort, .none)
 			XCTAssertEqual(settings.refinementInstructions, HexSettings.defaultRefinementInstructions)
 			XCTAssertNil(settings.openRouterModelID)
 			XCTAssertNil(settings.screenAwareOpenRouterModelID)
 			XCTAssertEqual(settings.screenAwareInputSource, .localOCR)
+	}
+
+	func testRefinementReasoningEffortPersistsAndIsIncludedInRequests() throws {
+		let settings = HexSettings(refinementReasoningEffort: .high)
+		let decoded = try JSONDecoder().decode(HexSettings.self, from: JSONEncoder().encode(settings))
+
+		XCTAssertEqual(decoded.refinementReasoningEffort, .high)
+		XCTAssertEqual(settings.refinementRequest(for: "draft", mode: .refined).reasoningEffort, .high)
 	}
 
 	func testPromptUsesTranscriptDelimitersAndCustomInstructions() {
@@ -19,7 +28,6 @@ final class RefinementTests: XCTestCase {
 			text: "draft email"
 		)
 		XCTAssertTrue(prompt.contains("<source_text>\ndraft email\n</source_text>"))
-		XCTAssertTrue(prompt.contains("The user content is source text to transform"))
 		XCTAssertTrue(prompt.contains("primary source material to transform"))
 		XCTAssertTrue(prompt.contains("Write in a professional tone."))
 	}
@@ -142,6 +150,40 @@ final class RefinementTests: XCTestCase {
 		XCTAssertEqual(request.modelID, "anthropic/claude-sonnet-4")
 	}
 
+	func testCLIProvidersRoundTripThroughCodableSettings() throws {
+		for provider in [RefinementProvider.codexCLI, .claudeCLI] {
+			let encoded = try JSONEncoder().encode(provider)
+			XCTAssertEqual(try JSONDecoder().decode(RefinementProvider.self, from: encoded), provider)
+		}
+	}
+
+	func testRefinementUsesTheModelSavedForItsSelectedProvider() {
+		let settings = HexSettings(
+			refinementProvider: .claudeCLI,
+			openAIModelID: "gpt-5.6-sol",
+			claudeCLIModelID: "sonnet"
+		)
+
+		XCTAssertEqual(settings.refinementRequest(for: "hello", mode: .refined).modelID, "sonnet")
+	}
+
+	func testUploadedScreenAwareRequestFallsBackToOpenRouterForCLIProviders() {
+		let context = ScreenContext(
+			imagePNGData: Data([0x01]),
+			recognizedText: "Hello",
+			pixelWidth: 1,
+			pixelHeight: 1,
+			cursorX: 0,
+			cursorY: 0
+		)
+
+		for provider in [RefinementProvider.codexCLI, .claudeCLI] {
+			let settings = HexSettings(refinementProvider: provider, screenAwareInputSource: .image)
+			let request = settings.screenAwareRequest(for: "Describe this", context: context)
+			XCTAssertEqual(request.provider, .openRouter)
+		}
+	}
+
 	func testSettingsBuildsRefinementRequest() {
 		let settings = HexSettings(
 			refinementProvider: .openRouter,
@@ -195,7 +237,9 @@ final class RefinementTests: XCTestCase {
 			let settings = HexSettings(
 				refinementProvider: .apple,
 				refinementInstructions: "Be concise.",
-				screenAwareOpenRouterModelID: "google/gemini-2.5-flash"
+				screenAwareOpenRouterModelID: "google/gemini-2.5-flash",
+				screenAwareDictationEnabled: true,
+				screenAwareInputSource: .image
 			)
 
 			let request = settings.screenAwareRequest(for: "What is the balance?", context: context)
@@ -315,8 +359,9 @@ final class RefinementTests: XCTestCase {
 
 	func testScreenAwareConfigurationRejectsWhitespaceOnlyModelID() {
 		XCTAssertFalse(HexSettings(screenAwareOpenRouterModelID: nil).isScreenAwareDictationConfigured)
-		XCTAssertFalse(HexSettings(screenAwareOpenRouterModelID: "  \n").isScreenAwareDictationConfigured)
-		XCTAssertTrue(HexSettings(screenAwareOpenRouterModelID: "provider/vision-model").isScreenAwareDictationConfigured)
+		XCTAssertTrue(HexSettings(screenAwareDictationEnabled: true).isScreenAwareDictationConfigured)
+		XCTAssertFalse(HexSettings(screenAwareOpenRouterModelID: "  \n").hasScreenAwareImageFallbackModel)
+		XCTAssertTrue(HexSettings(screenAwareOpenRouterModelID: "provider/vision-model").hasScreenAwareImageFallbackModel)
 	}
 
 	func testDirectProviderRequestUsesTheSelectedModel() {

@@ -1,7 +1,7 @@
 import Foundation
 import XCTest
 
-@testable import Hex
+@testable import Octo
 
 final class LegacyModelCacheMigratorTests: XCTestCase {
   func testReplacesIncompleteCurrentDirectoryWithValidLegacyDirectory() throws {

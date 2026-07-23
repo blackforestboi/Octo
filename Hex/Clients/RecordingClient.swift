@@ -34,6 +34,8 @@ struct RecordingClient {
   var getAvailableInputDevices: @Sendable () async -> [AudioInputDevice] = { [] }
   var getDefaultInputDeviceName: @Sendable () async -> String? = { nil }
   var warmUpRecorder: @Sendable () async -> Void = {}
+  var recoverInterruptedRecordings: @Sendable () async -> [RecoveredRecording] = { [] }
+  var releaseRecordingSource: @Sendable (URL) async -> Void = { _ in }
   var cleanup: @Sendable () async -> Void = {}
 }
 
@@ -51,6 +53,8 @@ extension RecordingClient: DependencyKey {
       getAvailableInputDevices: { await live.getAvailableInputDevices() },
       getDefaultInputDeviceName: { await live.getDefaultInputDeviceName() },
       warmUpRecorder: { await live.warmUpRecorder() },
+      recoverInterruptedRecordings: { await live.recoverInterruptedRecordings() },
+      releaseRecordingSource: { await live.releaseRecordingSource(for: $0) },
       cleanup: { await live.cleanup() }
     )
   }
@@ -366,6 +370,7 @@ actor RecordingClientLive {
 
   private enum RecordingBackend: String {
     case captureEngine = "capture-engine"
+    case fallbackCaptureEngine = "fallback-capture-engine"
     case recorderFallback = "recorder-fallback"
   }
 
@@ -407,6 +412,7 @@ actor RecordingClientLive {
       }
     }
   )
+  private var fallbackCaptureController: SuperFastCaptureController?
   private var captureControllerDeviceID: AudioDeviceID?
   private var captureControllerNeedsRestartReason: String?
   private var notificationObservers: [NSObjectProtocol] = []
@@ -1048,10 +1054,6 @@ actor RecordingClientLive {
     return getDefaultInputDevice()
   }
 
-  private func makeCaptureRecordingURL() -> URL {
-    FileManager.default.temporaryDirectory.appendingPathComponent("hex-capture-\(UUID().uuidString).wav")
-  }
-
   nonisolated static func shouldIgnoreStopRequest(
     snapshotSessionID: UUID?,
     currentSessionID: UUID?
@@ -1095,6 +1097,23 @@ actor RecordingClientLive {
   private func stopCaptureController(reason: String) {
     captureController.stop(reason: reason)
     captureControllerDeviceID = nil
+  }
+
+  private func fallbackController() -> SuperFastCaptureController {
+    if let fallbackCaptureController {
+      return fallbackCaptureController
+    }
+    let controller = SuperFastCaptureController(
+      meterContinuation: meterContinuation,
+      onEngineConfigurationChange: { _ in }
+    )
+    fallbackCaptureController = controller
+    return controller
+  }
+
+  private func stopFallbackCaptureController(reason: String) {
+    fallbackCaptureController?.stop(reason: reason)
+    fallbackCaptureController = nil
   }
 
   private func releaseRecorder(reason: String) {
@@ -1318,10 +1337,16 @@ actor RecordingClientLive {
     logRecordingStartRequest(mode: mode, inputDeviceID: activeInputDevice)
     let startRequestAt = Date()
 
+    var recoverySession: RecordingRecoverySession?
     do {
       try ensureCaptureControllerReadyAfterDeferredRestart(for: activeInputDevice, reason: "startRecording")
-      let recordingURL = makeCaptureRecordingURL()
-      try captureController.beginRecording(to: recordingURL, requestedAt: startRequestAt, mode: mode)
+      let session = try RecordingRecoveryStore.begin()
+      recoverySession = session
+      try captureController.beginRecording(
+        recoverySession: session,
+        requestedAt: startRequestAt,
+        mode: mode
+      )
       let startedAt = Date()
       activeRecordingSession = ActiveRecordingSession(
         startedAt: startedAt,
@@ -1333,30 +1358,39 @@ actor RecordingClientLive {
       )
       return
     } catch {
-      recordingLogger.error("Failed to start capture engine for mode=\(mode.rawValue): \(error.localizedDescription); falling back to AVAudioRecorder")
+      recoverySession?.abandonForRecovery()
+      if let recoverySession {
+        RecordingRecoveryStore.releaseSource(for: recoverySession.id)
+      }
+      recordingLogger.error("Failed to start primary capture engine for mode=\(mode.rawValue): \(error.localizedDescription); retrying with an isolated durable capture engine")
       stopCaptureController(reason: "capture-engine-start-failed")
     }
 
+    var fallbackRecoverySession: RecordingRecoverySession?
     do {
-      let recorder = try ensureRecorderReadyForRecording()
-      let recordCallStartedAt = Date()
-      guard recorder.record() else {
-        recordingLogger.error("AVAudioRecorder refused to start recording")
-        endRecordingSession()
-        return
-      }
+      let controller = fallbackController()
+      let session = try RecordingRecoveryStore.begin()
+      fallbackRecoverySession = session
+      try controller.beginRecording(
+        recoverySession: session,
+        requestedAt: startRequestAt,
+        mode: .standard
+      )
       let startedAt = Date()
       activeRecordingSession = ActiveRecordingSession(
         startedAt: startedAt,
         mode: mode,
-        backend: .recorderFallback
+        backend: .fallbackCaptureEngine
       )
-      startMeterTask()
       recordingLogger.notice(
-        "Recording started mode=\(mode.rawValue) backend=\(RecordingBackend.recorderFallback.rawValue) recordCall=\(self.formatDuration(Date().timeIntervalSince(recordCallStartedAt))) totalStart=\(self.formatDuration(startedAt.timeIntervalSince(startRequestAt)))"
+        "Recording started mode=\(mode.rawValue) backend=\(RecordingBackend.fallbackCaptureEngine.rawValue) startup=\(self.formatDuration(startedAt.timeIntervalSince(startRequestAt)))"
       )
     } catch {
-      recordingLogger.error("Failed to start recording: \(error.localizedDescription)")
+      fallbackRecoverySession?.abandonForRecovery()
+      if let fallbackRecoverySession {
+        RecordingRecoveryStore.releaseSource(for: fallbackRecoverySession.id)
+      }
+      recordingLogger.error("Failed to start durable fallback capture engine: \(error.localizedDescription)")
       clearActiveRecordingMetadata()
       endRecordingSession()
     }
@@ -1366,10 +1400,18 @@ actor RecordingClientLive {
     let stopSessionID = recordingSessionID
     let activeSession = activeRecordingSession
 
-    let captureFinishResult = await captureController.finishRecording(
-      clearBuffer: currentCaptureMode() == .superFast,
-      postRollDuration: Double(hexSettings.stopDelayMilliseconds) / 1_000
-    )
+    let captureFinishResult: SuperFastCaptureController.FinishRecordingResult
+    if activeSession?.backend == .fallbackCaptureEngine, let fallbackCaptureController {
+      captureFinishResult = await fallbackCaptureController.finishRecording(
+        clearBuffer: true,
+        postRollDuration: Double(hexSettings.stopDelayMilliseconds) / 1_000
+      )
+    } else {
+      captureFinishResult = await captureController.finishRecording(
+        clearBuffer: currentCaptureMode() == .superFast,
+        postRollDuration: Double(hexSettings.stopDelayMilliseconds) / 1_000
+      )
+    }
 
     if Self.shouldIgnoreStopRequest(
       snapshotSessionID: stopSessionID,
@@ -1400,8 +1442,12 @@ actor RecordingClientLive {
         "Recording stopped mode=\(session.mode.rawValue) backend=\(session.backend.rawValue) duration=\(self.formatDuration(recordingDuration))"
       )
 
+      if session.backend == .fallbackCaptureEngine {
+        stopFallbackCaptureController(reason: "fallback-capture-stop")
+      }
       if !hexSettings.superFastModeEnabled {
         stopCaptureController(reason: "mode-disabled-after-stop")
+        stopFallbackCaptureController(reason: "mode-disabled-after-stop")
         releaseRecorder(reason: "capture-engine-stop")
       }
 
@@ -1415,8 +1461,12 @@ actor RecordingClientLive {
       endRecordingSession()
       clearActiveRecordingMetadata()
       lastRecordingEndedAt = stoppedAt
+      if activeSession?.backend == .fallbackCaptureEngine {
+        stopFallbackCaptureController(reason: "fallback-capture-stop-failed")
+      }
       if !hexSettings.superFastModeEnabled {
         stopCaptureController(reason: "mode-disabled-after-stop-failed")
+        stopFallbackCaptureController(reason: "mode-disabled-after-stop-failed")
         releaseRecorder(reason: "capture-engine-stop-failed")
       }
       finalizeCaptureStateAfterRecording()
@@ -1700,8 +1750,17 @@ actor RecordingClientLive {
     await resumeMediaIfNeeded()
     stopObservingSystemChanges()
     stopCaptureController(reason: "cleanup")
+    stopFallbackCaptureController(reason: "cleanup")
     releaseRecorder(reason: "cleanup")
     recordingLogger.notice("RecordingClient cleaned up")
+  }
+
+  func recoverInterruptedRecordings() -> [RecoveredRecording] {
+    RecordingRecoveryStore.recoverInterruptedRecordings()
+  }
+
+  func releaseRecordingSource(for audioURL: URL) {
+    RecordingRecoveryStore.releaseSource(forFinalAudioURL: audioURL)
   }
 }
 

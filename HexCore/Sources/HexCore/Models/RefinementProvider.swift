@@ -7,4 +7,6 @@ public enum RefinementProvider: String, Codable, CaseIterable, Equatable, Sendab
 	case openRouter
 	case openAI
 	case anthropic
+	case codexCLI
+	case claudeCLI
 }

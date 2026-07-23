@@ -30,11 +30,11 @@ final class HexSettingsMigrationTests: XCTestCase {
 		XCTAssertFalse(decoded.removePunctuation)
 		XCTAssertEqual(decoded.refinementMode, .raw)
 		XCTAssertEqual(decoded.refinementProvider, .apple)
-		XCTAssertEqual(decoded.refinementInstructions, "")
+		XCTAssertTrue(decoded.hasCompletedRefinementProviderDetection)
+		XCTAssertEqual(decoded.refinementInstructions, HexSettings.defaultRefinementInstructions)
 			XCTAssertNil(decoded.openRouterModelID)
 			XCTAssertNil(decoded.screenAwareOpenRouterModelID)
 			XCTAssertEqual(decoded.screenAwareInputSource, .localOCR)
-		XCTAssertEqual(decoded.refinedHotkey, HotKey(key: nil, modifiers: [.option]))
 		XCTAssertTrue(decoded.includeSelectedTextInRefinement)
 	}
 
@@ -50,12 +50,12 @@ final class HexSettingsMigrationTests: XCTestCase {
 		XCTAssertEqual(HexSettings().stopDelayMilliseconds, 0)
 	}
 
-	func testNewSettingsUseOptionForRefinementHotkeyByDefault() {
-		XCTAssertEqual(HexSettings().refinedHotkey, HotKey(key: nil, modifiers: [.option]))
-	}
-
 	func testNewSettingsDisableScreenAwareDictationByDefault() {
 		XCTAssertFalse(HexSettings().screenAwareDictationEnabled)
+	}
+
+	func testNewSettingsCheckForAnAvailableSubscriptionProvider() {
+		XCTAssertFalse(HexSettings().hasCompletedRefinementProviderDetection)
 	}
 
 	func testInitNormalizesDoubleTapOnlyWhenLockDisabled() {
@@ -78,30 +78,18 @@ final class HexSettingsMigrationTests: XCTestCase {
 		XCTAssertFalse(decoded.doubleTapLockEnabled)
 	}
 
-	func testDecodeNormalizesRefinedDoubleTapOnlyWhenLockDisabled() throws {
-		let payload = "{\"refinedUseDoubleTapOnly\":true,\"refinedDoubleTapLockEnabled\":false}"
-		let decoded = try JSONDecoder().decode(HexSettings.self, from: Data(payload.utf8))
-
-		XCTAssertFalse(decoded.refinedUseDoubleTapOnly)
-		XCTAssertFalse(decoded.refinedDoubleTapLockEnabled)
-	}
-
-		func testRefinedHotkeyAndInstructionsRoundTrip() throws {
-			let settings = HexSettings(
-				refinementInstructions: "Return exactly three points.",
-				screenAwareOpenRouterModelID: "anthropic/claude-sonnet-4",
-			refinedHotkey: HotKey(key: .space, modifiers: [.command]),
-			refinedMinimumKeyTime: 0.4,
-			includeSelectedTextInRefinement: false,
-			screenAwareInputSource: .image
+	func testRefinementInstructionsRoundTrip() throws {
+		let settings = HexSettings(
+			refinementInstructions: "Return exactly three points.",
+			screenAwareOpenRouterModelID: "anthropic/claude-sonnet-4",
+			screenAwareInputSource: .image,
+			includeSelectedTextInRefinement: false
 		)
 		let decoded = try JSONDecoder().decode(HexSettings.self, from: JSONEncoder().encode(settings))
 
-			XCTAssertEqual(decoded.refinementInstructions, "Return exactly three points.")
-			XCTAssertEqual(decoded.screenAwareOpenRouterModelID, "anthropic/claude-sonnet-4")
-			XCTAssertEqual(decoded.screenAwareInputSource, .image)
-		XCTAssertEqual(decoded.refinedHotkey, HotKey(key: .space, modifiers: [.command]))
-		XCTAssertEqual(decoded.refinedMinimumKeyTime, 0.4)
+		XCTAssertEqual(decoded.refinementInstructions, "Return exactly three points.")
+		XCTAssertEqual(decoded.screenAwareOpenRouterModelID, "anthropic/claude-sonnet-4")
+		XCTAssertEqual(decoded.screenAwareInputSource, .image)
 		XCTAssertFalse(decoded.includeSelectedTextInRefinement)
 	}
 

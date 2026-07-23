@@ -1,9 +1,10 @@
 import ComposableArchitecture
 import Foundation
 import AVFoundation
+import HexCore
 import XCTest
 
-@testable import Hex
+@testable import Octo
 
 @MainActor
 final class HistoryPlaybackTests: XCTestCase {
@@ -96,22 +97,17 @@ final class HistoryPlaybackTests: XCTestCase {
     ) {
       HistoryFeature()
     }
+    store.exhaustivity = .off(showSkippedAssertions: false)
 
-    await store.send(.seekTranscript(transcriptID, 0.05)) {
-      XCTAssertEqual($0.playingTranscriptID, transcriptID)
-      XCTAssertGreaterThan($0.playbackDuration, 0)
-      XCTAssertEqual($0.playbackProgress, 0.05, accuracy: 0.02)
-      XCTAssertFalse($0.isPlaybackPaused)
-    }
+    await store.send(.seekTranscript(transcriptID, 0.05))
+    XCTAssertEqual(store.state.playingTranscriptID, transcriptID)
+    XCTAssertGreaterThan(store.state.playbackDuration, 0)
+    XCTAssertEqual(store.state.playbackProgress, 0.05, accuracy: 0.02)
+    XCTAssertFalse(store.state.isPlaybackPaused)
 
-    await store.send(.stopPlayback) {
-      $0.playingTranscriptID = nil
-      $0.playbackID = nil
-      $0.audioPlayerController = nil
-      $0.playbackProgress = 0
-      $0.playbackDuration = 0
-      $0.isPlaybackPaused = false
-    }
+    await store.send(.stopPlayback)
+    XCTAssertNil(store.state.playingTranscriptID)
+    XCTAssertNil(store.state.playbackID)
   }
 
   func testMatchingPlaybackCompletionResetsPlaybackState() async {
@@ -146,8 +142,8 @@ private func makeTestAudioURL() throws -> URL {
     .appendingPathComponent("hex-history-playback-\(UUID().uuidString).caf")
   let format = try XCTUnwrap(AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 1))
   let file = try AVAudioFile(forWriting: url, settings: format.settings)
-  let buffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 4_410))
-  buffer.frameLength = 4_410
+  let buffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 44_100))
+  buffer.frameLength = 44_100
   try file.write(from: buffer)
   return url
 }

@@ -2,7 +2,7 @@ import os.log
 
 /// Shared helper for creating consistent os.Logger instances across the Hex app and HexCore.
 public enum HexLog {
-  public static let subsystem = "com.kitlangton.Hex"
+  public static let subsystem = "io.github.blackforestboi.Octo"
 
   public enum Category: String {
     case app = "App"

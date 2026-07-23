@@ -6,7 +6,7 @@ import Foundation
 import HexCore
 import XCTest
 
-@testable import Hex
+@testable import Octo
 
 @MainActor
 final class RecordingRaceTests: XCTestCase {
@@ -37,6 +37,7 @@ final class RecordingRaceTests: XCTestCase {
       $0.sleepManagement.allowSleep = {}
       $0.soundEffects.play = { _ in }
     }
+    store.exhaustivity = .off(showSkippedAssertions: false)
 
     await store.send(.startRecording) {
       $0.isRecording = true
@@ -163,6 +164,7 @@ final class RecordingRaceTests: XCTestCase {
 
   func testFailedRecordingStopEndsTranscription() async {
     let now = Date(timeIntervalSince1970: 1_234)
+    let clock = TestClock()
     var state = Self.makeState()
     state.isRecording = true
     state.recordingStartTime = now
@@ -173,6 +175,7 @@ final class RecordingRaceTests: XCTestCase {
       TranscriptionFeature()
     } withDependencies: {
       $0.date.now = now
+      $0.continuousClock = clock
       $0.recording.stopRecording = { .failed(.fallbackExportFailed("copy failed")) }
       $0.sleepManagement.allowSleep = {}
     }
@@ -188,6 +191,11 @@ final class RecordingRaceTests: XCTestCase {
       $0.isPrewarming = false
       $0.error = "Failed to export recorded audio: copy failed"
     }
+    await clock.advance(by: .seconds(5))
+    await store.receive(\.dismissError) {
+      $0.error = nil
+    }
+    await store.finish()
   }
 
   func testShortRecordingReleasesSleepAssertion() async throws {
@@ -216,6 +224,7 @@ final class RecordingRaceTests: XCTestCase {
       }
       $0.soundEffects.play = { _ in }
     }
+    store.exhaustivity = .off(showSkippedAssertions: false)
 
     await store.send(.startRecording) {
       $0.isRecording = true
@@ -256,6 +265,7 @@ final class RecordingRaceTests: XCTestCase {
       $0.sleepManagement.allowSleep = {}
       $0.soundEffects.play = { _ in }
     }
+    store.exhaustivity = .off(showSkippedAssertions: false)
 
     await store.send(.startRecording) {
       $0.isRecording = true
@@ -337,6 +347,7 @@ final class RecordingRaceTests: XCTestCase {
       $0.pasteboard.paste = { _ in }
       $0.soundEffects.play = { _ in }
     }
+    store.exhaustivity = .off(showSkippedAssertions: false)
 
     await store.send(.transcriptionAudioCaptured(audioURL, duration)) {
       $0.activeTranscriptionAudioURL = audioURL
@@ -366,20 +377,44 @@ final class RecordingRaceTests: XCTestCase {
     settings.removePunctuation = true
 
     XCTAssertEqual(
-      TranscriptTextProcessor.process("Hello, World!", settings: settings, bypassFilters: false),
+      TranscriptFormattingApplier.apply(
+        "Hello, World!",
+        lowercase: settings.lowercaseTranscripts,
+        removePunctuation: settings.removePunctuation
+      ),
       "hello world"
     )
   }
 
-  func testTranscriptTextProcessorBypassesEveryTransformForScratchpadPreview() {
-    var settings = HexSettings()
-    settings.lowercaseTranscripts = true
-    settings.removePunctuation = true
+  func testScratchpadPreviewBypassesEveryTransform() async throws {
+    let audioURL = FileManager.default.temporaryDirectory
+      .appendingPathComponent("scratchpad-preview-\(UUID().uuidString).wav")
+    XCTAssertTrue(FileManager.default.createFile(atPath: audioURL.path, contents: Data("audio".utf8)))
+    defer { try? FileManager.default.removeItem(at: audioURL) }
 
-    XCTAssertEqual(
-      TranscriptTextProcessor.process("Hello, World!", settings: settings, bypassFilters: true),
-      "Hello, World!"
-    )
+    let pasteProbe = RefinementProbe()
+    var state = Self.makeState()
+    state.isTranscribing = true
+    state.isRemappingScratchpadFocused = true
+    state.$hexSettings.withLock {
+      $0.lowercaseTranscripts = true
+      $0.removePunctuation = true
+      $0.saveTranscriptionHistory = false
+    }
+    let store = TestStore(initialState: state) {
+      TranscriptionFeature()
+    } withDependencies: {
+      $0.pasteboard.paste = { text in await pasteProbe.recordPaste(text) }
+      $0.soundEffects.play = { _ in }
+    }
+    store.exhaustivity = .off(showSkippedAssertions: false)
+
+    await store.send(.transcriptionAudioCaptured(audioURL, 1))
+    await store.send(.transcriptionResult("Hello, World!", audioURL))
+    await store.finish()
+
+    let pastedText = await pasteProbe.paste
+    XCTAssertEqual(pastedText, "Hello, World!")
   }
 
 	func testRefinementReceivesProcessedTranscriptAndKeepsAudioOwnedUntilItCompletes() async throws {
@@ -392,6 +427,7 @@ final class RecordingRaceTests: XCTestCase {
 		var state = Self.makeState()
 		state.isTranscribing = true
 		state.isPrewarming = true
+		state.forcedRefinementMode = .refined
 		state.$hexSettings.withLock {
 			$0.refinementMode = .refined
 			$0.lowercaseTranscripts = true
@@ -406,7 +442,9 @@ final class RecordingRaceTests: XCTestCase {
 			}
 			$0.pasteboard.paste = { text in await probe.recordPaste(text) }
 			$0.soundEffects.play = { _ in }
+			$0.transcriptPersistence.save = { _ in throw RefinementTestError.failed }
 		}
+		store.exhaustivity = .off(showSkippedAssertions: false)
 
 		await store.send(.transcriptionAudioCaptured(audioURL, 2)) {
 			$0.activeTranscriptionAudioURL = audioURL
@@ -417,7 +455,7 @@ final class RecordingRaceTests: XCTestCase {
 			$0.isPrewarming = false
 			$0.isRefining = true
 		}
-		await store.receive(.refinementResult("refined text", audioURL, 2)) {
+		await store.receive(\.refinementResult) {
 			$0.activeTranscriptionAudioURL = nil
 			$0.activeTranscriptionDuration = nil
 			$0.isRefining = false
@@ -431,7 +469,9 @@ final class RecordingRaceTests: XCTestCase {
 		XCTAssertFalse(FileManager.default.fileExists(atPath: audioURL.path))
 	}
 
-	func testRefinementFailureFallsBackToProcessedTranscript() async throws {
+	func testRefinementFailureReportsErrorWithoutPastingUnrefinedText() async throws {
+		let now = Date(timeIntervalSince1970: 1_234)
+		let clock = TestClock()
 		let audioURL = FileManager.default.temporaryDirectory.appendingPathComponent("refinement-fallback-\(UUID().uuidString).wav")
 		XCTAssertTrue(FileManager.default.createFile(atPath: audioURL.path, contents: Data("audio".utf8)))
 		defer { try? FileManager.default.removeItem(at: audioURL) }
@@ -439,6 +479,7 @@ final class RecordingRaceTests: XCTestCase {
 		let probe = RefinementProbe()
 		var state = Self.makeState()
 		state.isTranscribing = true
+		state.forcedRefinementMode = .refined
 		state.$hexSettings.withLock {
 			$0.refinementMode = .refined
 			$0.lowercaseTranscripts = true
@@ -446,10 +487,14 @@ final class RecordingRaceTests: XCTestCase {
 			$0.saveTranscriptionHistory = false
 		}
 		let store = TestStore(initialState: state) { TranscriptionFeature() } withDependencies: {
+			$0.date.now = now
+			$0.continuousClock = clock
 			$0.refinement.refine = { _ in throw RefinementTestError.failed }
 			$0.pasteboard.paste = { text in await probe.recordPaste(text) }
 			$0.soundEffects.play = { _ in }
+			$0.transcriptPersistence.save = { _ in throw RefinementTestError.failed }
 		}
+		store.exhaustivity = .off(showSkippedAssertions: false)
 
 		await store.send(.transcriptionAudioCaptured(audioURL, 2)) {
 			$0.activeTranscriptionAudioURL = audioURL
@@ -459,15 +504,15 @@ final class RecordingRaceTests: XCTestCase {
 			$0.isTranscribing = false
 			$0.isRefining = true
 		}
-		await store.receive(.refinementResult("hello world", audioURL, 2)) {
-			$0.activeTranscriptionAudioURL = nil
-			$0.activeTranscriptionDuration = nil
-			$0.isRefining = false
+		await store.receive(\.transcriptionError)
+		await clock.advance(by: .seconds(5))
+		await store.receive(\.dismissError) {
+			$0.error = nil
 		}
 		await store.finish()
 
 		let pastedText = await probe.paste
-		XCTAssertEqual(pastedText, "hello world")
+		XCTAssertNil(pastedText)
 		XCTAssertFalse(FileManager.default.fileExists(atPath: audioURL.path))
 	}
 
@@ -480,16 +525,20 @@ final class RecordingRaceTests: XCTestCase {
 		let pasteProbe = RefinementProbe()
 		var state = Self.makeState()
 		state.isTranscribing = true
+		state.forcedRefinementMode = .refined
 		state.$hexSettings.withLock {
 			$0.refinementMode = .refined
 			$0.saveTranscriptionHistory = false
 		}
 		let store = TestStore(initialState: state) { TranscriptionFeature() } withDependencies: {
+			$0.date.now = Date(timeIntervalSince1970: 1_234)
 			$0.refinement.refine = { _ in try await refinementProbe.refine() }
 			$0.pasteboard.paste = { text in await pasteProbe.recordPaste(text) }
 			$0.sleepManagement.allowSleep = {}
 			$0.soundEffects.play = { _ in }
+			$0.transcriptPersistence.save = { _ in throw RefinementTestError.failed }
 		}
+		store.exhaustivity = .off(showSkippedAssertions: false)
 
 		await store.send(.transcriptionAudioCaptured(audioURL, 2)) {
 			$0.activeTranscriptionAudioURL = audioURL
@@ -514,49 +563,116 @@ final class RecordingRaceTests: XCTestCase {
 		XCTAssertFalse(FileManager.default.fileExists(atPath: audioURL.path))
 	}
 
-	func testRefinedHotkeyWithSelectedTextStartsRecording() async throws {
+	func testRegularHotkeyStartsImmediatelyAndLateSelectionStillForcesRefinement() async throws {
 		let now = Date(timeIntervalSince1970: 1_234)
-		let activeApp = NSWorkspace.shared.frontmostApplication
-		let recordingProbe = RecordingProbe(
-			stopURL: FileManager.default.temporaryDirectory.appendingPathComponent("selected-text-hotkey-\(UUID().uuidString).wav")
-		)
+		let audioURL = FileManager.default.temporaryDirectory
+			.appendingPathComponent("selected-text-race-\(UUID().uuidString).wav")
+		XCTAssertTrue(FileManager.default.createFile(atPath: audioURL.path, contents: Data("audio".utf8)))
+		defer { try? FileManager.default.removeItem(at: audioURL) }
+
+		let captureProbe = PendingSelectedTextCaptureProbe()
+		let refinementProbe = RefinementProbe()
+		let rawPasteProbe = RefinementProbe()
 		let selectedText = SelectedTextCapture(
 			text: "draft message",
+			replaceSelection: { text in
+				await refinementProbe.recordPaste(text)
+				return .replaced
+			},
+			cancelSelection: {}
+		)
+		var state = Self.makeState()
+		state.$hexSettings.withLock {
+			$0.hotkey = HotKey(key: .a, modifiers: [.command])
+			$0.refinementInstructions = "Preserve Markdown."
+			$0.saveTranscriptionHistory = false
+		}
+		let store = TestStore(initialState: state) {
+			TranscriptionFeature()
+		} withDependencies: {
+			$0.date.now = now
+			$0.pasteboard.captureSelectedText = { await captureProbe.capture() }
+			$0.pasteboard.paste = { text in await rawPasteProbe.recordPaste(text) }
+			$0.recording.startRecording = {}
+			$0.recording.stopRecording = { .captured(audioURL) }
+			$0.transcription.transcribe = { _, _, _, _ in "make it shorter" }
+			$0.refinement.refine = { request in
+				await refinementProbe.recordInput(request.text)
+				await refinementProbe.recordInstructions(request.instructions)
+				return "shorter draft"
+			}
+			$0.sleepManagement.preventSleep = { _ in }
+			$0.sleepManagement.allowSleep = {}
+			$0.soundEffects.play = { _ in }
+		}
+		store.exhaustivity = .off(showSkippedAssertions: false)
+
+		await store.send(.hotKeyPressed)
+		XCTAssertTrue(store.state.isRecording)
+		await store.receive(\.refinedHotKeyPressed)
+		await captureProbe.waitUntilPending()
+		XCTAssertTrue(store.state.isRecording, "Selected-text lookup must not delay recording")
+		XCTAssertTrue(store.state.isCapturingSelectedTextForRefinement)
+
+		await store.send(.hotKeyReleased(.regular))
+		await store.receive(\.transcriptionAudioCaptured)
+		await store.receive(\.transcriptionResult)
+		XCTAssertTrue(store.state.isTranscribing)
+		XCTAssertEqual(store.state.pendingSelectedTextTranscription?.text, "make it shorter")
+		let prematurePaste = await rawPasteProbe.paste
+		XCTAssertNil(prematurePaste, "Raw text must wait for the parallel selection lookup")
+
+		await captureProbe.resume(selectedText)
+		await store.receive(\.selectedTextCaptured)
+		await store.receive(\.transcriptionResult)
+		await store.receive(\.refinementResult)
+		await store.finish()
+
+		let refinementInput = await refinementProbe.input
+		let refinementInstructions = await refinementProbe.instructions
+		let refinedPaste = await refinementProbe.paste
+		let rawPaste = await rawPasteProbe.paste
+		XCTAssertEqual(refinementInput, "draft message")
+		XCTAssertEqual(
+			refinementInstructions,
+			"Preserve Markdown.\n\nSpoken instruction:\nmake it shorter"
+		)
+		XCTAssertEqual(refinedPaste, "shorter draft")
+		XCTAssertNil(rawPaste)
+	}
+
+	func testDiscardCancelsParallelSelectionLookupWithoutStartingRefinementLater() async {
+		let captureProbe = PendingSelectedTextCaptureProbe()
+		let selectedText = SelectedTextCapture(
+			text: "must not be refined",
 			replaceSelection: { _ in .replaced },
 			cancelSelection: {}
 		)
 		let store = TestStore(initialState: Self.makeState()) {
 			TranscriptionFeature()
 		} withDependencies: {
-			$0.date.now = now
-			$0.pasteboard.captureSelectedText = { selectedText }
-			$0.recording.startRecording = {
-				await recordingProbe.recordStart()
-			}
+			$0.date.now = Date(timeIntervalSince1970: 1_234)
+			$0.pasteboard.captureSelectedText = { await captureProbe.capture() }
+			$0.recording.startRecording = {}
+			$0.recording.stopRecording = { .ignored(.noActiveRecording) }
 			$0.sleepManagement.preventSleep = { _ in }
+			$0.sleepManagement.allowSleep = {}
+			$0.soundEffects.play = { _ in }
 		}
+		store.exhaustivity = .off(showSkippedAssertions: false)
 
-		await store.send(.refinedHotKeyPressed) {
-			$0.isCapturingSelectedTextForRefinement = true
-		}
-		await store.receive(.selectedTextCaptured(selectedText)) {
-			$0.isCapturingSelectedTextForRefinement = false
-			$0.selectedTextForRefinement = selectedText
-		}
-		await store.receive(.startRefinedRecording) {
-			$0.isRecording = true
-			$0.forcedRefinementMode = .refined
-			$0.activeRecordingHotkey = $0.hexSettings.refinedHotkey
-			$0.activeMinimumKeyTime = $0.hexSettings.refinedMinimumKeyTime
-			$0.activeRecordingSource = .refined
-			$0.recordingStartTime = now
-			$0.sourceAppBundleID = activeApp?.bundleIdentifier
-			$0.sourceAppName = activeApp?.localizedName
-		}
+		await store.send(.hotKeyPressed)
+		await store.receive(\.refinedHotKeyPressed)
+		await captureProbe.waitUntilPending()
+		XCTAssertTrue(store.state.isCapturingSelectedTextForRefinement)
+
+		await store.send(.discard)
+		XCTAssertFalse(store.state.isCapturingSelectedTextForRefinement)
+		await captureProbe.resume(selectedText)
 		await store.finish()
 
-		let recordingCounts = await recordingProbe.counts()
-		XCTAssertEqual(recordingCounts.startCalls, 1)
+		XCTAssertNil(store.state.selectedTextForRefinement)
+		XCTAssertFalse(store.state.isRefining)
 	}
 
 	func testSelectedTextRefinementUsesSpokenInstruction() async throws {
@@ -584,6 +700,7 @@ final class RecordingRaceTests: XCTestCase {
 		let store = TestStore(initialState: state) {
 			TranscriptionFeature()
 		} withDependencies: {
+			$0.date.now = Date(timeIntervalSince1970: 1_234)
 			$0.refinement.refine = { request in
 				await refinementProbe.recordInput(request.text)
 				await refinementProbe.recordInstructions(request.instructions)
@@ -591,6 +708,7 @@ final class RecordingRaceTests: XCTestCase {
 			}
 			$0.soundEffects.play = { _ in }
 		}
+		store.exhaustivity = .off(showSkippedAssertions: false)
 
 		await store.send(.transcriptionAudioCaptured(audioURL, 2)) {
 			$0.activeTranscriptionAudioURL = audioURL
@@ -600,7 +718,7 @@ final class RecordingRaceTests: XCTestCase {
 			$0.isTranscribing = false
 			$0.isRefining = true
 		}
-		await store.receive(.refinementResult("shorter draft", audioURL, 2)) {
+		await store.receive(\.refinementResult) {
 			$0.activeTranscriptionAudioURL = nil
 			$0.activeTranscriptionDuration = nil
 			$0.isRefining = false
@@ -612,9 +730,12 @@ final class RecordingRaceTests: XCTestCase {
 		}
 		await store.finish()
 
-		XCTAssertEqual(await refinementProbe.input, "draft message")
-		XCTAssertEqual(await refinementProbe.instructions, "Preserve Markdown.\n\nSpoken instruction:\nmake it shorter")
-		XCTAssertEqual(await refinementProbe.paste, "shorter draft")
+		let refinementInput = await refinementProbe.input
+		let refinementInstructions = await refinementProbe.instructions
+		let refinedPaste = await refinementProbe.paste
+		XCTAssertEqual(refinementInput, "draft message")
+		XCTAssertEqual(refinementInstructions, "Preserve Markdown.\n\nSpoken instruction:\nmake it shorter")
+		XCTAssertEqual(refinedPaste, "shorter draft")
 	}
 
 	func testSilentSelectedTextRefinementUsesDefaultInstructions() async throws {
@@ -642,6 +763,7 @@ final class RecordingRaceTests: XCTestCase {
 		let store = TestStore(initialState: state) {
 			TranscriptionFeature()
 		} withDependencies: {
+			$0.date.now = Date(timeIntervalSince1970: 1_234)
 			$0.refinement.refine = { request in
 				await refinementProbe.recordInput(request.text)
 				await refinementProbe.recordInstructions(request.instructions)
@@ -649,6 +771,7 @@ final class RecordingRaceTests: XCTestCase {
 			}
 			$0.soundEffects.play = { _ in }
 		}
+		store.exhaustivity = .off(showSkippedAssertions: false)
 
 		await store.send(.transcriptionAudioCaptured(audioURL, 2)) {
 			$0.activeTranscriptionAudioURL = audioURL
@@ -658,7 +781,7 @@ final class RecordingRaceTests: XCTestCase {
 			$0.isTranscribing = false
 			$0.isRefining = true
 		}
-		await store.receive(.refinementResult("refined draft", audioURL, 2)) {
+		await store.receive(\.refinementResult) {
 			$0.activeTranscriptionAudioURL = nil
 			$0.activeTranscriptionDuration = nil
 			$0.isRefining = false
@@ -670,18 +793,17 @@ final class RecordingRaceTests: XCTestCase {
 		}
 		await store.finish()
 
-		XCTAssertEqual(await refinementProbe.input, "draft message")
-		XCTAssertEqual(await refinementProbe.instructions, "Preserve Markdown.")
-		XCTAssertEqual(await refinementProbe.paste, "refined draft")
+		let refinementInput = await refinementProbe.input
+		let refinementInstructions = await refinementProbe.instructions
+		let refinedPaste = await refinementProbe.paste
+		XCTAssertEqual(refinementInput, "draft message")
+		XCTAssertEqual(refinementInstructions, "Preserve Markdown.")
+		XCTAssertEqual(refinedPaste, "refined draft")
 	}
 
-	func testDoubleTapRefinedHotkeyThirdTapCancelsPendingSelectionCapture() async {
+	func testTerminalTapCancelsPendingSelectionCapture() async {
 		let captureProbe = PendingSelectedTextCaptureProbe()
 		var state = Self.makeState()
-		state.$hexSettings.withLock {
-			$0.refinedDoubleTapLockEnabled = true
-			$0.refinedUseDoubleTapOnly = true
-		}
 		let store = TestStore(initialState: state) {
 			TranscriptionFeature()
 		} withDependencies: {
@@ -696,36 +818,40 @@ final class RecordingRaceTests: XCTestCase {
 			$0.refinedHotKeyReleasedWhileCapturingSelection = true
 		}
 		await captureProbe.resume(nil)
-		await store.receive(.selectedTextCaptureUnavailable) {
+		await store.receive(\.selectedTextCaptureUnavailable) {
 			$0.isCapturingSelectedTextForRefinement = false
 			$0.refinedHotKeyReleasedWhileCapturingSelection = false
 		}
 		await store.finish()
 	}
 
-	func testScreenAwareIndicatorActivatesForRefinedRecording() async {
-		let activationID = UUID()
+	func testScreenAwareIndicatorActivatesForRegularRecording() async {
 		var state = Self.makeState()
 		state.isRecording = true
-		state.activeRecordingSource = .refined
-		state.screenAwareActivationID = activationID
+		state.activeRecordingSource = .regular
+		let context = Self.makeScreenContext()
 		let store = TestStore(initialState: state) {
 			TranscriptionFeature()
+		} withDependencies: {
+			$0.uuid = .constant(UUID(1))
+			$0.screenCapture.captureDisplayUnderCursor = { _ in context }
 		}
+		store.exhaustivity = .off(showSkippedAssertions: false)
 
-		await store.send(.screenAwareModeActivated(activationID)) {
-			$0.screenAwareActivationID = nil
+		await store.send(.screenAwareModeActivated) {
 			$0.isScreenAwareModeActive = true
+			$0.forcedRefinementMode = .refined
 		}
+		await store.receive(\.screenContextCaptured)
 		await store.finish()
 	}
 
-	func testScreenAwareIndicatorDoesNotActivateOutsideRefinedRecording() async {
+	func testScreenAwareIndicatorDoesNotActivateOutsideActiveRecording() async {
 		let store = TestStore(initialState: Self.makeState()) {
 			TranscriptionFeature()
 		}
 
-		await store.send(.screenAwareModeActivated(UUID()))
+		await store.send(.screenAwareModeActivated)
 		await store.finish()
 	}
 
@@ -765,160 +891,140 @@ final class RecordingRaceTests: XCTestCase {
 		))
 	}
 
-	func testScreenAwareIndicatorActivatesAfterHoldThreshold() async {
+	func testDoubleTapOnlyFirstHoldStartsOnDemandRecordingAfterThreshold() async {
 		let activationID = UUID(0)
 		let clock = TestClock()
 		var state = Self.makeState()
-		state.isRecording = true
-		state.activeRecordingSource = .refined
+		state.$hexSettings.withLock {
+			$0.hotkey = HotKey(key: .a, modifiers: [.command])
+			$0.includeSelectedTextInRefinement = false
+		}
 		let store = TestStore(initialState: state) {
 			TranscriptionFeature()
 		} withDependencies: {
-			$0.continuousClock = clock
-			$0.uuid = .constant(activationID)
-		}
-
-		await store.send(.startScreenAwareActivationCountdown(activationID)) {
-			$0.screenAwareActivationID = activationID
-		}
-		await clock.advance(by: .seconds(0.74))
-		XCTAssertFalse(store.state.isScreenAwareModeActive)
-		await clock.advance(by: .seconds(0.01))
-		await store.receive(.screenAwareModeActivated(activationID)) {
-			$0.screenAwareActivationID = nil
-			$0.isScreenAwareModeActive = true
-		}
-		await store.finish()
-	}
-
-	func testQuickSecondTapCancelsScreenAwareCountdownAndStartsRefinement() async {
-		let activationID = UUID(0)
-		let clock = TestClock()
-		var state = Self.makeState()
-		state.$hexSettings.withLock { $0.includeSelectedTextInRefinement = false }
-		let store = TestStore(initialState: state) {
-			TranscriptionFeature()
-		} withDependencies: {
+			$0.date.now = Date(timeIntervalSince1970: 1_234)
 			$0.continuousClock = clock
 			$0.uuid = .constant(activationID)
 			$0.recording.startRecording = {}
+			$0.recording.stopRecording = { .ignored(.noActiveRecording) }
 			$0.sleepManagement.preventSleep = { _ in }
+			$0.sleepManagement.allowSleep = {}
+			$0.soundEffects.play = { _ in }
 		}
 		store.exhaustivity = .off(showSkippedAssertions: false)
 
-		await store.send(.startScreenAwareActivationCountdown(activationID)) {
-			$0.screenAwareActivationID = activationID
-		}
-		await store.send(.refinedLockEstablished(activationID, false)) {
-			$0.screenAwareActivationID = nil
-			$0.cancelledScreenAwareActivationID = activationID
-		}
-		await store.receive(.refinedHotKeyPressed)
-		await store.receive(.startRefinedRecording)
+		await store.send(.armPendingPressAndHold)
+		XCTAssertEqual(store.state.pendingPressAndHoldActivationID, activationID)
+		await clock.advance(by: .seconds(0.29))
+		XCTAssertFalse(store.state.isRecording)
+
+		await clock.advance(by: .seconds(0.01))
+		await store.receive(\.pendingPressAndHoldActivated)
+		await store.receive(\.hotKeyPressed)
+		await store.receive(\.startRecording)
 		XCTAssertTrue(store.state.isRecording)
-		XCTAssertEqual(store.state.activeRecordingSource, .refined)
-		await clock.advance(by: .seconds(1))
-		XCTAssertFalse(store.state.isScreenAwareModeActive)
+		XCTAssertEqual(store.state.activeRecordingSource, .regular)
+
+		await store.send(.discard)
 		await store.finish()
 	}
 
-	func testScreenAwareActivationStartsRecordingWithoutSelectedTextCapture() async {
+	func testDoubleTapOnlyQuickFirstTapCancelsPendingOnDemandRecording() async {
 		let activationID = UUID(0)
+		let clock = TestClock()
+		let store = TestStore(initialState: Self.makeState()) {
+			TranscriptionFeature()
+		} withDependencies: {
+			$0.continuousClock = clock
+			$0.uuid = .constant(activationID)
+		}
+
+		await store.send(.armPendingPressAndHold) {
+			$0.pendingPressAndHoldActivationID = activationID
+		}
+		await store.send(.cancelPendingPressAndHold) {
+			$0.pendingPressAndHoldActivationID = nil
+		}
+		await clock.advance(by: .seconds(1))
+		XCTAssertFalse(store.state.isRecording)
+		await store.finish()
+	}
+
+	func testScreenAwareActivationSkipsSelectedTextCapture() async {
 		let context = Self.makeScreenContext()
 		var state = Self.makeState()
-		state.screenAwareActivationID = activationID
+		state.isRecording = true
+		state.activeRecordingSource = .regular
 		state.$hexSettings.withLock { $0.includeSelectedTextInRefinement = true }
 		let store = TestStore(initialState: state) {
 			TranscriptionFeature()
 		} withDependencies: {
+			$0.date.now = Date(timeIntervalSince1970: 1_234)
 			$0.uuid = .constant(UUID(1))
 			$0.recording.startRecording = {}
 			$0.sleepManagement.preventSleep = { _ in }
+			$0.soundEffects.play = { _ in }
 			$0.screenCapture.captureDisplayUnderCursor = { _ in context }
 		}
 		store.exhaustivity = .off(showSkippedAssertions: false)
 
-		await store.send(.screenAwareModeActivated(activationID))
+		await store.send(.screenAwareModeActivated)
 		XCTAssertTrue(store.state.isRecording)
-		XCTAssertEqual(store.state.activeRecordingSource, .refined)
+		XCTAssertEqual(store.state.activeRecordingSource, .regular)
 		XCTAssertTrue(store.state.isScreenAwareModeActive)
+		XCTAssertEqual(store.state.forcedRefinementMode, .refined)
 		XCTAssertFalse(store.state.isCapturingSelectedTextForRefinement)
 		await store.receive(\.screenContextCaptured)
 		await store.finish()
 	}
 
-	func testScreenAwareIndicatorIgnoresStaleActivation() async {
-		let currentActivationID = UUID()
-		var state = Self.makeState()
-		state.isRecording = true
-		state.activeRecordingSource = .refined
-		state.screenAwareActivationID = currentActivationID
-		let store = TestStore(initialState: state) {
-			TranscriptionFeature()
-		}
-
-		await store.send(.screenAwareModeActivated(UUID()))
-		XCTAssertFalse(store.state.isScreenAwareModeActive)
-		XCTAssertEqual(store.state.screenAwareActivationID, currentActivationID)
-		await store.finish()
-	}
-
-	func testRefinedReleaseClearsScreenAwareIndicatorAndPendingActivation() async {
-		let activationID = UUID()
-		var state = Self.makeState()
-		state.isScreenAwareModeActive = true
-		state.screenAwareActivationID = activationID
-		let store = TestStore(initialState: state) {
-			TranscriptionFeature()
-		}
-
-		await store.send(.hotKeyReleased(.refined)) {
-			$0.isScreenAwareModeActive = false
-			$0.screenAwareActivationID = nil
-			$0.cancelledScreenAwareActivationID = activationID
-		}
-		await store.finish()
-	}
-
-	func testRefinedHotkeyWithoutSelectionStartsRefinedRecording() async {
+	func testRegularHotkeyWithoutSelectionStopsNormallyAndPastesBaseline() async throws {
 		let now = Date(timeIntervalSince1970: 1_234)
-		let activeApp = NSWorkspace.shared.frontmostApplication
-		let recordingProbe = RecordingProbe(
-			stopURL: FileManager.default.temporaryDirectory.appendingPathComponent("no-selection-hotkey-\(UUID().uuidString).wav")
-		)
-		let store = TestStore(initialState: Self.makeState()) {
+		let audioURL = FileManager.default.temporaryDirectory
+			.appendingPathComponent("no-selection-hotkey-\(UUID().uuidString).wav")
+		XCTAssertTrue(FileManager.default.createFile(atPath: audioURL.path, contents: Data("audio".utf8)))
+		defer { try? FileManager.default.removeItem(at: audioURL) }
+		let pasteProbe = RefinementProbe()
+		var state = Self.makeState()
+		state.$hexSettings.withLock {
+			$0.hotkey = HotKey(key: .a, modifiers: [.command])
+			$0.saveTranscriptionHistory = false
+		}
+		let store = TestStore(initialState: state) {
 			TranscriptionFeature()
 		} withDependencies: {
 			$0.date.now = now
 			$0.pasteboard.captureSelectedText = { nil }
-			$0.recording.startRecording = { await recordingProbe.recordStart() }
+			$0.pasteboard.paste = { text in await pasteProbe.recordPaste(text) }
+			$0.recording.startRecording = {}
+			$0.recording.stopRecording = { .captured(audioURL) }
+			$0.transcription.transcribe = { _, _, _, _ in "ordinary transcript" }
+			$0.refinement.refine = { _ in throw RefinementTestError.failed }
 			$0.sleepManagement.preventSleep = { _ in }
+			$0.sleepManagement.allowSleep = {}
+			$0.soundEffects.play = { _ in }
 		}
+		store.exhaustivity = .off(showSkippedAssertions: false)
 
-		await store.send(.refinedHotKeyPressed) {
-			$0.isCapturingSelectedTextForRefinement = true
-		}
-		await store.receive(.selectedTextCaptureUnavailable) {
-			$0.isCapturingSelectedTextForRefinement = false
-		}
-		await store.receive(.startRefinedRecording) {
-			$0.isRecording = true
-			$0.forcedRefinementMode = .refined
-			$0.activeRecordingHotkey = $0.hexSettings.refinedHotkey
-			$0.activeMinimumKeyTime = $0.hexSettings.refinedMinimumKeyTime
-			$0.activeRecordingSource = .refined
-			$0.recordingStartTime = now
-			$0.sourceAppBundleID = activeApp?.bundleIdentifier
-			$0.sourceAppName = activeApp?.localizedName
-		}
+		await store.send(.hotKeyPressed)
+		await store.receive(\.refinedHotKeyPressed)
+		await store.receive(\.selectedTextCaptureUnavailable)
+		XCTAssertTrue(store.state.isRecording)
+		XCTAssertNil(store.state.forcedRefinementMode)
+
+		await store.send(.hotKeyReleased(.regular))
+		await store.receive(\.transcriptionAudioCaptured)
+		await store.receive(\.transcriptionResult)
 		await store.finish()
 
-		let recordingCounts = await recordingProbe.counts()
-		XCTAssertEqual(recordingCounts.startCalls, 1)
+		let pastedText = await pasteProbe.paste
+		XCTAssertEqual(pastedText, "ordinary transcript")
 	}
 
-	func testRefinedHotkeyFinishesRegularRecordingWithRefinement() async throws {
+	func testTerminalHoldFinishesRegularRecordingWithRefinement() async throws {
 		let now = Date(timeIntervalSince1970: 1_234)
+		let activationID = UUID(0)
+		let clock = TestClock()
 		let audioURL = FileManager.default.temporaryDirectory
 			.appendingPathComponent("refined-finish-\(UUID().uuidString).wav")
 		XCTAssertTrue(FileManager.default.createFile(atPath: audioURL.path, contents: Data("audio".utf8)))
@@ -934,7 +1040,6 @@ final class RecordingRaceTests: XCTestCase {
 		state.activeRecordingSource = .regular
 		state.$hexSettings.withLock {
 			$0.hotkey = regularHotkey
-			$0.refinedHotkey = HotKey(key: .r, modifiers: [.command])
 			$0.refinementMode = .raw
 			$0.saveTranscriptionHistory = false
 		}
@@ -942,6 +1047,8 @@ final class RecordingRaceTests: XCTestCase {
 			TranscriptionFeature()
 		} withDependencies: {
 			$0.date.now = now
+			$0.continuousClock = clock
+			$0.uuid = .constant(activationID)
 			$0.recording.stopRecording = { .captured(audioURL) }
 			$0.transcription.transcribe = { _, _, _, _ in "dictated text" }
 			$0.refinement.refine = { request in
@@ -952,26 +1059,38 @@ final class RecordingRaceTests: XCTestCase {
 			$0.sleepManagement.allowSleep = {}
 			$0.soundEffects.play = { _ in }
 		}
+		store.exhaustivity = .off(showSkippedAssertions: false)
 
-		await store.send(.finishRecordingWithRefinement) {
+		await store.send(.armTerminalRefinement) {
+			$0.pendingTerminalRefinementID = activationID
+		}
+		await clock.advance(by: .seconds(0.74))
+		XCTAssertTrue(store.state.isRecording)
+		XCTAssertNil(store.state.forcedRefinementMode)
+
+		await clock.advance(by: .seconds(0.01))
+		await store.receive(\.terminalRefinementActivated) {
+			$0.pendingTerminalRefinementID = nil
+		}
+		await store.receive(\.finishRecordingWithRefinement) {
 			$0.forcedRefinementMode = .refined
 		}
-		await store.receive(.stopRecording) {
+		await store.receive(\.stopRecording) {
 			$0.isRecording = false
 			$0.isTranscribing = true
 			$0.error = nil
 			$0.isPrewarming = true
 		}
-		await store.receive(.transcriptionAudioCaptured(audioURL, 1)) {
+		await store.receive(\.transcriptionAudioCaptured) {
 			$0.activeTranscriptionAudioURL = audioURL
 			$0.activeTranscriptionDuration = 1
 		}
-		await store.receive(.transcriptionResult("dictated text", audioURL)) {
+		await store.receive(\.transcriptionResult) {
 			$0.isTranscribing = false
 			$0.isPrewarming = false
 			$0.isRefining = true
 		}
-		await store.receive(.refinementResult("refined text", audioURL, 1)) {
+		await store.receive(\.refinementResult) {
 			$0.activeTranscriptionAudioURL = nil
 			$0.activeTranscriptionDuration = nil
 			$0.isRefining = false
@@ -982,8 +1101,82 @@ final class RecordingRaceTests: XCTestCase {
 		}
 		await store.finish()
 
-		XCTAssertEqual(await refinementProbe.input, "dictated text")
+		let refinementInput = await refinementProbe.input
+		XCTAssertEqual(refinementInput, "dictated text")
 		XCTAssertFalse(FileManager.default.fileExists(atPath: audioURL.path))
+	}
+
+	func testQuickTerminalReleaseCancelsAutomaticRefinement() async {
+		let activationID = UUID(0)
+		let clock = TestClock()
+		var state = Self.makeState()
+		state.isRecording = true
+		state.recordingStartTime = Date(timeIntervalSince1970: 1_233)
+		state.activeRecordingHotkey = HotKey(key: .a, modifiers: [.command])
+		state.activeMinimumKeyTime = 0.2
+		state.activeRecordingSource = .regular
+		let store = TestStore(initialState: state) {
+			TranscriptionFeature()
+		} withDependencies: {
+			$0.date.now = Date(timeIntervalSince1970: 1_234)
+			$0.continuousClock = clock
+			$0.uuid = .constant(activationID)
+			$0.recording.stopRecording = { .ignored(.noActiveRecording) }
+			$0.sleepManagement.allowSleep = {}
+			$0.soundEffects.play = { _ in }
+		}
+		store.exhaustivity = .off(showSkippedAssertions: false)
+
+		await store.send(.armTerminalRefinement)
+		XCTAssertEqual(store.state.pendingTerminalRefinementID, activationID)
+		await clock.advance(by: .seconds(0.25))
+
+		await store.send(.hotKeyReleased(.regular))
+		XCTAssertNil(store.state.pendingTerminalRefinementID)
+		await store.receive(\.stopRecording)
+		XCTAssertFalse(store.state.isRecording)
+		XCTAssertNil(store.state.forcedRefinementMode)
+
+		await clock.advance(by: .seconds(1))
+		XCTAssertNil(store.state.forcedRefinementMode)
+		await store.finish()
+	}
+
+	func testQuickFollowUpTapRefinesTranscriptThatWasAlreadyPasted() async {
+		let transcriptID = UUID()
+		let refinementProbe = RefinementProbe()
+		var state = Self.makeState()
+		state.recentCompletedTranscript = .init(
+			id: transcriptID,
+			text: "already pasted transcript",
+			historyID: nil
+		)
+		state.$hexSettings.withLock {
+			$0.refinementInstructions = "Make it concise."
+		}
+		let store = TestStore(initialState: state) {
+			TranscriptionFeature()
+		} withDependencies: {
+			$0.date.now = Date(timeIntervalSince1970: 1_234)
+			$0.refinement.refine = { request in
+				await refinementProbe.recordInput(request.text)
+				return "concise transcript"
+			}
+			$0.pasteboard.paste = { text in await refinementProbe.recordPaste(text) }
+			$0.soundEffects.play = { _ in }
+		}
+		store.exhaustivity = .off(showSkippedAssertions: false)
+
+		await store.send(.refineMostRecentTranscription)
+		XCTAssertTrue(store.state.isRefining)
+		await store.receive(\.recentTranscriptRefined)
+		await store.finish()
+
+		let refinementInput = await refinementProbe.input
+		let refinedPaste = await refinementProbe.paste
+		XCTAssertEqual(refinementInput, "already pasted transcript")
+		XCTAssertEqual(refinedPaste, "concise transcript")
+		XCTAssertEqual(store.state.recentCompletedTranscript?.text, "concise transcript")
 	}
 
 	func testScreenAwareActivationCapturesBeforeFinish() async {
@@ -993,14 +1186,12 @@ final class RecordingRaceTests: XCTestCase {
 		var state = Self.makeState()
 		state.isRecording = true
 		state.recordingStartTime = now
-		state.forcedRefinementMode = .refined
-		state.activeRecordingSource = .refined
-		let activationID = UUID()
-		state.screenAwareActivationID = activationID
+		state.activeRecordingSource = .regular
 		let store = TestStore(initialState: state) {
 			TranscriptionFeature()
 		} withDependencies: {
 			$0.date.now = now
+			$0.uuid = .constant(UUID(1))
 			$0.screenCapture.captureDisplayUnderCursor = { _ in
 				return try await captureProbe.capture()
 			}
@@ -1009,10 +1200,11 @@ final class RecordingRaceTests: XCTestCase {
 		}
 		store.exhaustivity = .off(showSkippedAssertions: false)
 
-		await store.send(.screenAwareModeActivated(activationID))
+		await store.send(.screenAwareModeActivated)
 		await captureProbe.waitUntilPending()
 		XCTAssertTrue(store.state.isRecording)
 		XCTAssertTrue(store.state.isScreenAwareModeActive)
+		XCTAssertEqual(store.state.forcedRefinementMode, .refined)
 
 		await captureProbe.resume(returning: context)
 		await store.receive(\.screenContextCaptured)
@@ -1022,49 +1214,106 @@ final class RecordingRaceTests: XCTestCase {
 
 		await store.send(.finishScreenAwareRecording)
 		XCTAssertFalse(store.state.isScreenAwareModeActive)
-		await store.receive(.stopRecording)
+		await store.receive(\.stopRecording)
 		await store.finish()
 	}
 
-	func testScreenCaptureFailureDoesNotStopRefinedRecording() async {
+	func testRegularHotKeyReleaseFinishesScreenAwareMode() async {
+		var state = Self.makeState()
+		state.isRecording = true
+		state.activeRecordingSource = .regular
+		state.isScreenAwareModeActive = true
+		let store = TestStore(initialState: state) {
+			TranscriptionFeature()
+		} withDependencies: {
+			$0.recording.stopRecording = { .ignored(.noActiveRecording) }
+			$0.sleepManagement.allowSleep = {}
+		}
+		store.exhaustivity = .off(showSkippedAssertions: false)
+
+		await store.send(.hotKeyReleased(.regular))
+		await store.receive(\.finishScreenAwareRecording) {
+			$0.isScreenAwareModeActive = false
+		}
+		await store.receive(\.stopRecording)
+		await store.finish()
+	}
+
+	func testScreenAwareSecondTapActivatesAtThresholdBeforeRelease() async {
+		let clock = TestClock()
+		let now = Date(timeIntervalSince1970: 1_234)
+		let context = Self.makeScreenContext()
+		var state = Self.makeState()
+		state.isRecording = true
+		state.recordingStartTime = now
+		state.activeRecordingSource = .regular
+		let store = TestStore(initialState: state) {
+			TranscriptionFeature()
+		} withDependencies: {
+			$0.continuousClock = clock
+			$0.date.now = now
+			$0.uuid = .constant(UUID(1))
+			$0.screenCapture.captureDisplayUnderCursor = { _ in context }
+		}
+		store.exhaustivity = .off(showSkippedAssertions: false)
+
+		await store.send(.armScreenAwareActivation)
+		await clock.advance(by: .seconds(0.74))
+		XCTAssertFalse(store.state.isScreenAwareModeActive)
+		await clock.advance(by: .seconds(0.01))
+		await store.receive(\.screenAwareActivationThresholdReached)
+		await store.receive(\.screenAwareModeActivated)
+		await store.receive(\.screenContextCaptured)
+		XCTAssertTrue(store.state.isScreenAwareModeActive)
+		XCTAssertEqual(store.state.forcedRefinementMode, .refined)
+		// No hotKeyReleased action is sent: activation must happen while held.
+		await store.send(.cancelScreenAwareActivation)
+		await store.finish()
+	}
+
+	func testScreenCaptureFailureDoesNotStopScreenAwareRecording() async {
 		let now = Date(timeIntervalSince1970: 1_234)
 		var state = Self.makeState()
 		state.isRecording = true
 		state.recordingStartTime = now
-		state.forcedRefinementMode = .refined
-		state.activeRecordingSource = .refined
-		let activationID = UUID()
-		state.screenAwareActivationID = activationID
+		state.activeRecordingSource = .regular
 		let store = TestStore(initialState: state) {
 			TranscriptionFeature()
 		} withDependencies: {
 			$0.date.now = now
+			$0.uuid = .constant(UUID(1))
 			$0.screenCapture.captureDisplayUnderCursor = { _ in throw ScreenCaptureFlowTestError.failed }
 			$0.recording.stopRecording = { .ignored(.noActiveRecording) }
 			$0.sleepManagement.allowSleep = {}
 		}
 		store.exhaustivity = .off(showSkippedAssertions: false)
 
-		await store.send(.screenAwareModeActivated(activationID))
+		await store.send(.screenAwareModeActivated)
 		await store.receive(\.screenContextCaptureFailed)
 		XCTAssertFalse(store.state.isScreenAwareModeActive)
 		XCTAssertTrue(store.state.isRecording)
+		XCTAssertEqual(store.state.forcedRefinementMode, .refined)
 		await store.finish()
 	}
 
 	func testTranscriptionErrorClearsScreenAwareIndicatorDuringCapture() async {
+		let clock = TestClock()
 		var state = Self.makeState()
 		state.isTranscribing = true
 		state.isScreenAwareModeActive = true
 		state.screenContextCaptureID = UUID()
 		let store = TestStore(initialState: state) {
 			TranscriptionFeature()
+		} withDependencies: {
+			$0.continuousClock = clock
 		}
 		store.exhaustivity = .off(showSkippedAssertions: false)
 
 		await store.send(.transcriptionError(ScreenCaptureFlowTestError.failed, nil))
 		XCTAssertFalse(store.state.isScreenAwareModeActive)
 		XCTAssertNil(store.state.screenContextCaptureID)
+		await clock.advance(by: .seconds(5))
+		await store.receive(\.dismissError)
 		await store.finish()
 	}
 

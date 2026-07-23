@@ -69,7 +69,10 @@ extension TranscriptPersistenceClient: DependencyKey {
                 try fm.createDirectory(at: recordingsFolder, withIntermediateDirectories: true)
 
 				let identifier = UUID().uuidString
-				let finalURL = recordingsFolder.appendingPathComponent("\(identifier).wav")
+				let recoverySessionID = recoverySessionID(for: request.audioURL, recordingsFolder: recordingsFolder)
+				let finalURL = recoverySessionID == nil
+					? recordingsFolder.appendingPathComponent("\(identifier).wav")
+					: request.audioURL
 				let screenshotURL: URL?
 				let ownsScreenshotArtifact: Bool
 				if let screenshotPath = request.screenshotPath {
@@ -87,11 +90,13 @@ extension TranscriptPersistenceClient: DependencyKey {
 					ownsScreenshotArtifact = false
 				}
 
-				do {
-					try fm.moveItem(at: request.audioURL, to: finalURL)
-				} catch {
-					if ownsScreenshotArtifact, let screenshotURL { try? fm.removeItem(at: screenshotURL) }
-					throw error
+				if recoverySessionID == nil {
+					do {
+						try fm.moveItem(at: request.audioURL, to: finalURL)
+					} catch {
+						if ownsScreenshotArtifact, let screenshotURL { try? fm.removeItem(at: screenshotURL) }
+						throw error
+					}
 				}
                 
 				let screenshotByteCount: Int?
@@ -118,7 +123,8 @@ extension TranscriptPersistenceClient: DependencyKey {
 					wasRefined: request.wasRefined,
 					outputGenerationDuration: request.outputGenerationDuration,
 					screenshotByteCount: screenshotByteCount,
-					screenAwareInputSource: request.screenAwareInputSource
+					screenAwareInputSource: request.screenAwareInputSource,
+					recoverySessionID: recoverySessionID
                 )
 			},
 			saveScreenshot: { imagePNGData in
@@ -145,6 +151,16 @@ extension TranscriptPersistenceClient: DependencyKey {
 		saveScreenshot: { _ in URL(fileURLWithPath: "/") },
 		deleteArtifacts: { _ in }
     )
+}
+
+private func recoverySessionID(for audioURL: URL, recordingsFolder: URL) -> UUID? {
+	guard audioURL.deletingLastPathComponent().standardizedFileURL == recordingsFolder.standardizedFileURL,
+		  audioURL.pathExtension == "wav"
+	else { return nil }
+	let prefix = "active-"
+	let name = audioURL.deletingPathExtension().lastPathComponent
+	guard name.hasPrefix(prefix) else { return nil }
+	return UUID(uuidString: String(name.dropFirst(prefix.count)))
 }
 
 public extension DependencyValues {

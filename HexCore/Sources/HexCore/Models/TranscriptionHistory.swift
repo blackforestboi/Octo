@@ -61,6 +61,9 @@ public struct Transcript: Codable, Equatable, Identifiable, Sendable {
 	public var screenshotByteCount: Int?
 	/// The screen context source used for this run, retained for an accurate full rerun.
 	public var screenAwareInputSource: ScreenAwareInputSource?
+	/// Identifies audio reconstructed after an interrupted recording so it can be recovered
+	/// without being pasted as if it were a completed transcript.
+	public var recoverySessionID: UUID?
     
     public init(
         id: UUID = UUID(),
@@ -80,7 +83,8 @@ public struct Transcript: Codable, Equatable, Identifiable, Sendable {
 		wasRefined: Bool? = nil,
 		outputGenerationDuration: TimeInterval? = nil,
 		screenshotByteCount: Int? = nil,
-		screenAwareInputSource: ScreenAwareInputSource? = nil
+		screenAwareInputSource: ScreenAwareInputSource? = nil,
+		recoverySessionID: UUID? = nil
     ) {
         self.id = id
         self.timestamp = timestamp
@@ -100,6 +104,7 @@ public struct Transcript: Codable, Equatable, Identifiable, Sendable {
 		self.outputGenerationDuration = outputGenerationDuration
 		self.screenshotByteCount = screenshotByteCount
 		self.screenAwareInputSource = screenAwareInputSource
+		self.recoverySessionID = recoverySessionID
     }
 }
 

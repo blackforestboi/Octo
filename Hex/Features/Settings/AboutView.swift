@@ -36,15 +36,15 @@ struct AboutView: View {
                     }
                 }
                 HStack {
-                    Label("Hex is open source", systemImage: "apple.terminal.on.rectangle")
+					Label("Octo is open source", systemImage: "apple.terminal.on.rectangle")
                     Spacer()
-                    Link("Visit our GitHub", destination: URL(string: "https://github.com/kitlangton/Hex/")!)
+					Link("Visit our GitHub", destination: URL(string: "https://github.com/blackforestboi/Octo/")!)
                 }
                 
                 HStack {
                     Label("Support the developer", systemImage: "heart")
                     Spacer()
-                    Link("Become a Sponsor", destination: URL(string: "https://github.com/sponsors/kitlangton")!)
+					Link("Visit Black Forest Boi", destination: URL(string: "https://github.com/blackforestboi")!)
                 }
             }
         }

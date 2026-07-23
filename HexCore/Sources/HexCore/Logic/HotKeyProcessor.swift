@@ -94,7 +94,8 @@ public struct HotKeyProcessor {
     /// The hotkey combination to detect (key + modifiers)
     public var hotkey: HotKey
     
-    /// If true, only double-tap activates recording (press-and-hold disabled)
+    /// If true, quick taps only activate recording as a double-tap lock.
+    /// A held first press still activates an ordinary press-and-hold recording.
     public var useDoubleTapOnly: Bool = false
 
     /// When set, a second press that would establish a double-tap lock remains
@@ -108,8 +109,17 @@ public struct HotKeyProcessor {
     /// Whether the current hold is the second press that will establish a
     /// double-tap lock when released.
     public var isLockingHold: Bool {
-        doubleTapLockPendingRelease
+        secondTapHoldPendingRelease
     }
+
+    /// Enables the quick-tap, then held-second-tap screen-aware gesture while
+    /// ordinary press-and-hold recording is active.
+    public var screenAwareSecondTapEnabled: Bool = false
+
+    /// Enables the long-hold, then quick-second-tap refinement gesture for
+    /// press-and-hold recording. The second tap is consumed as a refinement
+    /// request rather than beginning a new recording.
+    public var postHoldRefinementEnabled: Bool = false
 
     /// If false, the quick double-tap lock gesture is disabled.
     /// Press-and-hold still works normally.
@@ -127,11 +137,13 @@ public struct HotKeyProcessor {
     /// Timestamp of the most recent hotkey release (for double-tap detection)
     private var lastTapAt: Date?
 
-    /// Start time for a pending tap while press-and-hold is disabled.
-    private var doubleTapOnlyPressStartedAt: Date?
+    /// The second tap has started recording and is being measured for either a
+    /// screen-aware hold or a double-tap lock.
+    private var secondTapHoldPendingRelease = false
 
-    /// The second tap has started recording and will enter the locked state on release.
-    private var doubleTapLockPendingRelease = false
+    /// Whether the most recently completed press-and-hold gesture was long
+    /// enough to be followed by the quick-tap refinement gesture.
+    private var lastTapWasLong = false
     
     /// When true, all input is ignored until full keyboard release
     /// Prevents accidental re-triggering after cancellation or during complex key combos
@@ -152,7 +164,7 @@ public struct HotKeyProcessor {
     /// Creates a new hotkey processor
     /// - Parameters:
     ///   - hotkey: The key combination to detect
-    ///   - useDoubleTapOnly: If true, disables press-and-hold and requires double-tap lock
+    ///   - useDoubleTapOnly: If true, quick taps require a double-tap lock while holds still record
     ///   - doubleTapLockEnabled: If false, disables double-tap lock behavior
     ///   - minimumKeyTime: Minimum duration for valid key press (overridden to modifierOnlyMinimumDuration for modifier-only)
     public init(
@@ -172,9 +184,9 @@ public struct HotKeyProcessor {
     /// Returns true if recording is currently active (press-and-hold or double-tap locked)
     public var isMatched: Bool {
         switch state {
-        case .idle:
+        case .idle, .pendingPressAndHold:
             return false
-        case .pressAndHold, .doubleTapLock:
+        case .pressAndHold, .doubleTapLock, .endingHold:
             return true
         }
     }
@@ -267,6 +279,22 @@ public struct HotKeyProcessor {
         switch state {
         case .idle:
             return nil
+        case let .pendingPressAndHold(startTime):
+            let elapsed = now.timeIntervalSince(startTime)
+            guard elapsed >= Self.doubleTapThreshold else {
+                resetToIdle()
+                return .cancelPendingPressAndHold
+            }
+            // The delayed activation has fired. Adopt the normal hold state so
+            // mouse behavior matches every other press-and-hold recording.
+            state = .pressAndHold(startTime: startTime)
+            let effectiveMinimum = max(minimumKeyTime, RecordingDecisionEngine.modifierOnlyMinimumDuration)
+            if elapsed < effectiveMinimum {
+                isDirty = true
+                resetToIdle()
+                return .discard
+            }
+            return nil
         case let .pressAndHold(startTime):
             // Mouse click during modifier-only recording
             let elapsed = now.timeIntervalSince(startTime)
@@ -283,7 +311,7 @@ public struct HotKeyProcessor {
                 // After threshold, ignore mouse clicks - let recording continue
                 return nil
             }
-        case .doubleTapLock:
+        case .doubleTapLock, .endingHold:
             // Mouse click during double-tap lock => ignore (only ESC cancels locked recordings)
             return nil
         }
@@ -297,6 +325,10 @@ public extension HotKeyProcessor {
     enum State: Equatable {
         /// Idle, waiting for hotkey activation
         case idle
+
+        /// The first press in double-tap-only mode is waiting to cross the
+        /// hold threshold before recording starts.
+        case pendingPressAndHold(startTime: Date)
         
         /// Press-and-hold recording active
         /// - Parameter startTime: When the hotkey was first pressed (for duration calculation)
@@ -304,15 +336,44 @@ public extension HotKeyProcessor {
         
         /// Double-tap lock active - recording continues until explicit stop
         case doubleTapLock
+
+        /// A locked recording is waiting for the terminal hotkey release so its
+        /// duration can choose normal transcription or refinement.
+        case endingHold(startTime: Date)
     }
 
     /// Actions to take in response to keyboard events
     enum Output: Equatable {
         /// Begin a new recording session
         case startRecording
+
+		/// Begin recording and arm the screen-aware second-tap hold threshold.
+		case startRecordingAndArmScreenAware
+
+        /// Schedule a press-and-hold recording if the first press remains held.
+        case armPendingPressAndHold
+
+        /// Cancel a scheduled hold because the first press was released quickly.
+        case cancelPendingPressAndHold
+
+        /// Schedule refinement for a locked recording once its terminal activation
+        /// reaches the configured hold duration, without waiting for key-up.
+        case armTerminalRefinement
         
         /// Stop the current recording and process audio
         case stopRecording
+
+        /// Stop the current recording and run the downstream refinement stage.
+        case stopRecordingWithRefinement
+
+        /// Stop the current recording after capturing screen context. This is
+        /// the non-locking variant of the held-second-tap gesture.
+        case stopRecordingWithScreenContext
+
+        /// Refine the most recently completed transcription. This handles a
+        /// quick terminal tap that arrives after a press-and-hold recording has
+        /// already finished transcribing and pasted its baseline result.
+        case refineMostRecentTranscription
 
         /// Recording remains active after a second tap established a double-tap lock.
         /// The associated hold duration can be inspected with `isLongPressLocked`.
@@ -338,61 +399,86 @@ extension HotKeyProcessor {
     /// Handles keyboard events that match the configured hotkey.
     ///
     /// # State Transitions
-    /// - `.idle` → `.pressAndHold`: Start new recording (unless useDoubleTapOnly mode)
+    /// - `.idle` → `.pressAndHold`: Start a new recording
+    /// - `.idle` → `.pendingPressAndHold`: Wait to distinguish a tap from a hold
     /// - `.pressAndHold` → no change: Already recording, ignore
-    /// - `.doubleTapLock` → `.idle`: User pressed hotkey to stop locked recording
+        /// - `.doubleTapLock` → `.endingHold`: User pressed hotkey to end locked recording
     ///
     /// # Double-Tap Only Mode
     /// When useDoubleTapOnly is enabled:
-    /// - First press: Record timestamp but don't start recording
-    /// - First release: Record release timestamp
+    /// - First press: Arm a delayed press-and-hold recording
+    /// - Quick first release: Cancel the delay and arm the double-tap lock
+    /// - Held first press: Start an ordinary press-and-hold recording after the threshold
     /// - Second press within threshold: Start recording, then enter the lock on release
     ///
     /// - Returns: `.startRecording` when entering press-and-hold, `.stopRecording` when exiting lock
     private mutating func handleMatchingChord() -> Output? {
         switch state {
         case .idle:
+            if postHoldRefinementEnabled,
+               lastTapWasLong,
+               let prevTapTime = lastTapAt,
+               now.timeIntervalSince(prevTapTime) < Self.doubleTapThreshold
+            {
+                clearDoubleTapTracking()
+                return .refineMostRecentTranscription
+            }
+
             if isDoubleTapOnlyEnabledForCurrentHotkey {
                 if let prevTapTime = lastTapAt,
                    now.timeIntervalSince(prevTapTime) < Self.doubleTapThreshold {
                     clearDoubleTapTracking()
                     if lockingHoldDuration != nil {
                         state = .pressAndHold(startTime: now)
-                        doubleTapLockPendingRelease = true
+                        secondTapHoldPendingRelease = true
                     } else {
                         state = .doubleTapLock
                     }
                     isLongPressLocked = false
-                    return .startRecording
+					return screenAwareSecondTapEnabled
+						? .startRecordingAndArmScreenAware
+						: .startRecording
                 } else {
-                    doubleTapOnlyPressStartedAt = now
                     lastTapAt = nil
-                    return nil
+                    state = .pendingPressAndHold(startTime: now)
+                    return .armPendingPressAndHold
                 }
             } else {
                 // Normal press => .pressAndHold => .startRecording
                 state = .pressAndHold(startTime: now)
-                if doubleTapLockEnabled,
+                if (doubleTapLockEnabled || screenAwareSecondTapEnabled),
                    lockingHoldDuration != nil,
                    let prevTapTime = lastTapAt,
                    now.timeIntervalSince(prevTapTime) < Self.doubleTapThreshold
                 {
-                    // Screen-aware mode needs to know whether this is the second
-                    // press of a normal double-tap lock, so it can activate only
-                    // while that second press is held.
-                    doubleTapLockPendingRelease = true
+                    // Remember that this is the second press at key-down. The release
+                    // may arrive outside the double-tap window when the user holds it
+                    // for Screen Aware, but it must still establish the lock. When
+                    // Screen Aware is unavailable the same gesture safely falls back
+                    // to an ordinary lock.
+                    secondTapHoldPendingRelease = true
                 }
-                return .startRecording
+				return secondTapHoldPendingRelease && screenAwareSecondTapEnabled
+					? .startRecordingAndArmScreenAware
+					: .startRecording
             }
 
         case .pressAndHold:
             // Already matched, no new output
             return nil
 
+        case .pendingPressAndHold:
+            // Repeated events while the first press remains held do not re-arm it.
+            return nil
+
         case .doubleTapLock:
-            // Pressing hotkey again while locked => stop
-            resetToIdle()
-            return .stopRecording
+            // Arm a threshold effect immediately. A quick release still chooses normal
+            // completion, while crossing the threshold can refine before key-up.
+            state = .endingHold(startTime: now)
+            return lockingHoldDuration == nil ? nil : .armTerminalRefinement
+
+        case .endingHold:
+            return nil
         }
     }
 
@@ -419,29 +505,50 @@ extension HotKeyProcessor {
     private mutating func handleNonmatchingChord(_ e: KeyEvent) -> Output? {
         switch state {
         case .idle:
-            if isDoubleTapOnlyEnabledForCurrentHotkey &&
-               isReleaseForActiveHotkey(e),
-               let pressStartedAt = doubleTapOnlyPressStartedAt {
-                let elapsed = now.timeIntervalSince(pressStartedAt)
-                if elapsed < Self.doubleTapThreshold {
-                    lastTapAt = now
-                } else {
-                    lastTapAt = nil
-                }
-                doubleTapOnlyPressStartedAt = nil
-            }
             return nil
+
+        case let .pendingPressAndHold(startTime):
+            let elapsed = now.timeIntervalSince(startTime)
+            guard isReleaseForActiveHotkey(e) else {
+                if elapsed >= Self.doubleTapThreshold {
+                    // The delayed activation has fired; from this event onward,
+                    // use the ordinary press-and-hold conflict behavior.
+                    state = .pressAndHold(startTime: startTime)
+                    return handleNonmatchingChord(e)
+                }
+                resetToIdle()
+                return .cancelPendingPressAndHold
+            }
+
+            let wasQuickTap = elapsed < Self.doubleTapThreshold
+            state = .idle
+            secondTapHoldPendingRelease = false
+            lastTapWasLong = false
+            isLongPressLocked = false
+            if wasQuickTap {
+                lastTapAt = now
+                return .cancelPendingPressAndHold
+            }
+
+            lastTapAt = nil
+            return .stopRecording
 
         case let .pressAndHold(startTime):
             // If user truly "released" the chord => either normal stop or doubleTapLock
             if isReleaseForActiveHotkey(e) {
-                if doubleTapLockPendingRelease {
-                    state = .doubleTapLock
-                    isLongPressLocked = lockingHoldDuration.map {
+                if secondTapHoldPendingRelease {
+                    let wasLongSecondTap = lockingHoldDuration.map {
                         now.timeIntervalSince(startTime) >= $0
                     } ?? false
                     clearDoubleTapTracking()
-                    return .locked
+                    if doubleTapLockEnabled {
+                        state = .doubleTapLock
+                        isLongPressLocked = wasLongSecondTap
+                        return .locked
+                    }
+
+                    state = .idle
+                    return wasLongSecondTap ? .stopRecordingWithScreenContext : .stopRecording
                 }
 
                 // Check if this release is close to the prior release => double-tap lock
@@ -456,7 +563,10 @@ extension HotKeyProcessor {
                 } else {
                     // Normal stop => idle => record the release time
                     state = .idle
-                    lastTapAt = doubleTapLockEnabled ? now : nil
+                    lastTapAt = (doubleTapLockEnabled || screenAwareSecondTapEnabled || postHoldRefinementEnabled) ? now : nil
+                    lastTapWasLong = lockingHoldDuration.map {
+                        now.timeIntervalSince(startTime) >= $0
+                    } ?? false
                     return .stopRecording
                 }
             } else {
@@ -494,6 +604,14 @@ extension HotKeyProcessor {
         case .doubleTapLock:
             // If locked, ignore everything except chord == hotkey => stop.
             return nil
+
+        case let .endingHold(startTime):
+            guard isReleaseForActiveHotkey(e) else { return nil }
+            let shouldRefine = lockingHoldDuration.map {
+                now.timeIntervalSince(startTime) >= $0
+            } ?? false
+            resetToIdle()
+            return shouldRefine ? .stopRecordingWithRefinement : .stopRecording
         }
     }
 
@@ -602,7 +720,7 @@ extension HotKeyProcessor {
 
     private mutating func clearDoubleTapTracking() {
         lastTapAt = nil
-        doubleTapOnlyPressStartedAt = nil
-        doubleTapLockPendingRelease = false
+        secondTapHoldPendingRelease = false
+        lastTapWasLong = false
     }
 }

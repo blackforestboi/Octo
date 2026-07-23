@@ -41,7 +41,7 @@ enum DirectProviderModelCatalog {
 			try await openAIModels(apiKey: apiKey)
 		case .anthropic:
 			try await anthropicModels(apiKey: apiKey)
-		case .apple, .gemini, .openRouter:
+		case .apple, .gemini, .openRouter, .codexCLI, .claudeCLI:
 			throw CatalogError.unsupportedProvider
 		}
 	}

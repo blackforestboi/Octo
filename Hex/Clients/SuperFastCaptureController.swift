@@ -100,15 +100,14 @@ final class SuperFastCaptureController {
   }
 
   private struct ActiveRecording {
-    let url: URL
-    let file: AVAudioFile
+    let recoverySession: RecordingRecoverySession
     let requestedAt: Date
     let prependedDuration: TimeInterval
     var didLogFirstBuffer: Bool
   }
 
   private let logger = HexLog.recording
-  private let processingQueue = DispatchQueue(label: "com.kitlangton.Hex.SuperFastCapture")
+  private let processingQueue = DispatchQueue(label: "io.github.blackforestboi.Octo.SuperFastCapture")
   private let stopBoundaryLock = NSLock()
   private let meterContinuation: AsyncStream<Meter>.Continuation
   private let ringBuffer = FloatRingBuffer(
@@ -256,6 +255,7 @@ final class SuperFastCaptureController {
       captureGeneration += 1
       converter = nil
       if clearingRecordingState {
+        activeRecording?.recoverySession.abandonForRecovery()
         resolvePendingFinish(with: .idle)
         clearStopBoundary()
         activeRecording = nil
@@ -283,42 +283,32 @@ final class SuperFastCaptureController {
     processingQueue.sync { generation == captureGeneration }
   }
 
-  func beginRecording(to url: URL, requestedAt: Date = Date(), mode: CaptureRecordingMode) throws {
+  func beginRecording(
+    recoverySession: RecordingRecoverySession,
+    requestedAt: Date = Date(),
+    mode: CaptureRecordingMode
+  ) throws {
     try startIfNeeded(reason: "begin-recording", keepWarmBuffer: mode.keepsWarmBuffer)
 
     var startError: Error?
     processingQueue.sync {
       do {
         recordingFailure = nil
-        let file = try AVAudioFile(
-          forWriting: url,
-          settings: [
-            AVFormatIDKey: Int(kAudioFormatLinearPCM),
-            AVSampleRateKey: SuperFastCaptureConstants.sampleRate,
-            AVNumberOfChannelsKey: 1,
-            AVLinearPCMBitDepthKey: 32,
-            AVLinearPCMIsFloatKey: true,
-            AVLinearPCMIsBigEndianKey: false,
-            AVLinearPCMIsNonInterleaved: true,
-          ],
-          commonFormat: .pcmFormatFloat32,
-          interleaved: false
-        )
-
         let preRollDuration = mode.preRollDuration
         let preRollFrameCount = Int(preRollDuration * SuperFastCaptureConstants.sampleRate)
         let preRollSamples = ringBuffer.recentSamples(count: preRollFrameCount)
         let prependedDuration = Double(preRollSamples.count) / SuperFastCaptureConstants.sampleRate
         if !preRollSamples.isEmpty {
-          try write(samples: preRollSamples, to: file)
+          try preRollSamples.withUnsafeBufferPointer { samples in
+            try recoverySession.append(samples)
+          }
         }
 
         logger.notice(
-          "Capture engine recording file opened prepended=\(String(format: "%.3f", prependedDuration))s requestedPreRoll=\(String(format: "%.3f", preRollDuration))s"
+          "Capture engine durable PCM source opened prepended=\(String(format: "%.3f", prependedDuration))s requestedPreRoll=\(String(format: "%.3f", preRollDuration))s"
         )
         activeRecording = ActiveRecording(
-          url: url,
-          file: file,
+          recoverySession: recoverySession,
           requestedAt: requestedAt,
           prependedDuration: prependedDuration,
           didLogFirstBuffer: false
@@ -452,7 +442,9 @@ final class SuperFastCaptureController {
     do {
       if outputFramesToWrite > 0 {
         converted.frameLength = AVAudioFrameCount(outputFramesToWrite)
-        try recording.file.write(from: converted)
+        try recording.recoverySession.append(
+          UnsafeBufferPointer(start: samples, count: outputFramesToWrite)
+        )
       }
       if let stopBoundary,
          time.isHostTimeValid,
@@ -467,14 +459,14 @@ final class SuperFastCaptureController {
         if let pendingFinish {
           let postRollDescription = String(format: "%.3f", pendingFinish.postRollDuration)
           logger.notice("Capture engine finalizing at audio boundary postRoll=\(postRollDescription)s")
-          resolvePendingFinish(with: .captured(recording.url))
+          resolvePendingFinish(with: finalize(recording))
         }
       }
     } catch {
       logger.error("Failed to write capture engine audio: \(error.localizedDescription)")
       activeRecording = nil
       recordingFailure = .captureWriteFailed(error.localizedDescription)
-      FileManager.default.removeItemIfExists(at: recording.url)
+      recording.recoverySession.abandonForRecovery()
       resolvePendingFinish(with: .failed(.captureWriteFailed(error.localizedDescription)))
     }
   }
@@ -566,9 +558,7 @@ final class SuperFastCaptureController {
         guard let self, self.pendingFinish != nil else { return }
         self.logger.error("Timed out waiting for capture engine to reach the stop audio boundary")
         let failure = RecordingFailure.captureFinalizationTimedOut
-        if let url = self.activeRecording?.url {
-          FileManager.default.removeItemIfExists(at: url)
-        }
+        self.activeRecording?.recoverySession.abandonForRecovery()
         self.resolvePendingFinish(with: .failed(failure))
       }
     }
@@ -578,10 +568,20 @@ final class SuperFastCaptureController {
     if let recordingFailure {
       return .failed(recordingFailure)
     }
-    if let url = activeRecording?.url {
-      return .captured(url)
+    if let recording = activeRecording {
+      return finalize(recording)
     }
     return .idle
+  }
+
+  private func finalize(_ recording: ActiveRecording) -> FinishRecordingResult {
+    do {
+      return .captured(try recording.recoverySession.finalize().audioURL)
+    } catch {
+      logger.error("Failed to finalize durable capture source: \(error.localizedDescription, privacy: .private)")
+      recording.recoverySession.abandonForRecovery()
+      return .failed(.captureWriteFailed(error.localizedDescription))
+    }
   }
 
   private func resolvePendingFinish(with result: FinishRecordingResult) {
@@ -643,22 +643,6 @@ final class SuperFastCaptureController {
     @unknown default:
       return nil
     }
-  }
-
-  private func write(samples: [Float], to file: AVAudioFile) throws {
-    guard !samples.isEmpty,
-          let buffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: AVAudioFrameCount(samples.count)),
-          let channelData = buffer.floatChannelData?[0]
-    else {
-      return
-    }
-
-    buffer.frameLength = AVAudioFrameCount(samples.count)
-    samples.withUnsafeBufferPointer { sampleBuffer in
-      guard let baseAddress = sampleBuffer.baseAddress else { return }
-      channelData.update(from: baseAddress, count: sampleBuffer.count)
-    }
-    try file.write(from: buffer)
   }
 
   private func meter(for samples: UnsafePointer<Float>, count: Int) -> Meter {

@@ -23,15 +23,17 @@ enum OpenRouterModelCatalog {
 		return modelID
 	}
 
-	static func reasoningConfiguration(for modelID: String) -> OpenRouterReasoningConfiguration? {
+	static func reasoningConfiguration(for modelID: String, requestedEffort: RefinementReasoningEffort) -> OpenRouterReasoningConfiguration? {
 		guard let reasoning = cachedModels().first(where: { $0.id == modelID })?.reasoning else {
 			return .init(exclude: true)
 		}
 		let effort: String
 		if reasoning.mandatory == true {
-			effort = lowestSupportedEffort(in: reasoning.supportedEfforts) ?? "low"
+			effort = reasoning.supportedEfforts?.contains(requestedEffort.rawValue) == true
+				? requestedEffort.rawValue
+				: lowestSupportedEffort(in: reasoning.supportedEfforts) ?? "low"
 		} else {
-			effort = "none"
+			effort = requestedEffort.rawValue
 		}
 		return .init(effort: effort, exclude: true)
 	}

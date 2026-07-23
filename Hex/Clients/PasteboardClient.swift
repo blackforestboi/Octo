@@ -141,86 +141,97 @@ final class PasteboardClientLive {
         pasteboard.setString(text, forType: .string)
     }
 
-    /// Copies the current selection without leaving it on the user's clipboard after replacement.
+    /// Reads the current selection through Accessibility without synthesizing a Copy command.
+    /// This is deliberately side-effect-free: selection enrichment must not alter hotkey state.
     @MainActor
     func captureSelectedText() async -> SelectedTextCapture? {
-        let pasteboard = NSPasteboard.general
-        let snapshot = PasteboardSnapshot(pasteboard: pasteboard)
-        let initialChangeCount = pasteboard.changeCount
         guard let sourceProcessIdentifier = NSWorkspace.shared.frontmostApplication?.processIdentifier else {
             return nil
         }
-
-        await sendKeyboardCommand(.init(key: .c, modifiers: [.command]))
-
-        guard await waitForPasteboardCommit(targetChangeCount: initialChangeCount + 1) else {
-            return nil
-        }
-
-        let capturedChangeCount = pasteboard.changeCount
-        guard let selectedText = pasteboard.string(forType: .string),
-              !selectedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        else {
-            if pasteboard.changeCount == capturedChangeCount {
-                snapshot.restore(to: pasteboard)
-            }
-            return nil
-        }
+		guard let (focusedElement, selectedText) = focusedSelection() else { return nil }
 
         return SelectedTextCapture(
             text: selectedText,
             replaceSelection: { [weak self] text in
                 guard let self else { return .pasteFailed }
-                return await self.replaceSelectedText(
+				return await self.replaceSelectedTextUsingAccessibility(
                     with: text,
-                    snapshot: snapshot,
-                    capturedChangeCount: capturedChangeCount,
+					originalSelection: selectedText,
+					focusedElement: focusedElement,
                     sourceProcessIdentifier: sourceProcessIdentifier
                 )
             },
-            cancelSelection: {
-                guard pasteboard.changeCount == capturedChangeCount else { return }
-                snapshot.restore(to: pasteboard)
-            }
+			cancelSelection: {}
         )
     }
 
-    /// Replaces the captured selection and restores the user's previous clipboard contents.
-    /// Reports whether replacement succeeded, the clipboard/source app changed, or paste failed.
+	@MainActor
+	private func focusedSelection() -> (AXUIElement, String)? {
+		let systemWideElement = AXUIElementCreateSystemWide()
+		var focusedElementRef: CFTypeRef?
+		guard AXUIElementCopyAttributeValue(
+			systemWideElement,
+			kAXFocusedUIElementAttribute as CFString,
+			&focusedElementRef
+		) == .success,
+		let focusedElementRef
+		else { return nil }
+		let focusedElement = focusedElementRef as! AXUIElement
+
+		var selectedTextRef: CFTypeRef?
+		guard AXUIElementCopyAttributeValue(
+			focusedElement,
+			kAXSelectedTextAttribute as CFString,
+			&selectedTextRef
+		) == .success,
+		let selectedText = selectedTextRef as? String
+		else { return nil }
+
+		guard !selectedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+		return (focusedElement, selectedText)
+	}
+
+    /// Replaces the captured selection only while the source app and selection still match.
     @MainActor
-    private func replaceSelectedText(
+    private func replaceSelectedTextUsingAccessibility(
         with text: String,
-        snapshot: PasteboardSnapshot,
-        capturedChangeCount: Int,
+		originalSelection: String,
+		focusedElement: AXUIElement,
         sourceProcessIdentifier: pid_t
     ) async -> SelectedTextReplacementResult {
-        let pasteboard = NSPasteboard.general
-        guard pasteboard.changeCount == capturedChangeCount else {
-            pasteboardLogger.notice("Skipped selected-text replacement because the clipboard changed")
-            return .clipboardChanged
-        }
-        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == sourceProcessIdentifier else {
-            pasteboardLogger.notice("Skipped selected-text replacement because the source app changed")
-            return .clipboardChanged
-        }
+		let sourceAppIsFrontmost = NSWorkspace.shared.frontmostApplication?.processIdentifier == sourceProcessIdentifier
 
-        let targetChangeCount = writeAndTrackChangeCount(pasteboard: pasteboard, text: text)
-        guard await waitForPasteboardCommit(targetChangeCount: targetChangeCount) else {
-            return .pasteFailed
-        }
+		var currentSelectionRef: CFTypeRef?
+		guard AXUIElementCopyAttributeValue(
+			focusedElement,
+			kAXSelectedTextAttribute as CFString,
+			&currentSelectionRef
+		) == .success,
+		let currentSelection = currentSelectionRef as? String,
+		currentSelection == originalSelection
+		else {
+			pasteboardLogger.notice("Skipped selected-text replacement because the selection changed")
+			return .clipboardChanged
+		}
 
-        guard await performPaste(text) else {
-            return .pasteFailed
-        }
+		let accessibilityResult = AXUIElementSetAttributeValue(
+			focusedElement,
+			kAXSelectedTextAttribute as CFString,
+			text as CFTypeRef
+		)
+		if accessibilityResult == .success {
+			return .replaced
+		}
 
-        Task { @MainActor in
-            // Give the target app time to read the replacement text, but never overwrite a
-            // clipboard update that happened after the paste.
-            try? await Task.sleep(for: .milliseconds(500))
-            guard pasteboard.changeCount == targetChangeCount else { return }
-            snapshot.restore(to: pasteboard)
-        }
-        return .replaced
+		// Some editors expose the selection through Accessibility but do not support
+		// setting AXSelectedText. Keep the captured selection focused and fall back to
+		// the normal clipboard paste path, which replaces the selection via Cmd-V/menu.
+		guard sourceAppIsFrontmost else {
+			pasteboardLogger.notice("Skipped clipboard selected-text replacement because the source app changed")
+			return .clipboardChanged
+		}
+		pasteboardLogger.notice("Accessibility selected-text replacement failed; trying clipboard paste")
+		return await pasteWithClipboard(text) ? .replaced : .pasteFailed
     }
     
     @MainActor
@@ -328,7 +339,8 @@ final class PasteboardClientLive {
     }
 
     @MainActor
-    func pasteWithClipboard(_ text: String) async {
+    @discardableResult
+    func pasteWithClipboard(_ text: String) async -> Bool {
         let pasteboard = NSPasteboard.general
         let snapshot = PasteboardSnapshot(pasteboard: pasteboard)
         let targetChangeCount = writeAndTrackChangeCount(pasteboard: pasteboard, text: text)
@@ -358,6 +370,8 @@ final class PasteboardClientLive {
             // TODO: Could add a notification here to inform user
             // that text is available in clipboard
         }
+
+        return pasteSucceeded
     }
 
     @MainActor

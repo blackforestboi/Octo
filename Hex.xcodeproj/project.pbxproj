@@ -16,6 +16,11 @@
 		4F0D6A0E2F1A000100000001 /* CasePaths in Frameworks */ = {isa = PBXBuildFile; productRef = 4F0D6A0C2F1A000100000001 /* CasePaths */; };
 		4F0D6A0F2F1A000100000001 /* Dependencies in Frameworks */ = {isa = PBXBuildFile; productRef = 47E05E092D44525B00D26DA6 /* Dependencies */; };
 		4F0D6A102F1A000100000001 /* IdentifiedCollections in Frameworks */ = {isa = PBXBuildFile; productRef = 4F0D6A0D2F1A000100000001 /* IdentifiedCollections */; };
+		4F0D6A112F1A000100000001 /* IssueReporting in Frameworks */ = {isa = PBXBuildFile; productRef = 4F0D6A192F1A000100000001 /* IssueReporting */; };
+		4F0D6A122F1A000100000001 /* PerceptionCore in Frameworks */ = {isa = PBXBuildFile; productRef = 4F0D6A1A2F1A000100000001 /* PerceptionCore */; };
+		4F0D6A132F1A000100000001 /* IssueReporting in Frameworks */ = {isa = PBXBuildFile; productRef = 4F0D6A192F1A000100000001 /* IssueReporting */; };
+		4F0D6A142F1A000100000001 /* PerceptionCore in Frameworks */ = {isa = PBXBuildFile; productRef = 4F0D6A1A2F1A000100000001 /* PerceptionCore */; };
+		4F0D6A152F1A000100000001 /* Clocks in Frameworks */ = {isa = PBXBuildFile; productRef = 4F0D6A1D2F1A000100000001 /* Clocks */; };
 		47512ABF2E14D8C9000E25BA /* WhisperKit in Frameworks */ = {isa = PBXBuildFile; productRef = 47512ABE2E14D8C9000E25BA /* WhisperKit */; };
 		476316272E5FB31400913CDE /* HexCore in Frameworks */ = {isa = PBXBuildFile; productRef = 476316262E5FB31400913CDE /* HexCore */; };
 		4765045E2D45900200C7EA60 /* Pow in Frameworks */ = {isa = PBXBuildFile; productRef = 4765045D2D45900200C7EA60 /* Pow */; };
@@ -36,26 +41,26 @@
 			containerPortal = 47E05DE62D444EC600D26DA6 /* Project object */;
 			proxyType = 1;
 			remoteGlobalIDString = 47E05DED2D444EC600D26DA6;
-			remoteInfo = Hex;
+			remoteInfo = Octo;
 		};
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
 		473544502D445936001FBCB5 /* XCTest.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = XCTest.framework; path = Platforms/MacOSX.platform/Developer/Library/Frameworks/XCTest.framework; sourceTree = DEVELOPER_DIR; };
 		473544542D445959001FBCB5 /* Testing.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Testing.framework; path = Platforms/MacOSX.platform/Developer/Library/Frameworks/Testing.framework; sourceTree = DEVELOPER_DIR; };
-		478637A52D48725900319BFA /* HexTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = HexTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
-		47E05DEE2D444EC600D26DA6 /* Hex Debug.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Hex Debug.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		478637A52D48725900319BFA /* OctoTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = OctoTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		47E05DEE2D444EC600D26DA6 /* Octo Debug.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Octo Debug.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		B53355FF2D7B8D4900E5F542 /* Localizable.xcstrings */ = {isa = PBXFileReference; lastKnownFileType = text.json.xcstrings; path = Localizable.xcstrings; sourceTree = "<group>"; };
 		B5A1C7E22E6A1C5B00AB1234 /* AppIcon.icon */ = {isa = PBXFileReference; lastKnownFileType = folder.icon; name = AppIcon.icon; path = Hex/AppIcon.icon; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
-		476BAD402D47E8500088C61F /* Exceptions for "Hex" folder in "Hex" target */ = {
+		476BAD402D47E8500088C61F /* Exceptions for "Hex" folder in "Octo" target */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
 				Info.plist,
 			);
-			target = 47E05DED2D444EC600D26DA6 /* Hex */;
+			target = 47E05DED2D444EC600D26DA6 /* Octo */;
 		};
 /* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
@@ -68,7 +73,7 @@
 		47E05DF02D444EC600D26DA6 /* Hex */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			exceptions = (
-				476BAD402D47E8500088C61F /* Exceptions for "Hex" folder in "Hex" target */,
+				476BAD402D47E8500088C61F /* Exceptions for "Hex" folder in "Octo" target */,
 			);
 			path = Hex;
 			sourceTree = "<group>";
@@ -82,6 +87,9 @@
 			files = (
 				4F0D6A022F1A000100000001 /* ComposableArchitecture in Frameworks */,
 				4F0D6A012F1A000100000001 /* HexCore in Frameworks */,
+				4F0D6A112F1A000100000001 /* IssueReporting in Frameworks */,
+				4F0D6A122F1A000100000001 /* PerceptionCore in Frameworks */,
+				4F0D6A152F1A000100000001 /* Clocks in Frameworks */,
 				4F0D6A052F1A000100000001 /* Sharing in Frameworks */,
 				4F0D6A0E2F1A000100000001 /* CasePaths in Frameworks */,
 				4F0D6A0F2F1A000100000001 /* Dependencies in Frameworks */,
@@ -95,6 +103,8 @@
 			files = (
 				476BAD3E2D47E7880088C61F /* Sparkle in Frameworks */,
 				476316272E5FB31400913CDE /* HexCore in Frameworks */,
+				4F0D6A132F1A000100000001 /* IssueReporting in Frameworks */,
+				4F0D6A142F1A000100000001 /* PerceptionCore in Frameworks */,
 				47E05E0A2D44525B00D26DA6 /* Dependencies in Frameworks */,
 				B5045C972D78DED500D0A119 /* MarkdownUI in Frameworks */,
 				47512ABF2E14D8C9000E25BA /* WhisperKit in Frameworks */,
@@ -137,8 +147,8 @@
 		47E05DEF2D444EC600D26DA6 /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				47E05DEE2D444EC600D26DA6 /* Hex Debug.app */,
-				478637A52D48725900319BFA /* HexTests.xctest */,
+				47E05DEE2D444EC600D26DA6 /* Octo Debug.app */,
+				478637A52D48725900319BFA /* OctoTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -146,9 +156,9 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
-		478637A42D48725900319BFA /* HexTests */ = {
+		478637A42D48725900319BFA /* OctoTests */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = 478637AB2D48725900319BFA /* Build configuration list for PBXNativeTarget "HexTests" */;
+			buildConfigurationList = 478637AB2D48725900319BFA /* Build configuration list for PBXNativeTarget "OctoTests" */;
 			buildPhases = (
 				478637A12D48725900319BFA /* Sources */,
 				478637A22D48725900319BFA /* Frameworks */,
@@ -162,22 +172,25 @@
 			fileSystemSynchronizedGroups = (
 				4F0D6A032F1A000100000001 /* HexTests */,
 			);
-			name = HexTests;
+			name = OctoTests;
 			packageProductDependencies = (
 				47E05E012D444EE900D26DA6 /* ComposableArchitecture */,
 				476316262E5FB31400913CDE /* HexCore */,
+				4F0D6A192F1A000100000001 /* IssueReporting */,
+				4F0D6A1A2F1A000100000001 /* PerceptionCore */,
+				4F0D6A1D2F1A000100000001 /* Clocks */,
 				4F0D6A072F1A000100000001 /* Sharing */,
 				4F0D6A0C2F1A000100000001 /* CasePaths */,
 				47E05E092D44525B00D26DA6 /* Dependencies */,
 				4F0D6A0D2F1A000100000001 /* IdentifiedCollections */,
 			);
-			productName = HexTests;
-			productReference = 478637A52D48725900319BFA /* HexTests.xctest */;
+			productName = OctoTests;
+			productReference = 478637A52D48725900319BFA /* OctoTests.xctest */;
 			productType = "com.apple.product-type.bundle.unit-test";
 		};
-		47E05DED2D444EC600D26DA6 /* Hex */ = {
+		47E05DED2D444EC600D26DA6 /* Octo */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = 47E05DFD2D444EC700D26DA6 /* Build configuration list for PBXNativeTarget "Hex" */;
+			buildConfigurationList = 47E05DFD2D444EC700D26DA6 /* Build configuration list for PBXNativeTarget "Octo" */;
 			buildPhases = (
 				47E05DEA2D444EC600D26DA6 /* Sources */,
 				47E05DEB2D444EC600D26DA6 /* Frameworks */,
@@ -190,9 +203,11 @@
 			fileSystemSynchronizedGroups = (
 				47E05DF02D444EC600D26DA6 /* Hex */,
 			);
-			name = Hex;
+			name = Octo;
 			packageProductDependencies = (
 				47E05E012D444EE900D26DA6 /* ComposableArchitecture */,
+				4F0D6A192F1A000100000001 /* IssueReporting */,
+				4F0D6A1A2F1A000100000001 /* PerceptionCore */,
 				47E05E042D444EF800D26DA6 /* Sauce */,
 				47E05E092D44525B00D26DA6 /* Dependencies */,
 				47E05E0B2D44525B00D26DA6 /* DependenciesMacros */,
@@ -207,8 +222,8 @@
 				4F0D6A0C2F1A000100000001 /* CasePaths */,
 				4F0D6A0D2F1A000100000001 /* IdentifiedCollections */,
 			);
-			productName = Hex;
-			productReference = 47E05DEE2D444EC600D26DA6 /* Hex Debug.app */;
+			productName = Octo;
+			productReference = 47E05DEE2D444EC600D26DA6 /* Octo Debug.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
@@ -230,7 +245,7 @@
 					};
 				};
 			};
-			buildConfigurationList = 47E05DE92D444EC600D26DA6 /* Build configuration list for PBXProject "Hex" */;
+			buildConfigurationList = 47E05DE92D444EC600D26DA6 /* Build configuration list for PBXProject "Octo" */;
 			developmentRegion = en;
 			hasScannedForEncodings = 0;
 			knownRegions = (
@@ -253,6 +268,9 @@
 				4F0D6A062F1A000100000001 /* XCRemoteSwiftPackageReference "swift-sharing" */,
 				4F0D6A0A2F1A000100000001 /* XCRemoteSwiftPackageReference "swift-case-paths" */,
 				4F0D6A0B2F1A000100000001 /* XCRemoteSwiftPackageReference "swift-identified-collections" */,
+				4F0D6A1B2F1A000100000001 /* XCRemoteSwiftPackageReference "xctest-dynamic-overlay" */,
+				4F0D6A1C2F1A000100000001 /* XCRemoteSwiftPackageReference "swift-perception" */,
+				4F0D6A1E2F1A000100000001 /* XCRemoteSwiftPackageReference "swift-clocks" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 47E05DEF2D444EC600D26DA6 /* Products */;
@@ -303,7 +321,7 @@
 /* Begin PBXTargetDependency section */
 		478637AA2D48725900319BFA /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
-			target = 47E05DED2D444EC600D26DA6 /* Hex */;
+			target = 47E05DED2D444EC600D26DA6 /* Octo */;
 			targetProxy = 478637A92D48725900319BFA /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
@@ -318,11 +336,11 @@
 				DEAD_CODE_STRIPPING = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				MARKETING_VERSION = 2026.7.161;
-				PRODUCT_BUNDLE_IDENTIFIER = com.kitlangton.HexTests;
+				PRODUCT_BUNDLE_IDENTIFIER = io.github.blackforestboi.OctoTests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = NO;
 				SWIFT_VERSION = 5.0;
-				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Hex Debug.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Hex Debug";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Octo Debug.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Octo Debug";
 			};
 			name = Debug;
 		};
@@ -335,11 +353,11 @@
 				DEAD_CODE_STRIPPING = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				MARKETING_VERSION = 2026.7.161;
-				PRODUCT_BUNDLE_IDENTIFIER = com.kitlangton.HexTests;
+				PRODUCT_BUNDLE_IDENTIFIER = io.github.blackforestboi.OctoTests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = NO;
 				SWIFT_VERSION = 5.0;
-				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Hex.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Hex";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Octo.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Octo";
 			};
 			name = Release;
 		};
@@ -379,7 +397,7 @@
 				COPY_PHASE_STRIP = NO;
 				DEAD_CODE_STRIPPING = YES;
 				DEBUG_INFORMATION_FORMAT = dwarf;
-				DEVELOPMENT_TEAM = QC99C9JE59;
+				DEVELOPMENT_TEAM = 5YUPQC9D96;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
 				ENABLE_USER_SCRIPT_SANDBOXING = YES;
@@ -445,7 +463,7 @@
 				COPY_PHASE_STRIP = NO;
 				DEAD_CODE_STRIPPING = YES;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
-				DEVELOPMENT_TEAM = QC99C9JE59;
+				DEVELOPMENT_TEAM = 5YUPQC9D96;
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_USER_SCRIPT_SANDBOXING = YES;
@@ -471,7 +489,6 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
-				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				AUTOMATION_APPLE_EVENTS = YES;
 				CODE_SIGN_ENTITLEMENTS = Hex/Hex.entitlements;
 				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Apple Development";
@@ -496,9 +513,9 @@
 				ENABLE_USER_SELECTED_FILES = readwrite;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Hex/Info.plist;
-				INFOPLIST_KEY_NSAppleEventsUsageDescription = "Hex needs to control keyboard events to simulate paste operations.";
+				INFOPLIST_KEY_NSAppleEventsUsageDescription = "Octo needs to control keyboard events to simulate paste operations.";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
-				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Hex needs microphone access in order to transcribe your voice.";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Octo needs microphone access in order to transcribe your voice.";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
@@ -509,9 +526,9 @@
 					"-Xlinker",
 					"-interposable",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.kitlangton.Hex.debug;
-				PRODUCT_MODULE_NAME = Hex;
-				PRODUCT_NAME = "Hex Debug";
+				PRODUCT_BUNDLE_IDENTIFIER = io.github.blackforestboi.Octo.debug;
+				PRODUCT_MODULE_NAME = Octo;
+				PRODUCT_NAME = "Octo Debug";
 				RUNTIME_EXCEPTION_ALLOW_DYLD_ENVIRONMENT_VARIABLES = NO;
 				RUNTIME_EXCEPTION_ALLOW_JIT = NO;
 				RUNTIME_EXCEPTION_ALLOW_UNSIGNED_EXECUTABLE_MEMORY = NO;
@@ -550,16 +567,16 @@
 				ENABLE_USER_SELECTED_FILES = readwrite;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Hex/Info.plist;
-				INFOPLIST_KEY_NSAppleEventsUsageDescription = "Hex needs to control keyboard events to simulate paste operations.";
+				INFOPLIST_KEY_NSAppleEventsUsageDescription = "Octo needs to control keyboard events to simulate paste operations.";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
-				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Hex needs microphone access in order to transcribe your voice.";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Octo needs microphone access in order to transcribe your voice.";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
 				MARKETING_VERSION = 2026.7.161;
-				PRODUCT_BUNDLE_IDENTIFIER = com.kitlangton.Hex;
+				PRODUCT_BUNDLE_IDENTIFIER = io.github.blackforestboi.Octo;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				RUNTIME_EXCEPTION_ALLOW_DYLD_ENVIRONMENT_VARIABLES = NO;
 				RUNTIME_EXCEPTION_ALLOW_JIT = NO;
@@ -584,7 +601,7 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		47E05DE92D444EC600D26DA6 /* Build configuration list for PBXProject "Hex" */ = {
+		47E05DE92D444EC600D26DA6 /* Build configuration list for PBXProject "Octo" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				47E05DFB2D444EC700D26DA6 /* Debug */,
@@ -593,7 +610,7 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		47E05DFD2D444EC700D26DA6 /* Build configuration list for PBXNativeTarget "Hex" */ = {
+		47E05DFD2D444EC700D26DA6 /* Build configuration list for PBXNativeTarget "Octo" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				47E05DFE2D444EC700D26DA6 /* Debug */,
@@ -700,6 +717,30 @@
 				minimumVersion = 1.1.1;
 			};
 		};
+		4F0D6A1B2F1A000100000001 /* XCRemoteSwiftPackageReference "xctest-dynamic-overlay" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/pointfreeco/xctest-dynamic-overlay";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 1.8.0;
+			};
+		};
+		4F0D6A1C2F1A000100000001 /* XCRemoteSwiftPackageReference "swift-perception" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/pointfreeco/swift-perception";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 2.0.0;
+			};
+		};
+		4F0D6A1E2F1A000100000001 /* XCRemoteSwiftPackageReference "swift-clocks" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/pointfreeco/swift-clocks";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 1.0.6;
+			};
+		};
 		B5045C952D78DED500D0A119 /* XCRemoteSwiftPackageReference "swift-markdown-ui" */ = {
 			isa = XCRemoteSwiftPackageReference;
 			repositoryURL = "https://github.com/gonzalezreal/swift-markdown-ui";
@@ -774,6 +815,21 @@
 			isa = XCSwiftPackageProductDependency;
 			package = 4F0D6A0B2F1A000100000001 /* XCRemoteSwiftPackageReference "swift-identified-collections" */;
 			productName = IdentifiedCollections;
+		};
+		4F0D6A192F1A000100000001 /* IssueReporting */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 4F0D6A1B2F1A000100000001 /* XCRemoteSwiftPackageReference "xctest-dynamic-overlay" */;
+			productName = IssueReporting;
+		};
+		4F0D6A1A2F1A000100000001 /* PerceptionCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 4F0D6A1C2F1A000100000001 /* XCRemoteSwiftPackageReference "swift-perception" */;
+			productName = PerceptionCore;
+		};
+		4F0D6A1D2F1A000100000001 /* Clocks */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 4F0D6A1E2F1A000100000001 /* XCRemoteSwiftPackageReference "swift-clocks" */;
+			productName = Clocks;
 		};
 		B5045C962D78DED500D0A119 /* MarkdownUI */ = {
 			isa = XCSwiftPackageProductDependency;

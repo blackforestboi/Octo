@@ -1,7 +1,7 @@
 {
-  "name": "hex-app",
+  "name": "octo-app",
   "version": "2026.7.161",
-  "description": "Release metadata + changelog automation for the Hex macOS app.",
+  "description": "Release metadata + changelog automation for the Octo macOS app.",
   "private": true,
   "license": "MIT",
   "type": "module",

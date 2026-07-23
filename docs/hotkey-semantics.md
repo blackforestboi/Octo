@@ -1,5 +1,11 @@
 # Hex HotKey Semantics
 
+## Unified refinement gestures
+
+Hex has one recording hotkey. In double-tap lock mode, a quick second activation starts normal recording, while holding that second activation for 0.75 seconds (or a larger configured minimum) captures screen context and forces refinement. While a locked recording is active, a quick terminal activation completes normally. Holding the terminal activation automatically stops and requests refinement as soon as the hold threshold is reached; key-up is not required. Screen-aware recordings always refine regardless of the terminal gesture.
+
+Without double-tap lock, a long press is normal press-and-hold transcription. A quick first tap followed by a held second activation captures screen context and forces refinement. A completed long hold followed immediately by a quick second activation requests refinement for that same transcript; if the local transcription already finished and pasted, Hex refines that completed result instead of losing the gesture. When selected-text inclusion is enabled and text is selected, either recording mode captures it and routes the result through refinement, with or without spoken audio.
+
 ## Overview
 
 Hex uses a **threshold-based recording system** that behaves differently depending on whether your hotkey is **modifier-only** (e.g., Option) or **a regular hotkey** (e.g., Cmd+A).
@@ -281,14 +287,15 @@ Now recording is locked on:
 3. **Tap 2** (t=0.2s, within 0.3s window) → START recording again
 4. **Release** (t=0.3s, Δt=0.2s < 0.3s) → **LOCK!** (hands-free mode)
 5. Recording continues until:
-   - Tap hotkey again → STOP
+   - Tap hotkey again → STOP normally
+   - Hold hotkey through the terminal threshold → STOP immediately and refine, without waiting for release
    - Press ESC → STOP
 
 ### Rules
 
 1. **Timing window**: 2nd tap must be within **0.3s** of 1st release
 2. **Lock engages**: On **2nd release**, not 2nd press
-3. **Exit lock**: Tap hotkey again OR press ESC
+3. **Exit lock**: Quick hotkey tap for normal transcription, terminal hold for refinement, or ESC to cancel
 4. **Too slow**: If 2nd tap > 0.3s after 1st release, treated as new recording
 
 ---
@@ -429,7 +436,9 @@ User: Hold Option (0.1s) → Add Shift → Release Shift → Press Option again
     - If ≥ 0.3s → (ignore, keep recording)
 
 - **LOCK** (hands-free recording)
-  - Transition: Tap hotkey again OR press ESC → STOP → IDLE
+  - Quick terminal tap → STOP normally → IDLE
+  - Terminal hold reaches threshold → STOP and refine immediately → IDLE
+  - Press ESC → cancel → IDLE
 
 ---
 

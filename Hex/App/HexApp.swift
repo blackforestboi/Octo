@@ -28,7 +28,7 @@ struct HexApp: App {
 			
 			Divider()
 			
-			Button("Quit Hex") {
+			Button("Quit Octo") {
 				NSApplication.shared.terminate(nil)
 			}.keyboardShortcut("q")
 		} label: {

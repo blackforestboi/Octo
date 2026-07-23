@@ -19,7 +19,7 @@ enum ScreenAwareActivation {
 	static let minimumHoldDuration: TimeInterval = 0.75
 
 	static func holdDuration(for settings: HexSettings) -> TimeInterval {
-		max(settings.refinedMinimumKeyTime, minimumHoldDuration)
+		max(settings.minimumKeyTime, minimumHoldDuration)
 	}
 
 	static func isAvailable(with settings: HexSettings) -> Bool {
@@ -53,6 +53,8 @@ enum ScreenAwareActivation {
 				return !(OpenAIAPIKeyStore.read() ?? "").isEmpty
 			case .anthropic:
 				return !(AnthropicAPIKeyStore.read() ?? "").isEmpty
+			case .codexCLI, .claudeCLI:
+				return true
 			}
 		}
 		guard settings.hasScreenAwareImageFallbackModel else { return false }
@@ -63,7 +65,7 @@ enum ScreenAwareActivation {
 			return !(AnthropicAPIKeyStore.read() ?? "").isEmpty
 		case .openRouter:
 			return hasOpenRouterKey
-		case .apple, .gemini:
+		case .apple, .gemini, .codexCLI, .claudeCLI:
 			return hasOpenRouterKey
 		}
 	}
@@ -82,8 +84,22 @@ struct TranscriptionFeature {
 		let duration: TimeInterval
 	}
 
+	/// A completed local transcription that is waiting for the parallel selected-text
+	/// lookup. Keeping it in the reducer avoids pasting raw text before a detected
+	/// selection can force the downstream refinement step.
+	struct PendingSelectedTextTranscription: Equatable {
+		let text: String
+		let audioURL: URL
+	}
+
   @ObservableState
-  struct State: Equatable {
+	struct State: Equatable {
+		struct RecentCompletedTranscript: Equatable {
+			let id: UUID
+			let text: String
+			let historyID: UUID?
+		}
+
     var isRecording: Bool = false
     var isTranscribing: Bool = false
 	var isRefining: Bool = false
@@ -100,13 +116,18 @@ struct TranscriptionFeature {
 			var stagedScreenContextScreenshotPath: URL?
 			/// The durable History row created as soon as the recorder produces audio.
 			var activeHistoryTranscriptID: UUID?
-			var screenAwareActivationID: UUID?
-			var cancelledScreenAwareActivationID: UUID?
 			var screenContextCaptureID: UUID?
 			var screenContextCaptureErrorMessage: String?
-				var pendingScreenAwareTranscription: PendingScreenAwareTranscription?
+			var pendingScreenAwareTranscription: PendingScreenAwareTranscription?
+			var pendingSelectedTextTranscription: PendingSelectedTextTranscription?
     var isPrewarming: Bool = false
 		var forcedRefinementMode: RefinementMode?
+		/// The most recent ordinary result remains eligible for the quick
+		/// post-hold refinement gesture even after it has been pasted.
+		var recentCompletedTranscript: RecentCompletedTranscript?
+		var postHocRefinement: RecentCompletedTranscript?
+		var pendingPressAndHoldActivationID: UUID?
+		var pendingTerminalRefinementID: UUID?
 		var activeRecordingHotkey: HotKey?
 		var activeMinimumKeyTime: Double?
 		var activeRecordingSource: RecordingSource?
@@ -134,13 +155,25 @@ struct TranscriptionFeature {
     case audioLevelUpdated(Meter)
 
     // Hotkey actions
+		case armPendingPressAndHold
+		case pendingPressAndHoldActivated(UUID)
+		case cancelPendingPressAndHold
+		case armTerminalRefinement
+		case terminalRefinementActivated(UUID)
+		case armScreenAwareActivation
+		case screenAwareActivationThresholdReached
+		case cancelScreenAwareActivation
     case hotKeyPressed
     case hotKeyReleased(RecordingSource)
 			case refinedHotKeyPressed
-			case startScreenAwareActivationCountdown(UUID)
-			case refinedLockEstablished(UUID, Bool)
-			case screenAwareModeActivated(UUID)
+			case screenAwareModeActivated
 				case finishRecordingWithRefinement
+				case refineMostRecentTranscription
+				case recentTranscriptRefined(UUID, String)
+				case recentTranscriptRefinementFailed(UUID, String)
+				case startSelectedTextOnlyRefinement
+				case selectedTextOnlyRefinementResult(String)
+				case selectedTextOnlyRefinementFailed(String)
 				case finishScreenAwareRecording
 				case selectedTextCaptured(SelectedTextCapture)
 				case selectedTextCaptureUnavailable
@@ -165,6 +198,8 @@ struct TranscriptionFeature {
     case transcriptionResult(String, URL)
 	case refinementResult(String, URL, TimeInterval)
     case transcriptionError(Error, URL?)
+	case showError(String)
+	case dismissError
 
     // Model availability
     case modelMissing
@@ -180,9 +215,14 @@ struct TranscriptionFeature {
     /// Must NOT be cancelled by handleStartRecording or we leak the temp file or lose the row.
     case recordingFinalize
     case transcription
-			case selectedTextRefinement
+		case postHocRefinement
+		case selectedTextOnlyRefinement
+		case selectedTextRefinement
+		case errorPresentation
+		case pendingPressAndHold
+		case terminalRefinementHold
+		case screenAwareActivation
 			case screenContextCapture
-			case screenAwareActivation
   }
 
   @Dependency(\.transcription) var transcription
@@ -222,15 +262,104 @@ struct TranscriptionFeature {
 
       // MARK: - HotKey Flow
 
-      case .hotKeyPressed:
-        // If we're transcribing or refining, send a cancel first. Otherwise start recording immediately.
-        // We'll decide later (on release) whether to keep or discard the recording.
-		return handleHotKeyPressed(isBusy: state.isTranscribing || state.isRefining)
+		case .armPendingPressAndHold:
+			guard !state.isRecording, !state.isTranscribing, !state.isRefining else { return .none }
+			let activationID = uuid()
+			state.pendingPressAndHoldActivationID = activationID
+			return .run { [clock] send in
+				try await clock.sleep(for: .seconds(HotKeyProcessor.doubleTapThreshold))
+				await send(.pendingPressAndHoldActivated(activationID))
+			}
+			.cancellable(id: CancelID.pendingPressAndHold, cancelInFlight: true)
 
-      case .hotKeyReleased(.regular):
+		case let .pendingPressAndHoldActivated(activationID):
+			guard state.pendingPressAndHoldActivationID == activationID else { return .none }
+			state.pendingPressAndHoldActivationID = nil
+			return .send(.hotKeyPressed)
+
+		case .cancelPendingPressAndHold:
+			state.pendingPressAndHoldActivationID = nil
+			return .cancel(id: CancelID.pendingPressAndHold)
+
+		case .armTerminalRefinement:
+			guard state.isRecording, state.activeRecordingSource == .regular else { return .none }
+			let activationID = uuid()
+			let holdDuration = ScreenAwareActivation.holdDuration(for: state.hexSettings)
+			state.pendingTerminalRefinementID = activationID
+			return .run { [clock] send in
+				try await clock.sleep(for: .seconds(holdDuration))
+				await send(.terminalRefinementActivated(activationID))
+			}
+			.cancellable(id: CancelID.terminalRefinementHold, cancelInFlight: true)
+
+		case let .terminalRefinementActivated(activationID):
+			guard state.pendingTerminalRefinementID == activationID,
+				state.isRecording,
+				state.activeRecordingSource == .regular
+			else { return .none }
+			state.pendingTerminalRefinementID = nil
+			return .send(.finishRecordingWithRefinement)
+
+		case .armScreenAwareActivation:
+			guard state.isRecording, state.activeRecordingSource == .regular else { return .none }
+			let holdDuration = ScreenAwareActivation.holdDuration(for: state.hexSettings)
+			return .run { [clock] send in
+				try await clock.sleep(for: .seconds(holdDuration))
+				await send(.screenAwareActivationThresholdReached)
+			}
+			.cancellable(id: CancelID.screenAwareActivation, cancelInFlight: true)
+
+		case .screenAwareActivationThresholdReached:
+			guard state.isRecording,
+				state.activeRecordingSource == .regular,
+				!state.isScreenAwareModeActive
+			else { return .none }
+			return .send(.screenAwareModeActivated)
+
+		case .cancelScreenAwareActivation:
+			return .cancel(id: CancelID.screenAwareActivation)
+
+      case .hotKeyPressed:
+		state.pendingPressAndHoldActivationID = nil
+		// Start recording immediately. Selection detection is deliberately parallel:
+		// a missing selection must never delay dictation or trigger a synthetic Copy
+		// command's system error sound.
+		if !state.isRecording,
+			!state.isTranscribing,
+			!state.isRefining,
+			state.hexSettings.includeSelectedTextInRefinement
+		{
+			let startRecording = handleStartRecording(&state, source: .regular)
+			return .merge(
+				.cancel(id: CancelID.pendingPressAndHold),
+				startRecording,
+				.send(.refinedHotKeyPressed)
+			)
+		}
+		return .merge(
+			.cancel(id: CancelID.pendingPressAndHold),
+			handleHotKeyPressed(isBusy: state.isTranscribing || state.isRefining)
+		)
+
+	case .hotKeyReleased(.regular):
         // If we're currently recording, then stop. Otherwise, just cancel
         // the delayed "startRecording" effect if we never actually started.
-        return handleHotKeyReleased(isRecording: state.isRecording, source: .regular, activeSource: state.activeRecordingSource)
+		state.pendingPressAndHoldActivationID = nil
+		state.pendingTerminalRefinementID = nil
+		if state.isScreenAwareModeActive {
+			return .merge(
+				.cancel(id: CancelID.pendingPressAndHold),
+				.cancel(id: CancelID.terminalRefinementHold),
+				.cancel(id: CancelID.screenAwareActivation),
+				.send(.finishScreenAwareRecording)
+			)
+		}
+		return .merge(
+			.cancel(id: CancelID.pendingPressAndHold),
+			.cancel(id: CancelID.terminalRefinementHold),
+			.cancel(id: CancelID.screenAwareActivation),
+			handleHotKeyReleased(isRecording: state.isRecording, source: .regular, activeSource: state.activeRecordingSource)
+		)
 
 		case .hotKeyReleased(.refined):
 				// The reducer owns the recording session, so it is the source of truth for
@@ -246,11 +375,12 @@ struct TranscriptionFeature {
 					// capture that its second tap started. Its third tap must end that
 					// session, rather than allowing the delayed capture to start a recording.
 					state.refinedHotKeyReleasedWhileCapturingSelection = true
-					return .cancel(id: CancelID.screenAwareActivation)
+					return .none
 				}
-				return .merge(
-					.cancel(id: CancelID.screenAwareActivation),
-					handleHotKeyReleased(isRecording: state.isRecording, source: .refined, activeSource: state.activeRecordingSource)
+				return handleHotKeyReleased(
+					isRecording: state.isRecording,
+					source: .refined,
+					activeSource: state.activeRecordingSource
 				)
 
 			case .refinedHotKeyPressed:
@@ -277,56 +407,13 @@ struct TranscriptionFeature {
 				}
 				.cancellable(id: CancelID.selectedTextRefinement, cancelInFlight: true)
 
-			case let .startScreenAwareActivationCountdown(activationID):
-				guard state.cancelledScreenAwareActivationID != activationID else {
-					state.cancelledScreenAwareActivationID = nil
-					return .none
-				}
-				state.screenAwareActivationID = activationID
-				let holdDuration = ScreenAwareActivation.holdDuration(for: state.hexSettings)
-				return .run { [clock] send in
-					try await clock.sleep(for: .seconds(holdDuration))
-					await send(.screenAwareModeActivated(activationID))
-				}
-				.cancellable(id: CancelID.screenAwareActivation, cancelInFlight: true)
-
-			case let .refinedLockEstablished(activationID, isLongPressLocked):
-				// A quick second tap starts ordinary refinement only after the lock
-				// is established. A held second tap leaves its Screen Aware countdown
-				// alive, so it never begins ordinary refinement first.
-				if isLongPressLocked {
-					// Remember the gesture even if this key-up reaches the reducer before
-					// its key-down task has installed the countdown.
-					if !state.isScreenAwareModeActive {
-						state.screenAwareActivationID = activationID
-					}
-					return .none
-				}
-				state.cancelledScreenAwareActivationID = activationID
-				if state.screenAwareActivationID == activationID {
-					state.screenAwareActivationID = nil
-				}
-				return .merge(
-					.cancel(id: CancelID.screenAwareActivation),
-					.send(.refinedHotKeyPressed)
-				)
-
-			case let .screenAwareModeActivated(activationID):
-				guard state.screenAwareActivationID == activationID else { return .none }
-				state.screenAwareActivationID = nil
-				let startRecording: Effect<Action>
-				if state.isRecording {
-					guard state.activeRecordingSource == .refined else { return .none }
-					startRecording = .none
-				} else {
-					startRecording = handleStartRecording(
-						&state,
-						forcedRefinementMode: .refined,
-						source: .refined,
-						cancelsScreenContextCapture: false
-					)
-					guard state.isRecording else { return startRecording }
-				}
+			case .screenAwareModeActivated:
+					guard state.isRecording,
+						state.activeRecordingSource == .regular,
+						!state.isScreenAwareModeActive
+					else { return .none }
+					let cancelScreenAwareActivation = Effect<Action>.cancel(id: CancelID.screenAwareActivation)
+					state.forcedRefinementMode = .refined
 				state.isScreenAwareModeActive = true
 				state.screenAwareInputSourceForRefinement = state.hexSettings.screenAwareInputSource
 				let captureID = uuid()
@@ -343,31 +430,100 @@ struct TranscriptionFeature {
 					}
 				}
 				.cancellable(id: CancelID.screenContextCapture, cancelInFlight: true)
-				return .merge(startRecording, captureScreen)
+					return .merge(cancelScreenAwareActivation, captureScreen)
 
 				case .finishRecordingWithRefinement:
-				// This action is emitted for a single press of the refinement shortcut only
-				// while the regular hotkey still owns an active recording. Preserve the
-				// original session's timing rules, but refine its resulting transcript.
+				// A held terminal activation selects refinement while the regular hotkey
+				// still owns the recording. Preserve the original session's timing rules.
 				guard state.isRecording, state.activeRecordingSource == .regular else { return .none }
+					state.pendingTerminalRefinementID = nil
 					state.forcedRefinementMode = .refined
-					return .send(.stopRecording)
+					return .merge(
+						.cancel(id: CancelID.terminalRefinementHold),
+						.send(.stopRecording)
+					)
+
+				case .refineMostRecentTranscription:
+					// If decoding is still underway, mark that active session for refinement.
+					// Otherwise refine the just-completed, already-pasted result retained below.
+					if state.isTranscribing {
+						state.forcedRefinementMode = .refined
+						return .none
+					}
+					guard !state.isRecording,
+						!state.isRefining,
+						let transcript = state.recentCompletedTranscript
+					else { return .none }
+					state.postHocRefinement = transcript
+					state.isRefining = true
+					state.outputGenerationStartTime = now
+					let request = state.hexSettings.refinementRequest(
+						for: transcript.text,
+						mode: .refined
+					)
+					return .run { [refinement] send in
+						do {
+							let refinedResult = try await refinement.refine(request)
+							try Task.checkCancellation()
+							await send(.recentTranscriptRefined(transcript.id, refinedResult))
+						} catch is CancellationError {
+							return
+						} catch {
+							transcriptionFeatureLogger.warning("Post-hoc refinement failed: \(error.localizedDescription, privacy: .private)")
+							await send(.recentTranscriptRefinementFailed(transcript.id, error.localizedDescription))
+						}
+					}
+					.cancellable(id: CancelID.postHocRefinement, cancelInFlight: true)
+
+				case let .recentTranscriptRefined(id, result):
+					guard let transcript = state.postHocRefinement, transcript.id == id else { return .none }
+					state.postHocRefinement = nil
+					state.isRefining = false
+					state.outputGenerationStartTime = nil
+					state.recentCompletedTranscript = .init(
+						id: UUID(),
+						text: result,
+						historyID: transcript.historyID
+					)
+					let transcriptionHistory = state.$transcriptionHistory
+					return .run { [pasteboard] _ in
+						if let historyID = transcript.historyID {
+							transcriptionHistory.withLock { history in
+								guard let index = history.history.firstIndex(where: { $0.id == historyID }) else { return }
+								var entry = history.history[index]
+								entry.text = result
+								entry.rawText = transcript.text
+								entry.wasRefined = true
+								history.history[index] = entry
+							}
+						}
+						await pasteboard.paste(result)
+						soundEffect.play(.pasteTranscript)
+					}
+					.cancellable(id: CancelID.postHocRefinement, cancelInFlight: true)
+
+				case let .recentTranscriptRefinementFailed(id, message):
+					guard state.postHocRefinement?.id == id else { return .none }
+					state.postHocRefinement = nil
+					state.isRefining = false
+					state.outputGenerationStartTime = nil
+					return .send(.showError(message))
 
 				case .finishScreenAwareRecording:
 					if state.isCapturingSelectedTextForRefinement {
 						deactivateScreenAwareMode(&state)
 						state.refinedHotKeyReleasedWhileCapturingSelection = true
-						return .cancel(id: CancelID.screenAwareActivation)
+						return .none
 					}
-					guard state.isRecording, state.activeRecordingSource == .refined else {
+					// Screen-aware mode can either start its own recording or upgrade an
+					// already-running regular session. In both cases the unified hotkey owns
+					// the active recording and must be able to finish it.
+					guard state.isRecording else {
 						deactivateScreenAwareMode(&state)
-						return .cancel(id: CancelID.screenAwareActivation)
+						return .none
 					}
 					deactivateScreenAwareMode(&state)
-					return .merge(
-						.cancel(id: CancelID.screenAwareActivation),
-						.send(.stopRecording)
-					)
+					return .send(.stopRecording)
 
 				case let .screenContextCaptured(captureID, context):
 					guard state.screenContextCaptureID == captureID else { return .none }
@@ -447,20 +603,73 @@ struct TranscriptionFeature {
 					)
 
 			case .selectedTextCaptureUnavailable:
-				let refinedHotKeyWasReleased = state.refinedHotKeyReleasedWhileCapturingSelection
 				state.isCapturingSelectedTextForRefinement = false
 				state.refinedHotKeyReleasedWhileCapturingSelection = false
-				return refinedHotKeyWasReleased ? .none : .send(.startRefinedRecording)
+				guard let pending = state.pendingSelectedTextTranscription else { return .none }
+				state.pendingSelectedTextTranscription = nil
+				return .send(.transcriptionResult(pending.text, pending.audioURL))
 
 			case let .selectedTextCaptured(selectedText):
-				let refinedHotKeyWasReleased = state.refinedHotKeyReleasedWhileCapturingSelection
 				state.isCapturingSelectedTextForRefinement = false
 				state.refinedHotKeyReleasedWhileCapturingSelection = false
-				guard !refinedHotKeyWasReleased else {
-					return .run { _ in await selectedText.cancel() }
-				}
 				state.selectedTextForRefinement = selectedText
-				return .send(.startRefinedRecording)
+				if state.isRecording || state.isTranscribing {
+					state.forcedRefinementMode = .refined
+					if let pending = state.pendingSelectedTextTranscription {
+						state.pendingSelectedTextTranscription = nil
+						return .send(.transcriptionResult(pending.text, pending.audioURL))
+					}
+					return .none
+				}
+				return .send(.startSelectedTextOnlyRefinement)
+
+			case .startSelectedTextOnlyRefinement:
+				guard let selectedText = state.selectedTextForRefinement else { return .none }
+				state.isRefining = true
+				state.outputGenerationStartTime = now
+				let request = state.hexSettings.refinementRequest(
+					for: selectedText.text,
+					mode: .refined
+				)
+				return .run { [refinement] send in
+					do {
+						let refinedResult = try await refinement.refine(request)
+						try Task.checkCancellation()
+						await send(.selectedTextOnlyRefinementResult(refinedResult))
+					} catch is CancellationError {
+						return
+					} catch {
+						await send(.selectedTextOnlyRefinementFailed(error.localizedDescription))
+					}
+				}
+				.cancellable(id: CancelID.selectedTextOnlyRefinement, cancelInFlight: true)
+
+			case let .selectedTextOnlyRefinementResult(result):
+				guard let selectedText = state.selectedTextForRefinement else { return .none }
+				state.selectedTextForRefinement = nil
+				state.isRefining = false
+				state.outputGenerationStartTime = nil
+				return .run { _ in
+					switch await selectedText.replace(with: result) {
+					case .replaced:
+						soundEffect.play(.pasteTranscript)
+					case .clipboardChanged:
+						transcriptionFeatureLogger.notice("Skipped selected-text replacement because the source app or clipboard changed")
+					case .pasteFailed:
+						transcriptionFeatureLogger.warning("Selected-text refinement paste failed")
+					}
+				}
+
+			case let .selectedTextOnlyRefinementFailed(message):
+				state.isRefining = false
+				state.outputGenerationStartTime = nil
+				state.error = message
+				let selectedText = state.selectedTextForRefinement
+				state.selectedTextForRefinement = nil
+				return .merge(
+					.run { _ in await selectedText?.cancel() },
+					.send(.showError(message))
+				)
 
       // MARK: - Recording Flow
 
@@ -468,10 +677,15 @@ struct TranscriptionFeature {
 		return handleStartRecording(&state, source: .regular)
 
 		case .startRefinedRecording:
-			return handleStartRecording(&state, forcedRefinementMode: .refined, source: .refined)
+			return handleStartRecording(&state, forcedRefinementMode: .refined, source: .regular)
 
       case .stopRecording:
-        return handleStopRecording(&state)
+		state.pendingTerminalRefinementID = nil
+		return .merge(
+			.cancel(id: CancelID.terminalRefinementHold),
+			.cancel(id: CancelID.screenAwareActivation),
+			handleStopRecording(&state)
+		)
 
       // MARK: - Transcription Results
 
@@ -489,7 +703,9 @@ struct TranscriptionFeature {
 				var artifactsToDelete: [Transcript] = []
 				history.history.insert(transcript, at: 0)
 				if let maximumEntries = state.hexSettings.maxHistoryEntries, maximumEntries > 0 {
-					while history.history.count > maximumEntries, let removedTranscript = history.history.popLast() {
+					while history.history.count > maximumEntries,
+						  let index = history.history.lastIndex(where: { $0.recoverySessionID == nil }) {
+						let removedTranscript = history.history.remove(at: index)
 						if !history.history.contains(where: { $0.audioPath == removedTranscript.audioPath }) {
 							artifactsToDelete.append(removedTranscript)
 						}
@@ -497,10 +713,11 @@ struct TranscriptionFeature {
 				}
 				return artifactsToDelete
 			}
-			return .run { _ in
+			return .run { [recording] _ in
 				for transcript in artifactsToDelete {
 					try? await transcriptPersistence.deleteArtifacts(transcript)
 				}
+				await recording.releaseRecordingSource(transcript.audioPath)
 			}
 
       case let .transcriptionResult(result, audioURL):
@@ -510,7 +727,29 @@ struct TranscriptionFeature {
 		return handleRefinementResult(&state, result: result, audioURL: audioURL, duration: duration)
 
       case let .transcriptionError(error, audioURL):
-        return handleTranscriptionError(&state, error: error, audioURL: audioURL)
+			guard state.activeTranscriptionAudioURL == audioURL else { return .none }
+			return .merge(
+				handleTranscriptionError(&state, error: error, audioURL: audioURL),
+				.run { send in
+					try? await clock.sleep(for: .seconds(5))
+					guard !Task.isCancelled else { return }
+					await send(.dismissError)
+				}
+				.cancellable(id: CancelID.errorPresentation, cancelInFlight: true)
+			)
+
+		case let .showError(message):
+			state.error = message
+			return .run { send in
+				try? await clock.sleep(for: .seconds(5))
+				guard !Task.isCancelled else { return }
+				await send(.dismissError)
+			}
+			.cancellable(id: CancelID.errorPresentation, cancelInFlight: true)
+
+		case .dismissError:
+			state.error = nil
+			return .cancel(id: CancelID.errorPresentation)
 
       case .modelMissing:
         return .none
@@ -562,105 +801,33 @@ private extension TranscriptionFeature {
   func startHotKeyMonitoringEffect() -> Effect<Action> {
     .run { send in
 		var hotKeyProcessor: HotKeyProcessor = .init(hotkey: HotKey(key: nil, modifiers: [.option]))
-		var refinedHotKeyProcessor: HotKeyProcessor = .init(hotkey: HotKey(key: nil, modifiers: []))
-		var pendingScreenAwareGestureID: UUID?
       @Shared(.isSettingHotKey) var isSettingHotKey: Bool
-		@Shared(.isSettingRefinedHotKey) var isSettingRefinedHotKey: Bool
       @Shared(.hexSettings) var hexSettings: HexSettings
 
       // Handle incoming input events (keyboard and mouse)
       let token = keyEventMonitor.handleInputEvent { inputEvent in
         // Skip if the user is currently setting a hotkey
-		if isSettingHotKey || isSettingRefinedHotKey {
-          return false
-        }
-
-		let refinedHotkey = hexSettings.refinedHotkey
-		let shouldMonitorRefinedHotkey = refinedHotkey.map { !$0.conflicts(with: hexSettings.hotkey) } ?? false
-		if let refinedHotkey, shouldMonitorRefinedHotkey {
-			refinedHotKeyProcessor.hotkey = refinedHotkey
-			refinedHotKeyProcessor.doubleTapLockEnabled = hexSettings.refinedDoubleTapLockEnabled
-			let usesScreenAwareDoubleTapActivation = hexSettings.refinedDoubleTapLockEnabled
-				&& ScreenAwareActivation.isAvailable(with: hexSettings)
-			// Screen Aware reserves the held second tap. This deliberately makes the
-			// first tap inert even when the separate "Use double-tap only" preference
-			// is off, so double-tap lock has one unambiguous Screen Aware sequence.
-			refinedHotKeyProcessor.useDoubleTapOnly = hexSettings.refinedDoubleTapLockEnabled
-				&& (hexSettings.refinedUseDoubleTapOnly || usesScreenAwareDoubleTapActivation)
-			let shouldMeasureSecondTapForScreenAware = usesScreenAwareDoubleTapActivation
-			// With double-tap lock enabled, Screen Aware activates only while the
-			// second tap is held. Its release enters the usual refinement lock state.
-			refinedHotKeyProcessor.lockingHoldDuration = shouldMeasureSecondTapForScreenAware
-				? ScreenAwareActivation.holdDuration(for: hexSettings)
-				: nil
-			refinedHotKeyProcessor.minimumKeyTime = hexSettings.refinedMinimumKeyTime
-		}
+			if isSettingHotKey {
+	          return false
+	        }
 
         // Always keep hotKeyProcessor in sync with current user hotkey preference
         hotKeyProcessor.hotkey = hexSettings.hotkey
-        let useDoubleTapOnly = hexSettings.doubleTapLockEnabled && hexSettings.useDoubleTapOnly
-        hotKeyProcessor.doubleTapLockEnabled = hexSettings.doubleTapLockEnabled
-        hotKeyProcessor.useDoubleTapOnly = useDoubleTapOnly
+	        let supportsScreenAwareGesture = ScreenAwareActivation.isAvailable(with: hexSettings)
+	        let useDoubleTapOnly = hexSettings.doubleTapLockEnabled
+	          && hexSettings.useDoubleTapOnly
+	        hotKeyProcessor.doubleTapLockEnabled = hexSettings.doubleTapLockEnabled
+	        hotKeyProcessor.useDoubleTapOnly = useDoubleTapOnly
+	        hotKeyProcessor.lockingHoldDuration = max(
+	          hexSettings.minimumKeyTime,
+	          ScreenAwareActivation.minimumHoldDuration
+	        )
+	        hotKeyProcessor.screenAwareSecondTapEnabled = supportsScreenAwareGesture
+	        hotKeyProcessor.postHoldRefinementEnabled = !hexSettings.doubleTapLockEnabled
         hotKeyProcessor.minimumKeyTime = hexSettings.minimumKeyTime
 
         switch inputEvent {
         case .keyboard(let keyEvent):
-			if let refinedHotkey,
-				hotKeyProcessor.isMatched,
-				keyEvent.key == refinedHotkey.key,
-				keyEvent.modifiers.matchesExactly(refinedHotkey.modifiers)
-			{
-				// While a regular recording is active, one press of the refinement hotkey
-				// finishes that recording. Do not feed this press to the refinement processor:
-				// its double-tap tracker must remain untouched for the next recording. Reset
-				// the regular processor as well, otherwise a double-tap lock would keep
-				// intercepting every future refinement-hotkey press.
-				hotKeyProcessor.reset()
-				Task { await send(.finishRecordingWithRefinement) }
-				return true
-			}
-				if shouldMonitorRefinedHotkey {
-					switch refinedHotKeyProcessor.process(keyEvent: keyEvent) {
-				case .startRecording:
-					let shouldDeferRefinementForScreenAware = refinedHotKeyProcessor.isLockingHold
-					let screenAwareGestureID = shouldDeferRefinementForScreenAware ? UUID() : nil
-					pendingScreenAwareGestureID = screenAwareGestureID
-					Task {
-						guard shouldDeferRefinementForScreenAware else {
-							await send(.refinedHotKeyPressed)
-							return
-						}
-						guard let screenAwareGestureID else { return }
-						await send(.startScreenAwareActivationCountdown(screenAwareGestureID))
-					}
-					return refinedHotKeyProcessor.useDoubleTapOnly || keyEvent.key != nil
-					case .stopRecording:
-						// Let the reducer route the finish according to the session it owns.
-						// `isLongPressLocked` is reset by this stop event, so using it here
-						// made Screen Aware's final press timing-sensitive.
-						Task { await send(.hotKeyReleased(.refined)) }
-					return false
-				case .locked:
-					let isLongPressLocked = refinedHotKeyProcessor.isLongPressLocked
-					let screenAwareGestureID = pendingScreenAwareGestureID
-					pendingScreenAwareGestureID = nil
-					Task {
-						guard let screenAwareGestureID else { return }
-						await send(.refinedLockEstablished(screenAwareGestureID, isLongPressLocked))
-					}
-					return false
-				case .cancel:
-					pendingScreenAwareGestureID = nil
-					Task { await send(.hotKeyCancelled(.refined)) }
-					return true
-				case .discard:
-					pendingScreenAwareGestureID = nil
-					Task { await send(.hotKeyDiscarded(.refined)) }
-					return false
-				case .none:
-					break
-				}
-			}
           // If Escape is pressed with no modifiers while idle, let's treat that as `cancel`.
           if keyEvent.key == .escape, keyEvent.modifiers.isEmpty,
              hotKeyProcessor.state == .idle
@@ -671,17 +838,56 @@ private extension TranscriptionFeature {
 
 		  // Process the key event
 		  switch hotKeyProcessor.process(keyEvent: keyEvent) {
+		  case .armPendingPressAndHold:
+			Task { await send(.armPendingPressAndHold) }
+			return useDoubleTapOnly || keyEvent.key != nil
+
+		  case .cancelPendingPressAndHold:
+			Task { await send(.cancelPendingPressAndHold) }
+			return false
+
+		  case .armTerminalRefinement:
+			Task { await send(.armTerminalRefinement) }
+			return useDoubleTapOnly || keyEvent.key != nil
+
 		  case .startRecording:
 			Task { await send(.hotKeyPressed) }
             // If the hotkey is purely modifiers, return false to keep it from interfering with normal usage
             // But if useDoubleTapOnly is true, always intercept the key
-            return useDoubleTapOnly || keyEvent.key != nil
+			return useDoubleTapOnly || keyEvent.key != nil
+
+		  case .startRecordingAndArmScreenAware:
+			Task {
+				await send(.hotKeyPressed)
+				await send(.armScreenAwareActivation)
+			}
+			return useDoubleTapOnly || keyEvent.key != nil
 
 		  case .stopRecording:
 			Task { await send(.hotKeyReleased(.regular)) }
             return false // or `true` if you want to intercept
 
 		  case .locked:
+			if hotKeyProcessor.isLongPressLocked, supportsScreenAwareGesture {
+				Task { await send(.screenAwareModeActivated) }
+			} else {
+				Task { await send(.cancelScreenAwareActivation) }
+			}
+			return false
+
+		  case .stopRecordingWithRefinement:
+			Task { await send(.finishRecordingWithRefinement) }
+			return false
+
+		  case .stopRecordingWithScreenContext:
+			Task {
+				await send(.screenAwareModeActivated)
+				await send(.stopRecording)
+			}
+			return false
+
+		  case .refineMostRecentTranscription:
+			Task { await send(.refineMostRecentTranscription) }
 			return false
 
 		  case .cancel:
@@ -704,14 +910,6 @@ private extension TranscriptionFeature {
           }
 
         case .mouseClick:
-			if shouldMonitorRefinedHotkey, refinedHotKeyProcessor.state != .idle {
-				switch refinedHotKeyProcessor.processMouseClick() {
-				case .cancel: Task { await send(.hotKeyCancelled(.refined)) }
-				case .discard: Task { await send(.hotKeyDiscarded(.refined)) }
-				case .startRecording, .stopRecording, .locked, .none: break
-				}
-				return false
-			}
           // Process mouse click - for modifier-only hotkeys, this may cancel/discard
           switch hotKeyProcessor.processMouseClick() {
 		  case .cancel:
@@ -720,7 +918,9 @@ private extension TranscriptionFeature {
 		  case .discard:
 			Task { await send(.hotKeyDiscarded(.regular)) }
             return false // Don't intercept the click itself
-		  case .startRecording, .stopRecording, .locked, .none:
+		  case .armPendingPressAndHold, .cancelPendingPressAndHold, .armTerminalRefinement,
+				 .startRecording, .startRecordingAndArmScreenAware, .stopRecording, .stopRecordingWithRefinement,
+				 .stopRecordingWithScreenContext, .refineMostRecentTranscription, .locked, .none:
             return false
           }
         }
@@ -767,10 +967,6 @@ private extension TranscriptionFeature {
 
 private extension TranscriptionFeature {
 	func deactivateScreenAwareMode(_ state: inout State) {
-		if let activationID = state.screenAwareActivationID {
-			state.cancelledScreenAwareActivationID = activationID
-		}
-		state.screenAwareActivationID = nil
 		guard state.isScreenAwareModeActive else { return }
 		state.isScreenAwareModeActive = false
 	}
@@ -803,9 +999,12 @@ private extension TranscriptionFeature {
 			state.screenContextCaptureID = nil
 			state.screenContextCaptureErrorMessage = nil
 			state.pendingScreenAwareTranscription = nil
+			state.pendingSelectedTextTranscription = nil
+			state.pendingPressAndHoldActivationID = nil
+			state.pendingTerminalRefinementID = nil
 		state.forcedRefinementMode = forcedRefinementMode
-		state.activeRecordingHotkey = forcedRefinementMode == nil ? state.hexSettings.hotkey : state.hexSettings.refinedHotkey
-		state.activeMinimumKeyTime = forcedRefinementMode == nil ? state.hexSettings.minimumKeyTime : state.hexSettings.refinedMinimumKeyTime
+	state.activeRecordingHotkey = state.hexSettings.hotkey
+	state.activeMinimumKeyTime = state.hexSettings.minimumKeyTime
 		state.activeRecordingSource = source
     let startTime = now
     state.recordingStartTime = startTime
@@ -820,13 +1019,15 @@ private extension TranscriptionFeature {
     // Prevent system sleep during recording
     return .merge(
 			.cancel(id: CancelID.recordingCleanup),
+			.cancel(id: CancelID.terminalRefinementHold),
+			.cancel(id: CancelID.screenAwareActivation),
 			cancelsScreenContextCapture ? .cancel(id: CancelID.screenContextCapture) : .none,
       .run { [sleepManagement, preventSleep = state.hexSettings.preventSystemSleep] _ in
         // Play sound immediately for instant feedback
         soundEffect.play(.startRecording)
 
         if preventSleep {
-          await sleepManagement.preventSleep(reason: "Hex Voice Recording")
+          await sleepManagement.preventSleep(reason: "Octo Voice Recording")
         }
         guard !Task.isCancelled else {
           if preventSleep {
@@ -864,16 +1065,22 @@ private extension TranscriptionFeature {
       "Recording stopped duration=\(String(format: "%.3f", duration))s start=\(startStamp) stop=\(stopStamp) decision=\(String(describing: decision)) minimumKeyTime=\(String(format: "%.2f", minimumKeyTime)) hotkeyHasKey=\(hotkeyHasKey)"
     )
 
-	// The long-press gesture has already cleared its own activation threshold. Selected-text
-	// capture can delay the microphone start, so do not discard an otherwise valid
-	// screen-aware request merely because the recorded-audio duration is shorter.
+	// The gesture itself can be meaningful without a long audio capture. Do not
+	// discard screen-aware or selected-text refinement merely because the recorded
+	// audio duration is shorter than the normal transcription threshold.
 	let screenAwareCaptureInFlight = state.screenContextCaptureID != nil
-    guard decision == .proceedToTranscription || screenAwareCaptureInFlight else {
+	let selectedTextRefinementRequested = state.selectedTextForRefinement != nil
+		|| state.isCapturingSelectedTextForRefinement
+    guard decision == .proceedToTranscription
+		|| screenAwareCaptureInFlight
+		|| selectedTextRefinementRequested
+	else {
 		let selectedText = state.selectedTextForRefinement
 			state.selectedTextForRefinement = nil
 			state.screenContextForRefinement = nil
 			state.screenContextCaptureID = nil
 			state.pendingScreenAwareTranscription = nil
+			state.pendingSelectedTextTranscription = nil
 			state.forcedRefinementMode = nil
 		state.activeRecordingHotkey = nil
 		state.activeMinimumKeyTime = nil
@@ -949,6 +1156,7 @@ private extension TranscriptionFeature {
         defer {
           if let unownedAudioURL {
             FileManager.default.removeItemIfExists(at: unownedAudioURL)
+            RecordingRecoveryStore.releaseSource(forFinalAudioURL: unownedAudioURL)
           }
         }
         do {
@@ -1049,6 +1257,7 @@ private extension TranscriptionFeature {
     state.screenContextForRefinement = nil
     state.screenContextCaptureID = nil
     state.pendingScreenAwareTranscription = nil
+    state.pendingSelectedTextTranscription = nil
     state.forcedRefinementMode = nil
     state.activeRecordingHotkey = nil
     state.activeMinimumKeyTime = nil
@@ -1070,7 +1279,10 @@ private extension TranscriptionFeature {
 
     return .merge(
       .cancel(id: CancelID.screenContextCapture),
-      .run { _ in FileManager.default.removeItemIfExists(at: audioURL) }
+      .run { _ in
+        FileManager.default.removeItemIfExists(at: audioURL)
+        RecordingRecoveryStore.releaseSource(forFinalAudioURL: audioURL)
+      }
     )
   }
 
@@ -1083,6 +1295,14 @@ private extension TranscriptionFeature {
     // before any state mutation, force-quit detection, empty-result handling, post-processing,
     // or side effects.
     guard state.activeTranscriptionAudioURL == audioURL else {
+      return .none
+    }
+
+    // Selection lookup starts in parallel with recording. If transcription wins that
+    // race, keep its result intact until the lookup can either force refinement or
+    // confirm that there was no selection.
+    if state.isCapturingSelectedTextForRefinement {
+      state.pendingSelectedTextTranscription = .init(text: result, audioURL: audioURL)
       return .none
     }
     let duration = state.activeTranscriptionDuration
@@ -1099,15 +1319,17 @@ private extension TranscriptionFeature {
 		  state.screenContextForRefinement = nil
 		  state.screenContextCaptureID = nil
 		  state.pendingScreenAwareTranscription = nil
+		  state.pendingSelectedTextTranscription = nil
 	  state.forcedRefinementMode = nil
 	  state.activeRecordingHotkey = nil
 	  state.activeMinimumKeyTime = nil
 	  state.activeRecordingSource = nil
-      transcriptionFeatureLogger.fault("Force quit voice command recognized; terminating Hex.")
+      transcriptionFeatureLogger.fault("Force quit voice command recognized; terminating Octo.")
 	      return .merge(
 			.cancel(id: CancelID.screenContextCapture),
 			.run { _ in
 				FileManager.default.removeItemIfExists(at: audioURL)
+				RecordingRecoveryStore.releaseSource(forFinalAudioURL: audioURL)
 				await MainActor.run {
 					NSApp.terminate(nil)
 				}
@@ -1153,8 +1375,8 @@ private extension TranscriptionFeature {
       return handleEmptyTranscriptionResult(&state, audioURL: audioURL)
     }
 
-		// The ordinary hotkey always produces the normal transcription. Only the
-		// dedicated refined-transcription hotkey enables downstream AI processing.
+		// Refinement is selected by the terminal hold, selected text, or the
+		// screen-aware start gesture; the configured start hotkey stays unified.
 		let refinementMode = state.forcedRefinementMode ?? .raw
 	    let sourceAppBundleID = state.sourceAppBundleID
     let sourceAppName = state.sourceAppName
@@ -1172,6 +1394,11 @@ private extension TranscriptionFeature {
 	// text and never participates in capture, transcription, or audio ownership.
 	guard refinementMode != .raw else {
 		let historyCheckpointID = state.activeHistoryTranscriptID
+		state.recentCompletedTranscript = .init(
+			id: UUID(),
+			text: modifiedResult,
+			historyID: historyCheckpointID
+		)
 		state.activeHistoryTranscriptID = nil
 		state.forcedRefinementMode = nil
 		state.activeRecordingHotkey = nil
@@ -1249,6 +1476,10 @@ private extension TranscriptionFeature {
 			do {
 				let refinedResult = try await refinement.refine(request)
 				try Task.checkCancellation()
+				@Shared(.hexSettings) var settings: HexSettings
+				if settings.refinementReasoningEffort != request.reasoningEffort {
+					await send(.showError("Thinking level not supported. Changed to \(settings.refinementReasoningEffort.displayName)."))
+				}
 				await send(.refinementResult(refinedResult, audioURL, duration))
 			} catch is CancellationError {
 				return
@@ -1272,6 +1503,7 @@ private extension TranscriptionFeature {
 	state.activeTranscriptionAudioURL = nil
 	state.activeTranscriptionDuration = nil
 	state.isRefining = false
+	deactivateScreenAwareMode(&state)
 		let outputGenerationDuration = state.outputGenerationStartTime.map { now.timeIntervalSince($0) }
 		state.outputGenerationStartTime = nil
 		state.isCapturingSelectedTextForRefinement = false
@@ -1288,6 +1520,7 @@ private extension TranscriptionFeature {
 			state.screenContextCaptureErrorMessage = nil
 			state.screenContextCaptureID = nil
 			state.pendingScreenAwareTranscription = nil
+			state.pendingSelectedTextTranscription = nil
 		state.forcedRefinementMode = nil
 		state.activeRecordingHotkey = nil
 		state.activeMinimumKeyTime = nil
@@ -1297,6 +1530,13 @@ private extension TranscriptionFeature {
 	let sourceAppName = state.sourceAppName
 	let transcriptionHistory = state.$transcriptionHistory
 	let historyCheckpointID = state.activeHistoryTranscriptID
+	// Selected text is context for the refinement request, never transcription.
+	// In the silent selected-text path, retain an explicit empty raw transcript so
+	// History shows the generated replacement as a result rather than mislabeling
+	// it (or the selection) as spoken text.
+	let rawTranscriptForHistory = selectedText == nil
+		? (originalTranscript ?? result)
+		: (originalTranscript ?? "")
 	state.activeHistoryTranscriptID = nil
 	return finalizeTranscriptEffect(
 		result: result,
@@ -1307,7 +1547,7 @@ private extension TranscriptionFeature {
 			transcriptionHistory: transcriptionHistory,
 			selectedText: selectedText,
 			originalTranscript: originalTranscript,
-			rawTranscript: originalTranscript ?? result,
+			rawTranscript: rawTranscriptForHistory,
 			screenshotData: screenContext?.imagePNGData,
 			screenshotRecognizedText: screenContext?.recognizedText,
 			processingErrors: screenContextCaptureErrorMessage.map {
@@ -1399,6 +1639,7 @@ private extension TranscriptionFeature {
 			state.screenContextCaptureErrorMessage = nil
 			state.screenContextCaptureID = nil
 			state.pendingScreenAwareTranscription = nil
+			state.pendingSelectedTextTranscription = nil
 		state.forcedRefinementMode = nil
 		state.activeRecordingHotkey = nil
 		state.activeMinimumKeyTime = nil
@@ -1546,9 +1787,11 @@ private extension TranscriptionFeature {
           "Failed to persist completed transcript: \(error.localizedDescription, privacy: .private)"
         )
         try? FileManager.default.removeItem(at: audioURL)
+        RecordingRecoveryStore.releaseSource(forFinalAudioURL: audioURL)
       }
     } else {
       FileManager.default.removeItemIfExists(at: audioURL)
+      RecordingRecoveryStore.releaseSource(forFinalAudioURL: audioURL)
     }
 
 	if selectedText == nil {
@@ -1611,6 +1854,7 @@ private extension TranscriptionFeature {
 	))
 
 		await insertHistoryEntry(transcript, at: 0, transcriptionHistory: transcriptionHistory)
+    await recording.releaseRecordingSource(transcript.audioPath)
     return transcript
   }
 
@@ -1620,7 +1864,9 @@ private extension TranscriptionFeature {
 		transcriptionHistory.withLock { history in
 			history.history.insert(transcript, at: min(index, history.history.count))
 			guard let maxEntries = hexSettings.maxHistoryEntries, maxEntries > 0 else { return }
-			while history.history.count > maxEntries, let removedTranscript = history.history.popLast() {
+			while history.history.count > maxEntries,
+				  let index = history.history.lastIndex(where: { $0.recoverySessionID == nil }) {
+				let removedTranscript = history.history.remove(at: index)
 				if !history.history.contains(where: { $0.audioPath == removedTranscript.audioPath }) {
 					audioToDelete.append(removedTranscript)
 				}
@@ -1661,6 +1907,7 @@ private extension TranscriptionFeature {
 
     guard shouldPersist else {
       try? FileManager.default.removeItem(at: audioURL)
+      RecordingRecoveryStore.releaseSource(forFinalAudioURL: audioURL)
       return
     }
 
@@ -1686,6 +1933,7 @@ private extension TranscriptionFeature {
         "Failed to persist incomplete transcript (\(String(describing: status))): \(error.localizedDescription, privacy: .private)"
       )
       try? FileManager.default.removeItem(at: audioURL)
+      RecordingRecoveryStore.releaseSource(forFinalAudioURL: audioURL)
     }
   }
 }
@@ -1698,6 +1946,10 @@ private extension TranscriptionFeature {
 	let wasRefining = state.isRefining
 	state.isTranscribing = false
 	state.isRefining = false
+	state.pendingPressAndHoldActivationID = nil
+	state.pendingTerminalRefinementID = nil
+	state.pendingScreenAwareTranscription = nil
+		state.postHocRefinement = nil
 		state.outputGenerationStartTime = nil
 		deactivateScreenAwareMode(&state)
 		state.isCapturingSelectedTextForRefinement = false
@@ -1716,6 +1968,7 @@ private extension TranscriptionFeature {
 			state.screenContextCaptureID = nil
 			state.screenContextCaptureErrorMessage = nil
 			state.pendingScreenAwareTranscription = nil
+			state.pendingSelectedTextTranscription = nil
     state.isRecording = false
 		state.forcedRefinementMode = nil
 		state.activeRecordingHotkey = nil
@@ -1743,9 +1996,12 @@ private extension TranscriptionFeature {
 
     return .merge(
       .cancel(id: CancelID.transcription),
+				.cancel(id: CancelID.pendingPressAndHold),
+				.cancel(id: CancelID.terminalRefinementHold),
+				.cancel(id: CancelID.postHocRefinement),
+				.cancel(id: CancelID.selectedTextOnlyRefinement),
 				.cancel(id: CancelID.selectedTextRefinement),
 				.cancel(id: CancelID.screenContextCapture),
-				.cancel(id: CancelID.screenAwareActivation),
       .cancel(id: CancelID.recordingStart),
       .run { [sleepManagement] _ in
 		await selectedText?.cancel()
@@ -1809,8 +2065,13 @@ private extension TranscriptionFeature {
   func handleDiscard(_ state: inout State) -> Effect<Action> {
 	state.isRecording = false
 	deactivateScreenAwareMode(&state)
+	state.pendingPressAndHoldActivationID = nil
+	state.pendingTerminalRefinementID = nil
+		state.postHocRefinement = nil
 		state.outputGenerationStartTime = nil
     state.isPrewarming = false
+	state.isCapturingSelectedTextForRefinement = false
+	state.refinedHotKeyReleasedWhileCapturingSelection = false
 	state.forcedRefinementMode = nil
 	state.activeRecordingHotkey = nil
 	state.activeMinimumKeyTime = nil
@@ -1822,12 +2083,17 @@ private extension TranscriptionFeature {
 			state.screenContextCaptureID = nil
 			state.screenContextCaptureErrorMessage = nil
 			state.pendingScreenAwareTranscription = nil
+			state.pendingSelectedTextTranscription = nil
 
     // Silently discard - no sound effect
     return .merge(
       .cancel(id: CancelID.recordingStart),
-			.cancel(id: CancelID.screenContextCapture),
+			.cancel(id: CancelID.pendingPressAndHold),
+			.cancel(id: CancelID.terminalRefinementHold),
 			.cancel(id: CancelID.screenAwareActivation),
+			.cancel(id: CancelID.postHocRefinement),
+			.cancel(id: CancelID.selectedTextRefinement),
+			.cancel(id: CancelID.screenContextCapture),
       .run { [sleepManagement] _ in
 		await selectedText?.cancel()
         // Allow system to sleep again
@@ -1835,6 +2101,7 @@ private extension TranscriptionFeature {
 		let result = await recording.stopRecording()
 		if case let .captured(url) = result {
 		  FileManager.default.removeItemIfExists(at: url)
+		  RecordingRecoveryStore.releaseSource(forFinalAudioURL: url)
 		}
 		guard !Task.isCancelled else { return }
       }
@@ -1850,7 +2117,9 @@ struct TranscriptionView: View {
   @ObserveInjection var inject
 
   var status: TranscriptionIndicatorView.Status {
-	if store.isScreenAwareModeActive {
+	if let error = store.error {
+		return .error(error)
+	} else if store.isScreenAwareModeActive {
 	  return .screenAware
 	} else if store.isRefining {
 	  return .refining
