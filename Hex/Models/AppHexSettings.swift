@@ -18,12 +18,12 @@ extension SharedReaderKey
 	}
 }
 
-// MARK: - Storage Migration
+// MARK: - Storage
 
 extension URL {
 	static var hexSettingsURL: URL {
 		get {
-			URL.hexMigratedFileURL(named: "hex_settings.json")
+			URL.hexStoredFileURL(named: "hex_settings.json")
 		}
 	}
 }

@@ -16,16 +16,9 @@ public extension URL {
 		}
 	}
 
-	static var legacyDocumentsDirectory: URL {
-		FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-	}
-
-	static func hexMigratedFileURL(named fileName: String) -> URL {
-		let newURL = (try? hexApplicationSupport.appending(component: fileName))
-			?? documentsDirectory.appending(component: fileName)
-		let legacyURL = legacyDocumentsDirectory.appending(component: fileName)
-		FileManager.default.migrateIfNeeded(from: legacyURL, to: newURL)
-		return newURL
+	static func hexStoredFileURL(named fileName: String) -> URL {
+		(try? hexApplicationSupport.appending(component: fileName))
+			?? temporaryDirectory.appending(component: fileName)
 	}
 
 	static var hexModelsDirectory: URL {
@@ -59,11 +52,6 @@ public extension URL {
 }
 
 public extension FileManager {
-	func migrateIfNeeded(from legacy: URL, to new: URL) {
-		guard fileExists(atPath: legacy.path), !fileExists(atPath: new.path) else { return }
-		try? copyItem(at: legacy, to: new)
-	}
-
 	func removeItemIfExists(at url: URL) {
 		guard fileExists(atPath: url.path) else { return }
 		try? removeItem(at: url)

@@ -3,7 +3,7 @@ import HexCore
 
 /// Loads OpenRouter's catalog and keeps the last successful response available offline.
 enum OpenRouterModelCatalog {
-	private static let cacheURL = URL.hexMigratedFileURL(named: "openrouter_models.json")
+	private static let cacheURL = URL.hexStoredFileURL(named: "openrouter_models.json")
 
 	static func cachedModels() -> [OpenRouterModel] {
 		guard let data = try? Data(contentsOf: cacheURL),

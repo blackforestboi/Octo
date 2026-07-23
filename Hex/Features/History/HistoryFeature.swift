@@ -99,12 +99,12 @@ extension SharedReaderKey
 	}
 }
 
-// MARK: - Storage Migration
+// MARK: - Storage
 
 extension URL {
 	static var transcriptionHistoryURL: URL {
 		get {
-			URL.hexMigratedFileURL(named: "transcription_history.json")
+			URL.hexStoredFileURL(named: "transcription_history.json")
 		}
 	}
 }
