@@ -83,6 +83,18 @@ actor TranscriptionClientLive {
     }
   }()
 
+  /// WhisperKit's Hugging Face staging area. Supplying this explicitly prevents
+  /// WhisperKit from using its Documents-folder default for remote model lookups.
+  private lazy var whisperKitDownloadBase: URL = {
+    let folder = modelsBaseFolder.appendingPathComponent("downloads", isDirectory: true)
+    do {
+      try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+      return folder
+    } catch {
+      fatalError("Could not create WhisperKit download folder: \(error)")
+    }
+  }()
+
   // MARK: - Public Methods
 
   /// Ensures the given `variant` model is downloaded and loaded, reporting
@@ -204,12 +216,12 @@ actor TranscriptionClientLive {
 
   /// Returns a list of recommended models based on current device hardware.
   func getRecommendedModels() async -> ModelSupport {
-    await WhisperKit.recommendedRemoteModels()
+    await WhisperKit.recommendedRemoteModels(downloadBase: whisperKitDownloadBase)
   }
 
   /// Lists all model variants available in the `argmaxinc/whisperkit-coreml` repository.
   func getAvailableModels() async throws -> [String] {
-    var names = try await WhisperKit.fetchAvailableModels()
+    var names = try await WhisperKit.fetchAvailableModels(downloadBase: whisperKitDownloadBase)
     #if canImport(FluidAudio)
     for model in ParakeetModel.allCases.reversed() {
       if !names.contains(model.identifier) { names.insert(model.identifier, at: 0) }
@@ -286,7 +298,7 @@ actor TranscriptionClientLive {
     guard variant.contains("*") || variant.contains("?") else { return variant }
 
     let names: [String]
-    do { names = try await WhisperKit.fetchAvailableModels() } catch { return variant }
+    do { names = try await WhisperKit.fetchAvailableModels(downloadBase: whisperKitDownloadBase) } catch { return variant }
 
     // Build tuple array with download status for matching models
     var models: [(name: String, isDownloaded: Bool)] = []
@@ -357,7 +369,7 @@ actor TranscriptionClientLive {
       // default repo/host (Hugging Face) by omitting the repo/host arg.
       let tempFolder = try await WhisperKit.download(
         variant: variant,
-        downloadBase: nil,
+        downloadBase: whisperKitDownloadBase,
         useBackgroundSession: false,
         progressCallback: { progress in
           progressCallback(progress)
