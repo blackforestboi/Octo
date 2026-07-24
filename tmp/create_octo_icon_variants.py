@@ -67,13 +67,48 @@ boundary = np.asarray(inner_mask)[:, :, None] < 255
 light_rgb = np.where(boundary, aquamarine.reshape(1, 1, 3), rgb)
 dark_rgb = np.where(boundary, navy.reshape(1, 1, 3), inverted_rgb)
 
-light_output = np.concatenate((light_rgb, alpha), axis=2)
-light_output = Image.fromarray(np.rint(light_output).astype(np.uint8), mode="RGBA")
-light_output.save(light_path)
+def make_padded_icon(rgb_values: np.ndarray, background: np.ndarray) -> Image.Image:
+    artwork = Image.fromarray(
+        np.rint(np.concatenate((rgb_values, alpha), axis=2)).astype(np.uint8),
+        mode="RGBA",
+    )
 
-dark_output = np.concatenate((dark_rgb, alpha), axis=2)
-dark_output = Image.fromarray(np.rint(dark_output).astype(np.uint8), mode="RGBA")
-dark_output.save(dark_path)
+    # macOS sizes the complete image canvas in the Dock. Keep transparent
+    # breathing room around the tile so its perceived size matches neighboring
+    # app icons, then use a larger standard app-icon corner radius.
+    inset = round(min(width, height) * 0.115)
+    tile_size = min(width, height) - (2 * inset)
+    artwork = artwork.resize((tile_size, tile_size), Image.Resampling.LANCZOS)
+    canvas = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    canvas.paste(artwork, (inset, inset), artwork)
+
+    mask = Image.new("L", (width * mask_scale, height * mask_scale), 0)
+    draw = ImageDraw.Draw(mask)
+    radius = round(tile_size * 0.24) * mask_scale
+    draw.rounded_rectangle(
+        (
+            inset * mask_scale,
+            inset * mask_scale,
+            (width - inset) * mask_scale - 1,
+            (height - inset) * mask_scale - 1,
+        ),
+        radius=radius,
+        fill=255,
+    )
+    mask = mask.resize((width, height), Image.Resampling.LANCZOS)
+    values = np.asarray(canvas).astype(np.float32)
+    tile_mask = np.asarray(mask).astype(np.float32)[:, :, None]
+    values[:, :, 3:4] *= tile_mask / 255.0
+    values[:, :, :3] = np.where(
+        tile_mask < 255.0,
+        background.reshape(1, 1, 3),
+        values[:, :, :3],
+    )
+    return Image.fromarray(np.rint(values).astype(np.uint8), mode="RGBA")
+
+
+make_padded_icon(light_rgb, aquamarine).save(light_path)
+make_padded_icon(dark_rgb, navy).save(dark_path)
 
 print(f"light={light_path}")
 print(f"dark={dark_path}")
