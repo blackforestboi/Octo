@@ -155,7 +155,9 @@ jobs:
             cp docs/updates/appcast.xml update-site/appcast.xml
           fi
           cp "dist/Octo-${{ steps.package.outputs.version }}.dmg" update-site/
-          printf '%s' "$SPARKLE_PRIVATE_KEY" | "$GENERATE_APPCAST" \
+          PRIVATE_KEY=$(printf '%s' "$SPARKLE_PRIVATE_KEY" | python3 -c 'import re, sys; value = sys.stdin.read().strip(); match = re.search(r"-----BEGIN [^-]+-----(.*?)-----END [^-]+-----", value, re.DOTALL); print("".join((match.group(1) if match else value).split()))')
+          test -n "$PRIVATE_KEY"
+          printf '%s' "$PRIVATE_KEY" | "$GENERATE_APPCAST" \
             --ed-key-file - \
             --download-url-prefix "https://github.com/$GITHUB_REPOSITORY/releases/download/$INPUT_TAG/" \
             --maximum-versions 0 \
