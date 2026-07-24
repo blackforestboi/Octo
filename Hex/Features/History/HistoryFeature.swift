@@ -62,6 +62,43 @@ private final class ScreenshotImageCache: @unchecked Sendable {
 
 private let screenshotImageCache = ScreenshotImageCache()
 
+/// Performs the history search entirely in memory. Only the spoken transcript and
+/// generated output participate, so metadata and captured screen context stay out of
+/// search results.
+enum HistorySearch {
+	static func matchingIDs(in history: [Transcript], query: String) -> Set<UUID> {
+		let terms = query.split(whereSeparator: \.isWhitespace).map(String.init)
+		guard !terms.isEmpty else { return Set(history.map(\.id)) }
+		let legacyRawTranscripts = history.reduce(into: [URL: String]()) { result, transcript in
+			guard transcript.isRefinementSource == true else { return }
+			result[transcript.audioPath] = transcript.text
+		}
+
+		return Set(history.compactMap { transcript in
+			guard transcript.isRefinementSource != true else { return nil }
+			let legacyRawTranscript = legacyRawTranscripts[transcript.audioPath]
+			let rawTranscript = transcript.rawText ?? legacyRawTranscript ?? transcript.text
+			let searchableText = [rawTranscript, transcript.text]
+				.joined(separator: "\n")
+			return terms.contains { searchableText.range(of: $0, options: .caseInsensitive) != nil }
+				? transcript.id
+				: nil
+		})
+	}
+}
+
+private func highlightedText(_ text: String, matching query: String) -> AttributedString {
+	var attributedText = AttributedString(text)
+	for term in query.split(whereSeparator: \.isWhitespace) where !term.isEmpty {
+		var searchRange = attributedText.startIndex..<attributedText.endIndex
+		while let range = attributedText[searchRange].range(of: term, options: .caseInsensitive) {
+			attributedText[range].backgroundColor = .yellow.opacity(0.35)
+			searchRange = range.upperBound..<attributedText.endIndex
+		}
+	}
+	return attributedText
+}
+
 // MARK: - Date Extensions
 
 extension Date {
@@ -578,6 +615,7 @@ private struct RunHistoryItemView: View {
 	let onRerunTranscription: () -> Void
 	let onRerunFullRun: () -> Void
 	let onDelete: () -> Void
+	let searchQuery: String
 
 	private var rawTranscript: String { transcript.rawText ?? legacyRawTranscript ?? transcript.text }
 	private var hasDistinctResult: Bool { transcript.text != rawTranscript || transcript.wasRefined == true }
@@ -614,15 +652,21 @@ private struct RunHistoryItemView: View {
 						.font(.caption.weight(.semibold))
 						.foregroundStyle(status == .failed ? .red : .secondary)
 				}
-				Text(rawTranscript.isEmpty
-					? (transcript.status == .processing ? "Transcription is still processing." : "No transcription was produced.")
-					: rawTranscript)
+				Text(highlightedText(
+					rawTranscript.isEmpty
+						? (transcript.status == .processing ? "Transcription is still processing." : "No transcription was produced.")
+						: rawTranscript,
+					matching: searchQuery
+				))
 					.textSelection(.enabled)
 					.fixedSize(horizontal: false, vertical: true)
 				if hasDistinctResult {
 					Divider().padding(.vertical, 4)
 					Text("Result").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-					Text(transcript.text.isEmpty ? "No result was produced." : transcript.text)
+					Text(highlightedText(
+						transcript.text.isEmpty ? "No result was produced." : transcript.text,
+						matching: searchQuery
+					))
 						.textSelection(.enabled)
 						.fixedSize(horizontal: false, vertical: true)
 					if let outputGenerationDuration = transcript.outputGenerationDuration {
@@ -773,7 +817,19 @@ struct HistoryView: View {
 	@ObserveInjection var inject
 	let store: StoreOf<HistoryFeature>
 	@State private var showingDeleteConfirmation = false
+	@State private var searchQuery = ""
+	@State private var submittedSearchQuery = ""
+	@State private var matchingTranscriptIDs: Set<UUID>?
+	@State private var isSearching = false
+	@State private var searchTask: Task<Void, Never>?
+	@FocusState private var isSearchFieldFocused: Bool
 	@Shared(.hexSettings) var hexSettings: HexSettings
+
+	private var visibleTranscripts: [Transcript] {
+		let runs = store.transcriptionHistory.history.filter { $0.isRefinementSource != true }
+		guard let matchingTranscriptIDs else { return runs }
+		return runs.filter { matchingTranscriptIDs.contains($0.id) }
+	}
 
 	var body: some View {
       Group {
@@ -793,10 +849,27 @@ struct HistoryView: View {
           } description: {
             Text("Your transcription history will appear here.")
           }
-        } else {
+		} else if isSearching {
+			ContentUnavailableView {
+				Label("Searching History", systemImage: "magnifyingglass")
+			} description: {
+				Text("Looking through your transcripts and results…")
+			}
+		} else {
+			VStack(spacing: 0) {
+				TextField("Search transcripts and results", text: $searchQuery)
+					.textFieldStyle(.roundedBorder)
+					.focused($isSearchFieldFocused)
+					.onSubmit(searchHistory)
+					.padding()
+
+				if matchingTranscriptIDs != nil && visibleTranscripts.isEmpty {
+					ContentUnavailableView.search(text: submittedSearchQuery)
+						.frame(maxWidth: .infinity, maxHeight: .infinity)
+				} else {
           ScrollView {
             LazyVStack(spacing: 12) {
-              ForEach(store.transcriptionHistory.history.filter { $0.isRefinementSource != true }) { transcript in
+              ForEach(visibleTranscripts) { transcript in
                 RunHistoryItemView(
                   transcript: transcript,
                   legacyRawTranscript: store.transcriptionHistory.history.first(where: {
@@ -812,12 +885,15 @@ struct HistoryView: View {
                   onCopy: { store.send(.copyToClipboard(transcript.text)) },
                   onRerunTranscription: { store.send(.rerunTranscription(transcript.id)) },
                   onRerunFullRun: { store.send(.rerunFullRun(transcript.id)) },
-                  onDelete: { store.send(.deleteTranscript(transcript.id)) }
+					onDelete: { store.send(.deleteTranscript(transcript.id)) },
+					searchQuery: matchingTranscriptIDs == nil ? "" : submittedSearchQuery
                 )
               }
             }
             .padding()
           }
+				}
+			}
           .toolbar {
             Button(role: .destructive, action: { showingDeleteConfirmation = true }) {
               Label("Delete All", systemImage: "trash")
@@ -833,5 +909,32 @@ struct HistoryView: View {
           }
         }
       }.enableInjection()
+	}
+
+	private func searchHistory() {
+		searchTask?.cancel()
+		let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+		guard !query.isEmpty else {
+			matchingTranscriptIDs = nil
+			submittedSearchQuery = ""
+			isSearching = false
+			isSearchFieldFocused = true
+			return
+		}
+
+		let history = store.transcriptionHistory.history
+		submittedSearchQuery = query
+		isSearching = true
+		searchTask = Task {
+			let matchingIDs = await Task.detached(priority: .userInitiated) {
+				HistorySearch.matchingIDs(in: history, query: query)
+			}.value
+			guard !Task.isCancelled else { return }
+			matchingTranscriptIDs = matchingIDs
+			isSearching = false
+			await Task.yield()
+			guard !Task.isCancelled else { return }
+			isSearchFieldFocused = true
+		}
 	}
 }
