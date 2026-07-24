@@ -113,9 +113,8 @@ struct AppFeature {
         
       case .pasteLastTranscript:
         @Shared(.transcriptionHistory) var transcriptionHistory: TranscriptionHistory
-        guard let lastTranscript = transcriptionHistory.history.first(where: {
-          $0.recoverySessionID == nil && !$0.text.isEmpty
-        })?.text else {
+        guard let lastTranscript = state.transcription.recentCompletedTranscript?.text
+          ?? transcriptionHistory.latestPasteableTranscriptText else {
           return .none
         }
         return .run { _ in

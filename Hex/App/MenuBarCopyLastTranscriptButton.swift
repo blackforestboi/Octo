@@ -11,7 +11,7 @@ struct MenuBarCopyLastTranscriptButton: View {
   @Dependency(\.pasteboard) var pasteboard
 
   var body: some View {
-    let lastText = transcriptionHistory.history.first?.text
+    let lastText = transcriptionHistory.latestPasteableTranscriptText
 
     let button = Button("Paste Last Transcript") {
       if let text = lastText {

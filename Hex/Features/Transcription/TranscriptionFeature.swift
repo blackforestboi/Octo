@@ -1532,6 +1532,11 @@ private extension TranscriptionFeature {
 	let sourceAppName = state.sourceAppName
 	let transcriptionHistory = state.$transcriptionHistory
 	let historyCheckpointID = state.activeHistoryTranscriptID
+	state.recentCompletedTranscript = .init(
+		id: UUID(),
+		text: result,
+		historyID: historyCheckpointID
+	)
 	// Selected text is context for the refinement request, never transcription.
 	// In the silent selected-text path, retain an explicit empty raw transcript so
 	// History shows the generated replacement as a result rather than mislabeling

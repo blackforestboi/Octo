@@ -110,6 +110,14 @@ public struct Transcript: Codable, Equatable, Identifiable, Sendable {
 
 public struct TranscriptionHistory: Codable, Equatable, Sendable {
     public var history: [Transcript] = []
+
+	/// The most recent non-recovery transcript with text, regardless of array order.
+	public var latestPasteableTranscriptText: String? {
+		history
+			.filter { $0.recoverySessionID == nil && !$0.text.isEmpty }
+			.max { $0.timestamp < $1.timestamp }?
+			.text
+	}
     
     public init(history: [Transcript] = []) {
         self.history = history
