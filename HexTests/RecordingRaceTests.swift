@@ -214,7 +214,7 @@ final class RecordingRaceTests: XCTestCase {
       TranscriptionFeature()
     } withDependencies: {
       $0.date.now = now
-      $0.recording.startRecording = {}
+      $0.recording.startRecording = { .failed }
       $0.recording.stopRecording = { .captured(stopURL) }
       $0.sleepManagement.preventSleep = { _ in
         await probe.recordPreventSleep()
@@ -593,7 +593,7 @@ final class RecordingRaceTests: XCTestCase {
 			$0.date.now = now
 			$0.pasteboard.captureSelectedText = { await captureProbe.capture() }
 			$0.pasteboard.paste = { text in await rawPasteProbe.recordPaste(text) }
-			$0.recording.startRecording = {}
+			$0.recording.startRecording = { .failed }
 			$0.recording.stopRecording = { .captured(audioURL) }
 			$0.transcription.transcribe = { _, _, _, _ in "make it shorter" }
 			$0.refinement.refine = { request in
@@ -653,7 +653,7 @@ final class RecordingRaceTests: XCTestCase {
 		} withDependencies: {
 			$0.date.now = Date(timeIntervalSince1970: 1_234)
 			$0.pasteboard.captureSelectedText = { await captureProbe.capture() }
-			$0.recording.startRecording = {}
+			$0.recording.startRecording = { .failed }
 			$0.recording.stopRecording = { .ignored(.noActiveRecording) }
 			$0.sleepManagement.preventSleep = { _ in }
 			$0.sleepManagement.allowSleep = {}
@@ -907,7 +907,7 @@ final class RecordingRaceTests: XCTestCase {
 			$0.date.now = Date(timeIntervalSince1970: 1_234)
 			$0.continuousClock = clock
 			$0.uuid = .constant(activationID)
-			$0.recording.startRecording = {}
+			$0.recording.startRecording = { .failed }
 			$0.recording.stopRecording = { .ignored(.noActiveRecording) }
 			$0.sleepManagement.preventSleep = { _ in }
 			$0.sleepManagement.allowSleep = {}
@@ -963,7 +963,7 @@ final class RecordingRaceTests: XCTestCase {
 		} withDependencies: {
 			$0.date.now = Date(timeIntervalSince1970: 1_234)
 			$0.uuid = .constant(UUID(1))
-			$0.recording.startRecording = {}
+			$0.recording.startRecording = { .failed }
 			$0.sleepManagement.preventSleep = { _ in }
 			$0.soundEffects.play = { _ in }
 			$0.screenCapture.captureDisplayUnderCursor = { _ in context }
@@ -998,7 +998,7 @@ final class RecordingRaceTests: XCTestCase {
 			$0.date.now = now
 			$0.pasteboard.captureSelectedText = { nil }
 			$0.pasteboard.paste = { text in await pasteProbe.recordPaste(text) }
-			$0.recording.startRecording = {}
+			$0.recording.startRecording = { .failed }
 			$0.recording.stopRecording = { .captured(audioURL) }
 			$0.transcription.transcribe = { _, _, _, _ in "ordinary transcript" }
 			$0.refinement.refine = { _ in throw RefinementTestError.failed }
@@ -1431,8 +1431,9 @@ private actor RecordingProbe {
     self.stopURL = stopURL
   }
 
-  func recordStart() {
+  func recordStart() -> RecordingStartResult {
     startCalls += 1
+    return .failed
   }
 
   func beginStop() async -> RecordingStopResult {

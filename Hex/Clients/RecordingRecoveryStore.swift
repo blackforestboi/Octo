@@ -308,7 +308,7 @@ enum RecordingRecoveryStore {
     activeRecordingsDirectory.appendingPathComponent("\(id.uuidString).json")
   }
 
-  private static func finalAudioURL(for id: UUID) -> URL {
+  static func finalAudioURL(for id: UUID) -> URL {
     recordingsDirectory.appendingPathComponent("active-\(id.uuidString).wav")
   }
 

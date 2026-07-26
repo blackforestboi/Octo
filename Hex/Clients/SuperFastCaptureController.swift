@@ -124,6 +124,9 @@ final class SuperFastCaptureController {
   private var converter: AVAudioConverter?
   private var configurationChangeObserver: NSObjectProtocol?
   private var activeRecording: ActiveRecording?
+  /// A synchronously-written PCM source whose capture stream failed. It stays available until
+  /// the stop path can convert the valid prefix to WAV and place it in History.
+  private var failedRecoverySession: RecordingRecoverySession?
   private var captureGeneration = 0
   private var recordingFailure: RecordingFailure?
   private var keepWarmBuffer = false
@@ -294,6 +297,7 @@ final class SuperFastCaptureController {
     processingQueue.sync {
       do {
         recordingFailure = nil
+        failedRecoverySession = nil
         let preRollDuration = mode.preRollDuration
         let preRollFrameCount = Int(preRollDuration * SuperFastCaptureConstants.sampleRate)
         let preRollSamples = ringBuffer.recentSamples(count: preRollFrameCount)
@@ -466,6 +470,7 @@ final class SuperFastCaptureController {
       logger.error("Failed to write capture engine audio: \(error.localizedDescription)")
       activeRecording = nil
       recordingFailure = .captureWriteFailed(error.localizedDescription)
+      failedRecoverySession = recording.recoverySession
       recording.recoverySession.abandonForRecovery()
       resolvePendingFinish(with: .failed(.captureWriteFailed(error.localizedDescription)))
     }
@@ -558,7 +563,10 @@ final class SuperFastCaptureController {
         guard let self, self.pendingFinish != nil else { return }
         self.logger.error("Timed out waiting for capture engine to reach the stop audio boundary")
         let failure = RecordingFailure.captureFinalizationTimedOut
-        self.activeRecording?.recoverySession.abandonForRecovery()
+        if let recording = self.activeRecording {
+          self.failedRecoverySession = recording.recoverySession
+          recording.recoverySession.abandonForRecovery()
+        }
         self.resolvePendingFinish(with: .failed(failure))
       }
     }
@@ -579,8 +587,31 @@ final class SuperFastCaptureController {
       return .captured(try recording.recoverySession.finalize().audioURL)
     } catch {
       logger.error("Failed to finalize durable capture source: \(error.localizedDescription, privacy: .private)")
+      failedRecoverySession = recording.recoverySession
       recording.recoverySession.abandonForRecovery()
       return .failed(.captureWriteFailed(error.localizedDescription))
+    }
+  }
+
+  /// Finalize a capture that stopped because the streaming write failed. The raw PCM prefix is
+  /// fsynced before the failure is surfaced, so this turns every accepted frame into replayable
+  /// WAV without waiting for the next app launch.
+  func recoverFailedRecording() -> RecoveredRecording? {
+    let session = processingQueue.sync { failedRecoverySession }
+    guard let session else { return nil }
+
+    do {
+      let recovered = try session.finalize()
+      processingQueue.sync {
+        if failedRecoverySession === session {
+          failedRecoverySession = nil
+        }
+      }
+      logger.notice("Finalized recoverable PCM after capture failure duration=\(String(format: "%.3f", recovered.duration))s")
+      return recovered
+    } catch {
+      logger.error("Could not finalize recoverable PCM after capture failure: \(error.localizedDescription, privacy: .private)")
+      return nil
     }
   }
 
