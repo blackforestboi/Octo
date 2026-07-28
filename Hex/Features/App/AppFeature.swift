@@ -23,6 +23,7 @@ struct AppFeature {
     case remappings
     case history
     case about
+		case support
   }
 
 	@ObservableState
@@ -392,6 +393,14 @@ struct AppView: View {
         }
         .buttonStyle(.plain)
         .tag(AppFeature.ActiveTab.about)
+
+			Button {
+				store.send(.setActiveTab(.support))
+			} label: {
+				Label("Support", systemImage: "questionmark.circle")
+			}
+			.buttonStyle(.plain)
+			.tag(AppFeature.ActiveTab.support)
       }
     } detail: {
       switch store.state.activeTab {
@@ -412,6 +421,9 @@ struct AppView: View {
       case .about:
         AboutView(store: store.scope(state: \.settings, action: \.settings))
           .navigationTitle("About")
+			case .support:
+				SupportView()
+					.navigationTitle("Support")
       }
     }
     .enableInjection()

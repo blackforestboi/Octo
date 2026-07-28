@@ -7,6 +7,16 @@ import XCTest
 
 @MainActor
 final class AppFeatureTests: XCTestCase {
+	func testSupportTabCanBeSelected() async {
+		let store = TestStore(initialState: AppFeature.State()) {
+			AppFeature()
+		}
+
+		await store.send(.setActiveTab(.support)) {
+			$0.activeTab = .support
+		}
+	}
+
 	func testPasteLastTranscriptPrefersMostRecentLiveTranscript() async {
 		var state = AppFeature.State()
 		state.transcription.recentCompletedTranscript = .init(
