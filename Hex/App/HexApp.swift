@@ -15,6 +15,7 @@ struct HexApp: App {
         MenuBarExtra {
             MenuBarCopyLastTranscriptButton()
             MenuBarRefineSelectedTextButton()
+            MenuBarRefinementModelPicker()
 
             Button("History") {
                 appDelegate.presentHistoryView()
