@@ -1,5 +1,30 @@
 # Changelog
 
+## 2026.7.28
+
+### Patch Changes
+
+- 5f48c5c: Use signed-in Codex or Claude CLI subscriptions for transcript refinement, select an available subscription on fresh setup, choose models per API or subscription provider, show CLI sign-in failures in the recording pill, and reduce CLI refinement startup overhead.
+- 8c956b7: Add direct History access from the menu bar.
+- 5f48c5c: Persist live recording frames so interrupted recordings can be recovered after Octo restarts.
+- c0836b2: Fix the menu bar icon rendering at its intended compact size.
+- 07d24d9: Fix the paste-last-transcript hotkey selecting a stale history entry instead of the most recent completed transcript.
+- 3e6e725: Fix first-release Sparkle feed generation and make GitHub release asset publishing repeatable.
+- 501f3a7: Add in-memory history search for transcripts and generated results.
+- 5f48c5c: Let screen-aware capture select a screen region by dragging, avoid accidental micro-drags with a movement threshold, reposition it with Space, retry with Escape, or use the full display with a click. Show the Space-to-move affordance compactly above the selection.
+- b306419: Keep WhisperKit's model lookup and download cache in Application Support instead of requesting access to Documents.
+- a93366b: Switch the active refinement model directly from a hover-opened menu-bar submenu.
+- 0e0c639: Add rounded light and inverse-color dark Octo Dock icons plus a monochrome eight-tentacle menu bar icon.
+- bdac6ec: Document Octo's fork identity and the improvements included in the date-based 2026.7.24 release.
+- 8ab39aa: Prevent Octo from requesting Documents-folder access for legacy storage migration.
+- 5f48c5c: Rebrand Hex as Octo with an independent signed update feed.
+- 9670ba2: Recover interrupted recordings into History immediately, preserving their captured audio for retry.
+- 5f48c5c: Use a lighter weight for the Transcription Refinement description.
+- 5f48c5c: Show the underlying Codex and Claude CLI errors when AI transcript refinement fails.
+- f5caeee: Add an in-app Support portal backed by Featurebase.
+- fb67a80: Redesign the transcription pill with configurable size and location, persistent waveform feedback, and direct History access.
+- 5f48c5c: Unify recording, screenshot capture, and refinement under one hotkey, add a configurable long-press on-demand path for double-tap-only locking, execute terminal refinement and screen-aware holds without waiting for key-up, keep Escape scoped to an active screen-selection rectangle, paste refinement output at the current cursor while retaining selected text only as context, keep selected text out of the transcript history field, and show adaptive gesture sequences in Hot Key settings.
+
 ## 2026.7.161
 
 ### Minor Changes
