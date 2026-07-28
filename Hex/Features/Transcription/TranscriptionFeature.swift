@@ -185,6 +185,8 @@ struct TranscriptionFeature {
     case startRecording
 		case startRefinedRecording
     case stopRecording
+	case recordingCheckpointStarted(RecordingCheckpoint)
+	case recordingCheckpointFinalized(URL, TimeInterval, TranscriptStatus)
 
     // Cancel/discard flow
     case cancel   // Explicit cancellation with sound
@@ -673,13 +675,77 @@ struct TranscriptionFeature {
 		case .startRefinedRecording:
 			return handleStartRecording(&state, forcedRefinementMode: .refined, source: .regular)
 
-      case .stopRecording:
+		case .stopRecording:
 		state.pendingTerminalRefinementID = nil
 		return .merge(
 			.cancel(id: CancelID.terminalRefinementHold),
 			.cancel(id: CancelID.screenAwareActivation),
 			handleStopRecording(&state)
 		)
+
+		case let .recordingCheckpointStarted(checkpoint):
+			guard state.isRecording, state.hexSettings.saveTranscriptionHistory else { return .none }
+			guard state.activeHistoryTranscriptID == nil else { return .none }
+			let transcript = Transcript(
+				timestamp: checkpoint.createdAt,
+				text: "",
+				audioPath: checkpoint.audioURL,
+				duration: 0,
+				sourceAppBundleID: state.sourceAppBundleID,
+				sourceAppName: state.sourceAppName,
+				status: .processing,
+				recoverySessionID: checkpoint.sessionID
+			)
+			state.activeHistoryTranscriptID = transcript.id
+			let artifactsToDelete = state.$transcriptionHistory.withLock { history -> [Transcript] in
+				var artifactsToDelete: [Transcript] = []
+				history.history.insert(transcript, at: 0)
+				if let maximumEntries = state.hexSettings.maxHistoryEntries, maximumEntries > 0 {
+					while history.history.count > maximumEntries,
+						  let index = history.history.lastIndex(where: { $0.recoverySessionID == nil }) {
+						let removedTranscript = history.history.remove(at: index)
+						if !history.history.contains(where: { $0.audioPath == removedTranscript.audioPath }) {
+							artifactsToDelete.append(removedTranscript)
+						}
+					}
+				}
+				return artifactsToDelete
+			}
+			return .run { _ in
+				for transcript in artifactsToDelete {
+					try? await transcriptPersistence.deleteArtifacts(transcript)
+				}
+			}
+
+		case let .recordingCheckpointFinalized(audioURL, duration, status):
+			guard let historyID = state.activeHistoryTranscriptID else { return .none }
+			let minimumDuration = max(state.hexSettings.minimumKeyTime, 1.0)
+			if status == .cancelled, duration < minimumDuration {
+				state.$transcriptionHistory.withLock { history in
+					history.history.removeAll { $0.id == historyID }
+				}
+				state.activeHistoryTranscriptID = nil
+				return .run { [recording] _ in
+					FileManager.default.removeItemIfExists(at: audioURL)
+					await recording.releaseRecordingSource(audioURL)
+				}
+			}
+
+			state.$transcriptionHistory.withLock { history in
+				guard let index = history.history.firstIndex(where: { $0.id == historyID }) else { return }
+				history.history[index].audioPath = audioURL
+				history.history[index].duration = duration
+				history.history[index].status = status
+				// The final WAV is durable now, so this ordinary run can participate in
+				// regular retention instead of being treated as an unresolved crash recovery.
+				history.history[index].recoverySessionID = nil
+			}
+			if status != .processing {
+				state.activeHistoryTranscriptID = nil
+			}
+			return .run { [recording] _ in
+				await recording.releaseRecordingSource(audioURL)
+			}
 
       // MARK: - Transcription Results
 
@@ -1024,7 +1090,7 @@ private extension TranscriptionFeature {
 			.cancel(id: CancelID.terminalRefinementHold),
 			.cancel(id: CancelID.screenAwareActivation),
 			cancelsScreenContextCapture ? .cancel(id: CancelID.screenContextCapture) : .none,
-      .run { [sleepManagement, preventSleep = state.hexSettings.preventSystemSleep] _ in
+		.run { [sleepManagement, preventSleep = state.hexSettings.preventSystemSleep] send in
         // Play sound immediately for instant feedback
         soundEffect.play(.startRecording)
 
@@ -1037,13 +1103,15 @@ private extension TranscriptionFeature {
           }
           return
         }
-        await recording.startRecording()
+			let startResult = await recording.startRecording()
+			guard case let .started(checkpoint) = startResult, !Task.isCancelled else { return }
+			await send(.recordingCheckpointStarted(checkpoint))
       }
       .cancellable(id: CancelID.recordingStart, cancelInFlight: true)
     )
   }
 
-  func handleStopRecording(_ state: inout State) -> Effect<Action> {
+	  func handleStopRecording(_ state: inout State) -> Effect<Action> {
     state.isRecording = false
     
     let stopTime = now
@@ -1091,26 +1159,39 @@ private extension TranscriptionFeature {
       // persist it as a cancelled entry so the user can retry; otherwise discard silently
       // (covers accidental modifier-only taps).
       transcriptionFeatureLogger.notice("Short recording per decision \(String(describing: decision)); duration=\(String(format: "%.3f", duration))s")
-      let sourceAppBundleID = state.sourceAppBundleID
+	      let sourceAppBundleID = state.sourceAppBundleID
       let sourceAppName = state.sourceAppName
       let transcriptionHistory = state.$transcriptionHistory
+		  let historyCheckpointID = state.activeHistoryTranscriptID
 	      return .merge(
 	        .cancel(id: CancelID.recordingStart),
 			.cancel(id: CancelID.screenContextCapture),
-        .run { [duration, sleepManagement] _ in
+		.run { [duration, sleepManagement] send in
 			await selectedText?.cancel()
           await sleepManagement.allowSleep()
-          let stopResult = await recording.stopRecording()
-          guard !Task.isCancelled else { return }
-          guard case let .captured(url) = stopResult else { return }
-          await persistOrDiscard(
-            status: .cancelled,
-            audioURL: url,
-            duration: duration,
-            sourceAppBundleID: sourceAppBundleID,
-            sourceAppName: sourceAppName,
-            transcriptionHistory: transcriptionHistory
-          )
+		  let stopResult = await recording.stopRecording()
+		  guard !Task.isCancelled else { return }
+		  switch stopResult {
+		  case let .captured(url):
+			if historyCheckpointID != nil {
+				await send(.recordingCheckpointFinalized(url, duration, .cancelled))
+			} else {
+				await persistOrDiscard(
+					status: .cancelled,
+					audioURL: url,
+					duration: duration,
+					sourceAppBundleID: sourceAppBundleID,
+					sourceAppName: sourceAppName,
+					transcriptionHistory: transcriptionHistory
+				)
+			}
+		  case let .recovered(url, error):
+			await send(.recordingCheckpointFinalized(url, duration, .processing))
+			await send(.transcriptionAudioCaptured(url, duration))
+			await send(.transcriptionError(error, url))
+		  case .ignored, .failed:
+			return
+		  }
         }
         // Don't cancelInFlight here: a second finalize firing (rare hotkey-release + ESC
         // race) must not abort an already-running persist between recording.stopRecording()
@@ -1140,6 +1221,7 @@ private extension TranscriptionFeature {
 
     state.isPrewarming = true
 	let shouldCreateHistoryCheckpoint = state.hexSettings.saveTranscriptionHistory
+	let historyCheckpointID = state.activeHistoryTranscriptID
 	let selectedTextForCheckpoint = state.selectedTextForRefinement?.text
 	let screenContextForCheckpoint = state.screenContextForRefinement
 	let screenAwareInputSourceForCheckpoint = state.screenAwareInputSourceForRefinement
@@ -1165,8 +1247,13 @@ private extension TranscriptionFeature {
           let stopResult = await recording.stopRecording()
           let capturedURL: URL
           switch stopResult {
-          case let .captured(url):
-            capturedURL = url
+		  case let .captured(url):
+			capturedURL = url
+		  case let .recovered(url, error):
+			await send(.recordingCheckpointFinalized(url, duration, .processing))
+			await send(.transcriptionAudioCaptured(url, duration))
+			await send(.transcriptionError(error, url))
+			return
           case .ignored(.staleSession):
             transcriptionFeatureLogger.notice("Ignoring transcription stop superseded by a newer recording session")
             return
@@ -1188,7 +1275,7 @@ private extension TranscriptionFeature {
 		  // The audio file is the first durable checkpoint. It is stored before
 		  // transcription begins, so a crash, cancellation, or provider failure can
 		  // never discard the voice message that produced the run.
-		  if shouldCreateHistoryCheckpoint {
+		  if shouldCreateHistoryCheckpoint, historyCheckpointID == nil {
 			  do {
 				  let checkpoint = try await transcriptPersistence.save(.init(
 					  text: "",
@@ -1210,6 +1297,12 @@ private extension TranscriptionFeature {
 			  } catch {
 				  transcriptionFeatureLogger.error("Failed to persist audio checkpoint: \(error.localizedDescription, privacy: .private)")
 			  }
+		  }
+		  if historyCheckpointID != nil {
+			  // The row was inserted when durable PCM opened. The WAV now exists at its
+			  // predicted path, so History owns it rather than this effect's cleanup defer.
+			  unownedAudioURL = nil
+			  await send(.recordingCheckpointFinalized(capturedURL, duration, .processing))
 		  }
 
           // Synchronously plumb the captured URL + accurate duration into state so cancel

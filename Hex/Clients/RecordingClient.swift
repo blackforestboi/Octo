@@ -27,7 +27,7 @@ struct AudioInputDevice: Identifiable, Equatable {
 
 @DependencyClient
 struct RecordingClient {
-  var startRecording: @Sendable () async -> Void = {}
+  var startRecording: @Sendable () async -> RecordingStartResult = { .failed }
   var stopRecording: @Sendable () async -> RecordingStopResult = { .ignored(.noActiveRecording) }
   var requestMicrophoneAccess: @Sendable () async -> Bool = { false }
   var observeAudioLevel: @Sendable () async -> AsyncStream<Meter> = { AsyncStream { _ in } }
@@ -95,8 +95,20 @@ extension RecordingFailure: LocalizedError {
 
 enum RecordingStopResult: Equatable {
   case captured(URL)
+  case recovered(URL, RecordingFailure)
   case ignored(IgnoredRecordingStopReason)
   case failed(RecordingFailure)
+}
+
+struct RecordingCheckpoint: Equatable, Sendable {
+  let sessionID: UUID
+  let createdAt: Date
+  let audioURL: URL
+}
+
+enum RecordingStartResult: Equatable, Sendable {
+  case started(RecordingCheckpoint)
+  case failed
 }
 
 // Define function pointer types for the MediaRemote functions.
@@ -1259,7 +1271,7 @@ actor RecordingClientLive {
     }
   }
 
-  func startRecording() async {
+  func startRecording() async -> RecordingStartResult {
     let sessionID = UUID()
     recordingSessionID = sessionID
     // A pending environment-change debounce is superseded: the start path below applies
@@ -1275,7 +1287,7 @@ actor RecordingClientLive {
     await captureController.waitForPendingFinish()
     guard !Task.isCancelled, recordingSessionID == sessionID else {
       recordingLogger.notice("Ignoring recording start superseded while finalizing prior capture")
-      return
+      return .failed
     }
 
     // Handle audio behavior based on user preference
@@ -1356,7 +1368,11 @@ actor RecordingClientLive {
       recordingLogger.notice(
         "Recording started mode=\(mode.rawValue) backend=\(RecordingBackend.captureEngine.rawValue) startup=\(self.formatDuration(startedAt.timeIntervalSince(startRequestAt)))"
       )
-      return
+      return .started(.init(
+        sessionID: session.id,
+        createdAt: session.createdAt,
+        audioURL: RecordingRecoveryStore.finalAudioURL(for: session.id)
+      ))
     } catch {
       recoverySession?.abandonForRecovery()
       if let recoverySession {
@@ -1385,6 +1401,11 @@ actor RecordingClientLive {
       recordingLogger.notice(
         "Recording started mode=\(mode.rawValue) backend=\(RecordingBackend.fallbackCaptureEngine.rawValue) startup=\(self.formatDuration(startedAt.timeIntervalSince(startRequestAt)))"
       )
+      return .started(.init(
+        sessionID: session.id,
+        createdAt: session.createdAt,
+        audioURL: RecordingRecoveryStore.finalAudioURL(for: session.id)
+      ))
     } catch {
       fallbackRecoverySession?.abandonForRecovery()
       if let fallbackRecoverySession {
@@ -1393,6 +1414,7 @@ actor RecordingClientLive {
       recordingLogger.error("Failed to start durable fallback capture engine: \(error.localizedDescription)")
       clearActiveRecordingMetadata()
       endRecordingSession()
+      return .failed
     }
   }
 
@@ -1471,6 +1493,9 @@ actor RecordingClientLive {
       }
       finalizeCaptureStateAfterRecording()
       await resumeMediaIfNeeded()
+      if let recovered = captureController.recoverFailedRecording() {
+        return .recovered(recovered.audioURL, error)
+      }
       return .failed(error)
 
     case .idle:

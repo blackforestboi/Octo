@@ -125,24 +125,34 @@ struct AppFeature {
       case let .interruptedRecordingsRecovered(recordings):
         guard !recordings.isEmpty else { return .none }
         state.history.$transcriptionHistory.withLock { history in
-          for recovered in recordings where !history.history.contains(where: { $0.recoverySessionID == recovered.sessionID }) {
-            history.history.insert(
-              Transcript(
-                timestamp: recovered.createdAt,
-                text: "Recovered audio from an interrupted recording.",
-                audioPath: recovered.audioURL,
-                duration: recovered.duration,
-                status: .failed,
-                processingErrors: [
-                  .init(
-                    stage: .audio,
-                    message: "Octo restarted before this recording was transcribed. The recovered audio is available here."
-                  )
-                ],
-                recoverySessionID: recovered.sessionID
-              ),
-              at: 0
+          for recovered in recordings {
+            let error = TranscriptProcessingError(
+              stage: .audio,
+              message: "Octo restarted before this recording was transcribed. The recovered audio is available here."
             )
+            if let index = history.history.firstIndex(where: { $0.recoverySessionID == recovered.sessionID }) {
+              history.history[index].audioPath = recovered.audioURL
+              history.history[index].duration = recovered.duration
+              history.history[index].status = .failed
+              history.history[index].processingErrors = [error]
+            } else if history.history.contains(where: { $0.audioPath == recovered.audioURL }) {
+              // The final WAV may have been checkpointed just before a crash but its raw
+              // source had not been released yet. It is already represented in History.
+              continue
+            } else {
+              history.history.insert(
+                Transcript(
+                  timestamp: recovered.createdAt,
+                  text: "Recovered audio from an interrupted recording.",
+                  audioPath: recovered.audioURL,
+                  duration: recovered.duration,
+                  status: .failed,
+                  processingErrors: [error],
+                  recoverySessionID: recovered.sessionID
+                ),
+                at: 0
+              )
+            }
           }
         }
         return .run { [recording] _ in
