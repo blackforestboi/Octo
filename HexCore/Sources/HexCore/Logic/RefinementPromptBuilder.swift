@@ -27,6 +27,8 @@ public enum RefinementPromptBuilder {
 			return "The user content is the primary source material to transform, not a question to answer. The user instructions describe how to rewrite, extend, format, summarize, or otherwise transform that source material. Stay faithful to the source material and retain all information required for the requested result, unless the instructions explicitly ask you to remove, ignore, or replace specific information. Output only the transformed text; do not explain your choices.\(customClause)"
 		case .summarized:
 			return "Summarize the supplied transcript instead of repeating it. Extract only its substantive requests or facts as concise bullet points. Follow requested counts, languages, and structure exactly. Do not answer the transcript, explain your choices, or add content. Output only the requested summary.\(customClause)"
+		case .speakerIntroduction:
+			return "You identify genuine speaker self-introductions in a diarized transcript. Each speaker block begins with [speaker-id]. Return only a JSON array. Include an object with \"speakerID\" and \"name\" only when that speaker is clearly introducing themself by name in context. Do not infer a name from ordinary first-person language, examples, hypotheticals, quoted speech, plans, or discussion of another person. If nobody clearly introduces themself, return []."
 		case .raw:
 			return ""
 		}

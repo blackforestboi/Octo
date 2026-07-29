@@ -20,6 +20,8 @@ struct AppFeature {
 
   enum ActiveTab: Equatable {
     case settings
+		case speakers
+    case handoffs
     case remappings
     case history
     case about
@@ -373,6 +375,22 @@ struct AppView: View {
     NavigationSplitView(columnVisibility: $columnVisibility) {
       List(selection: $store.activeTab) {
         Button {
+          store.send(.setActiveTab(.history))
+        } label: {
+          Label("History", systemImage: "clock")
+        }
+        .buttonStyle(.plain)
+        .tag(AppFeature.ActiveTab.history)
+
+		Button {
+			store.send(.setActiveTab(.speakers))
+		} label: {
+			Label("Speakers", systemImage: "person.2")
+		}
+		.buttonStyle(.plain)
+		.tag(AppFeature.ActiveTab.speakers)
+
+        Button {
           store.send(.setActiveTab(.settings))
         } label: {
           Label("Settings", systemImage: "gearshape")
@@ -381,20 +399,20 @@ struct AppView: View {
         .tag(AppFeature.ActiveTab.settings)
 
         Button {
+          store.send(.setActiveTab(.handoffs))
+        } label: {
+          Label("Handoffs", systemImage: "arrowshape.turn.up.right")
+        }
+        .buttonStyle(.plain)
+        .tag(AppFeature.ActiveTab.handoffs)
+
+        Button {
           store.send(.setActiveTab(.remappings))
         } label: {
           Label("Transforms", systemImage: "text.badge.plus")
         }
         .buttonStyle(.plain)
         .tag(AppFeature.ActiveTab.remappings)
-
-        Button {
-          store.send(.setActiveTab(.history))
-        } label: {
-          Label("History", systemImage: "clock")
-        }
-        .buttonStyle(.plain)
-        .tag(AppFeature.ActiveTab.history)
 
         Button {
           store.send(.setActiveTab(.about))
@@ -422,6 +440,12 @@ struct AppView: View {
           inputMonitoringPermission: store.inputMonitoringPermission
         )
         .navigationTitle("Settings")
+		case .speakers:
+			SpeakersView()
+				.navigationTitle("Speakers")
+      case .handoffs:
+        HandoffsView()
+          .navigationTitle("Handoffs")
       case .remappings:
         WordRemappingsView(store: store.scope(state: \.settings, action: \.settings))
           .navigationTitle("Transforms")

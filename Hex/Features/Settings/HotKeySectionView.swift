@@ -124,6 +124,14 @@ struct HotKeySectionView: View {
                 }
             }
 
+			if hotKey.modifiers.contains(.shift) {
+				Text("Agent Handoff is unavailable because this hotkey already includes Shift.")
+					.settingsCaption()
+			} else {
+				Text("Use Shift with this hotkey to end a recording as an Agent Handoff. It creates native Codex or Claude tasks instead of pasting the transcript.")
+					.settingsCaption()
+			}
+
             HStack(spacing: 16) {
                 Label("Hotkey Sequences", systemImage: "command")
                     .font(.headline)
@@ -140,7 +148,12 @@ struct HotKeySectionView: View {
             ForEach(Array(hotKeySequences.enumerated()), id: \.offset) { _, sequence in
                 LabeledContent {
                     HStack(spacing: 6) {
-                        ForEach(Array(sequence.presses.enumerated()), id: \.offset) { _, press in
+						ForEach(Array(sequence.presses.enumerated()), id: \.offset) { index, press in
+							if index > 0, sequence.usesPlusSeparator {
+								Text("+")
+									.font(.caption.weight(.semibold))
+									.foregroundStyle(.secondary)
+							}
                             HotKeyPressPill(kind: press)
                         }
                     }
@@ -161,6 +174,11 @@ struct HotKeySectionView: View {
                 HotKeySequence(title: String(localized: "Start screen-aware transcription"), presses: [.short, .long]),
                 HotKeySequence(title: String(localized: "Finish normally"), presses: [.short]),
                 HotKeySequence(title: String(localized: "Finish with refinement"), presses: [.long]),
+				HotKeySequence(
+					title: String(localized: "Finish with rewrite prompt"),
+					presses: [.numberRange, .long],
+					usesPlusSeparator: true
+				),
             ]
         } else {
             [
@@ -175,11 +193,13 @@ struct HotKeySectionView: View {
 private struct HotKeySequence {
     let title: String
     let presses: [HotKeyPressKind]
+	var usesPlusSeparator = false
 }
 
-private enum HotKeyPressKind {
+private enum HotKeyPressKind: Equatable {
     case long
     case short
+	case numberRange
 
     var label: String {
         switch self {
@@ -187,6 +207,8 @@ private enum HotKeyPressKind {
             String(localized: "Long")
         case .short:
             String(localized: "Short")
+		case .numberRange:
+			String(localized: "1 through 9")
         }
     }
 
@@ -196,6 +218,8 @@ private enum HotKeyPressKind {
             54
         case .short:
             28
+		case .numberRange:
+			54
         }
     }
 
@@ -205,6 +229,8 @@ private enum HotKeyPressKind {
             64
         case .short:
             44
+		case .numberRange:
+			64
         }
     }
 }
@@ -215,7 +241,14 @@ private struct HotKeyPressPill: View {
 
     var body: some View {
         Group {
-            if showsLabel {
+			if case .numberRange = kind {
+				HStack(spacing: 4) {
+					Image(systemName: "keyboard")
+					Text("1–9")
+				}
+				.font(.caption.weight(.medium))
+				.foregroundStyle(.secondary)
+            } else if showsLabel {
                 Text(kind.label)
                     .font(.caption.weight(.medium))
                     .foregroundStyle(.secondary)
@@ -225,17 +258,17 @@ private struct HotKeyPressPill: View {
             }
         }
         .frame(
-            width: showsLabel ? kind.labeledWidth : kind.width,
-            height: showsLabel ? 20 : 10
+            width: showsLabel || kind == .numberRange ? kind.labeledWidth : kind.width,
+            height: showsLabel || kind == .numberRange ? 20 : 10
         )
         .background {
-            if showsLabel {
+			if showsLabel || kind == .numberRange {
                 Capsule()
                     .fill(.secondary.opacity(0.12))
             }
         }
         .overlay {
-            if showsLabel {
+			if showsLabel || kind == .numberRange {
                 Capsule()
                     .stroke(.secondary.opacity(0.22), lineWidth: 1)
             }

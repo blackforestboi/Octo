@@ -35,10 +35,14 @@ final class HexSettingsMigrationTests: XCTestCase {
 		XCTAssertEqual(decoded.refinementProvider, .apple)
 		XCTAssertTrue(decoded.hasCompletedRefinementProviderDetection)
 		XCTAssertEqual(decoded.refinementInstructions, HexSettings.defaultRefinementInstructions)
+		XCTAssertEqual(decoded.rewritePrompts.count, 1)
+		XCTAssertEqual(decoded.rewritePrompts[0].instructions, HexSettings.defaultRefinementInstructions)
 			XCTAssertNil(decoded.openRouterModelID)
 			XCTAssertNil(decoded.screenAwareOpenRouterModelID)
 			XCTAssertEqual(decoded.screenAwareInputSource, .localOCR)
 		XCTAssertTrue(decoded.includeSelectedTextInRefinement)
+		XCTAssertFalse(decoded.speakerIdentificationEnabled)
+		XCTAssertEqual(decoded.speakerDiarizationProvider, .fluidAudio)
 	}
 
 	func testEncodeDecodeRoundTripPreservesDefaults() throws {
@@ -103,9 +107,21 @@ final class HexSettingsMigrationTests: XCTestCase {
 		let decoded = try JSONDecoder().decode(HexSettings.self, from: JSONEncoder().encode(settings))
 
 		XCTAssertEqual(decoded.refinementInstructions, "Return exactly three points.")
+		XCTAssertEqual(decoded.rewritePrompts.count, 1)
+		XCTAssertEqual(decoded.rewritePrompts[0].instructions, "Return exactly three points.")
 		XCTAssertEqual(decoded.screenAwareOpenRouterModelID, "anthropic/claude-sonnet-4")
 		XCTAssertEqual(decoded.screenAwareInputSource, .image)
 		XCTAssertFalse(decoded.includeSelectedTextInRefinement)
+	}
+
+	func testLegacyInstructionsMigrateToTheDefaultRewritePrompt() throws {
+		let decoded = try JSONDecoder().decode(
+			HexSettings.self,
+			from: Data("{\"refinementInstructions\":\"Keep technical terms.\"}".utf8)
+		)
+
+		XCTAssertEqual(decoded.rewritePrompts.map(\.name), [HexSettings.defaultRewritePromptName])
+		XCTAssertEqual(decoded.rewritePrompts.map(\.instructions), ["Keep technical terms."])
 	}
 
 	func testEncodeDecodeRoundTripPreservesNormalizedDoubleTapValues() throws {

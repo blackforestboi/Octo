@@ -6,6 +6,14 @@ Hex has one recording hotkey. In double-tap lock mode, a quick second activation
 
 Without double-tap lock, a long press is normal press-and-hold transcription. A quick first tap followed by a held second activation captures screen context and forces refinement. A completed long hold followed immediately by a quick second activation requests refinement for that same transcript; if the local transcription already finished and pasted, Hex refines that completed result instead of losing the gesture. When selected-text inclusion is enabled and text is selected, either recording mode captures it and routes the result through refinement, with or without spoken audio.
 
+## Agent Handoff
+
+Start every recording with the configured hotkey. While an ordinary recording is active, use **Shift** with that hotkey as its terminating gesture to route the completed input to Agent Handoff. The handoff is not pasted or sent through the lightweight refinement path. It receives the same context as refinement: selected text is the source material, the spoken transcript is its instruction, and Screen Aware context is included. Image-mode Screen Aware attaches the screenshot; local-OCR mode passes only the OCR and metadata. Each child task discovers the user's regular configured tools, skills, plugins, MCP servers, and approval rules before executing its one bounded objective.
+
+For Codex, Octo uses an ephemeral, read-only planning run that only returns focused task packages. It writes those packages and their full input context to its local journal before creating one normal, visible Recent Chat per package and starting the agent turn against that exact thread ID. There is no visible coordinator task and Octo does not edit Codex's private sidebar/project registry. Each task starts in the user-selected Codex project folder, so it receives that project’s normal files, instructions, configuration, skills, plugins, and MCP servers rather than an empty generated workspace. If task creation or a later turn fails, the journal retains the original package and its creation state rather than losing it.
+
+The gesture is unavailable when the configured hotkey already includes Shift, because the two chords would be ambiguous. Choose or change the Codex project in Refinement settings. On the first handoff, if none is configured, Octo asks for that project folder; it does not choose a project, create a project, or write a fake Codex sidebar registry.
+
 ## Overview
 
 Hex uses a **threshold-based recording system** that behaves differently depending on whether your hotkey is **modifier-only** (e.g., Option) or **a regular hotkey** (e.g., Cmd+A).

@@ -125,6 +125,7 @@ struct SettingsFeature {
     case setRemappingScratchpadFocused(Bool)
     case setLowercaseTranscripts(Bool)
     case setRemovePunctuation(Bool)
+    case setSpeakerIdentificationEnabled(Bool)
   }
 
   @Dependency(\.keyEventMonitor) var keyEventMonitor
@@ -448,6 +449,10 @@ struct SettingsFeature {
 
       case let .setRemovePunctuation(enabled):
         state.$hexSettings.withLock { $0.removePunctuation = enabled }
+        return .none
+
+      case let .setSpeakerIdentificationEnabled(enabled):
+        state.$hexSettings.withLock { $0.speakerIdentificationEnabled = enabled }
         return .none
 
       case .startSettingPasteLastTranscriptHotkey:

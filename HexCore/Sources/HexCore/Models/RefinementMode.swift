@@ -5,4 +5,5 @@ public enum RefinementMode: String, Codable, CaseIterable, Equatable, Sendable {
 	case raw
 	case refined
 	case summarized
+	case speakerIntroduction
 }

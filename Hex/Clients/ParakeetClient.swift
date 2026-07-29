@@ -120,14 +120,19 @@ actor ParakeetClient {
     }
   }
 
-  func transcribe(_ url: URL) async throws -> String {
+  func transcribe(_ url: URL) async throws -> TranscriptionOutput {
     guard let asr else { throw NSError(domain: "Parakeet", code: -1, userInfo: [NSLocalizedDescriptionKey: "Parakeet not initialized"]) }
     let t0 = Date()
     logger.notice("Transcribing with Parakeet file=\(url.lastPathComponent)")
     var decoderState = TdtDecoderState.make(decoderLayers: await asr.decoderLayerCount)
     let result = try await asr.transcribe(url, decoderState: &decoderState)
     logger.info("Parakeet transcription finished in \(String(format: "%.2f", Date().timeIntervalSince(t0)))s")
-    return result.text
+    return .init(
+      text: result.text,
+      words: result.tokenTimings.map(buildWordTimings(from:)).map {
+        $0.map { .init(word: $0.word, startTime: $0.startTime, endTime: $0.endTime) }
+      } ?? []
+    )
   }
 
   // Delete cached Parakeet models from known locations and reset state
@@ -207,7 +212,7 @@ actor ParakeetClient {
       userInfo: [NSLocalizedDescriptionKey: "Parakeet support not linked. Add Swift Package: https://github.com/FluidInference/FluidAudio.git and link FluidAudio to Octo."]
     )
   }
-  func transcribe(_ url: URL) async throws -> String { throw NSError(domain: "Parakeet", code: -3, userInfo: [NSLocalizedDescriptionKey: "Parakeet not available"]) }
+  func transcribe(_ url: URL) async throws -> TranscriptionOutput { throw NSError(domain: "Parakeet", code: -3, userInfo: [NSLocalizedDescriptionKey: "Parakeet not available"]) }
   func deleteCaches(modelName: String) async throws {}
 }
 

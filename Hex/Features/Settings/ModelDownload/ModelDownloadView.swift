@@ -164,7 +164,7 @@ private struct NoModelChooser: View {
 			}
 		}
 		.padding(10)
-		.background(Color(NSColor.controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+		.background(Color.octoCardBackground, in: RoundedRectangle(cornerRadius: 8))
 		.overlay(
 			RoundedRectangle(cornerRadius: 8)
 				.stroke(borderColor, lineWidth: isFlashing ? 3 : 1)
@@ -294,7 +294,7 @@ private struct CurrentModelSummary: View {
 			}
 		}
 		.padding(10)
-		.background(Color(NSColor.controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+		.background(Color.octoCardBackground, in: RoundedRectangle(cornerRadius: 8))
 	}
 
 	/// The selection references a model that isn't on disk (e.g. the scan came
@@ -430,7 +430,7 @@ private struct ModelLibrarySheet: View {
 					}
 				}
 			}
-			.background(Color(NSColor.controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
+			.background(Color.octoCardBackground, in: RoundedRectangle(cornerRadius: 10))
 		}
 	}
 

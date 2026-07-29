@@ -22,7 +22,7 @@ private let parakeetLogger = HexLog.parakeet
 struct TranscriptionClient {
   /// Transcribes an audio file at the specified `URL` using the named `model`.
   /// Reports transcription progress via `progressCallback`.
-  var transcribe: @Sendable (URL, String, DecodingOptions, @escaping (Progress) -> Void) async throws -> String
+  var transcribe: @Sendable (URL, String, DecodingOptions, @escaping (Progress) -> Void) async throws -> TranscriptionOutput
 
   /// Ensures a model is downloaded (if missing) and loaded into memory, reporting progress via `progressCallback`.
   var downloadModel: @Sendable (String, @escaping (Progress) -> Void) async throws -> Void
@@ -238,7 +238,7 @@ actor TranscriptionClientLive {
     model: String,
     options: DecodingOptions,
     progressCallback: @escaping (Progress) -> Void
-  ) async throws -> String {
+  ) async throws -> TranscriptionOutput {
     let startAll = Date()
     if isParakeet(model) {
       transcriptionLogger.notice("Transcribing with Parakeet model=\(model) file=\(url.lastPathComponent)")
@@ -250,10 +250,10 @@ actor TranscriptionClientLive {
       let preparedClip = try ParakeetClipPreparer.ensureMinimumDuration(url: url, logger: parakeetLogger)
       defer { preparedClip.cleanup() }
       let startTx = Date()
-      let text = try await parakeet.transcribe(preparedClip.url)
+      let output = try await parakeet.transcribe(preparedClip.url)
       transcriptionLogger.info("Parakeet transcription took \(String(format: "%.2f", Date().timeIntervalSince(startTx)))s")
       transcriptionLogger.info("Parakeet request total elapsed \(String(format: "%.2f", Date().timeIntervalSince(startAll)))s")
-      return text
+      return output
     }
     let model = await resolveVariant(model)
     // Load or switch to the required model if needed.
@@ -285,9 +285,36 @@ actor TranscriptionClientLive {
     transcriptionLogger.info("WhisperKit transcription took \(String(format: "%.2f", Date().timeIntervalSince(startTx)))s")
     transcriptionLogger.info("WhisperKit request total elapsed \(String(format: "%.2f", Date().timeIntervalSince(startAll)))s")
 
-    // Concatenate results from all segments.
+    // Preserve provider timestamps as part of the core result. Whisper supplies
+    // segment timing without requesting its more expensive word-alignment pass;
+    // when word timings are available, use them to stitch sentence sections.
+    let segments = results.flatMap(\.segments)
+    let words = segments.flatMap { segment in
+      (segment.words ?? []).map {
+        TimedTranscriptWord(
+          word: $0.word,
+          startTime: TimeInterval($0.start),
+          endTime: TimeInterval($0.end)
+        )
+      }
+    }
+    let timestampedSections: [TimestampedTranscriptSection]
+    if words.isEmpty {
+      timestampedSections = segments.compactMap { segment in
+        let text = segment.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return nil }
+        return .init(
+          text: text,
+          startTime: TimeInterval(segment.start),
+          endTime: TimeInterval(segment.end)
+        )
+      }
+    } else {
+      timestampedSections = TimestampedTranscriptSectionBuilder.sections(from: words)
+    }
+
     let text = results.map(\.text).joined(separator: " ")
-    return text
+    return .init(text: text, words: words, timestampedSections: timestampedSections)
   }
 
   // MARK: - Private Helpers

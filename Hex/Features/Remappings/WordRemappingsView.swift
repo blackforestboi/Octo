@@ -56,7 +56,7 @@ struct WordRemappingsView: View {
 							.frame(maxWidth: .infinity, minHeight: 22, alignment: .leading)
 							.padding(.horizontal, 8)
 							.padding(.vertical, 5)
-							.background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 6))
+							.background(Color.octoCardBackground, in: RoundedRectangle(cornerRadius: 6))
 					}
 				}
 				.padding(.vertical, 4)

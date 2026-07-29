@@ -18,7 +18,8 @@ struct TranscriptionIndicatorView: View {
 		case recording
 		case screenAware
 		case transcribing
-		case refining
+		case refining(String?)
+		case handoff(String, isReady: Bool)
 		case prewarming
 		case completedTranscript(String)
 		case copied(String)
@@ -34,7 +35,7 @@ struct TranscriptionIndicatorView: View {
 
 		var showsProcessing: Bool {
 			switch self {
-			case .transcribing, .refining, .prewarming: true
+		case .transcribing, .refining, .handoff(_, isReady: false), .prewarming: true
 			default: false
 			}
 		}
@@ -59,11 +60,34 @@ struct TranscriptionIndicatorView: View {
 		}
 	}
 
+	private enum RecordingCapability: Hashable {
+		case speakerIdentification
+		case systemAudio
+
+		var systemImage: String {
+			switch self {
+			case .speakerIdentification: "person.2.wave.2"
+			case .systemAudio: "speaker.wave.2"
+			}
+		}
+
+		var label: String {
+			switch self {
+			case .speakerIdentification: "Speaker identification"
+			case .systemAudio: "System audio"
+			}
+		}
+	}
+
 	var status: Status
 	var meter: Meter
 	var size: IndicatorSize
+	var isSpeakerIdentificationActive = false
+	var isSystemAudioActive = false
 	var availableSize: CGSize = .zero
 	var onOpenHistory: () -> Void = {}
+	var onOpenAgentHandoff: () -> Void = {}
+	var onDismissAgentHandoff: () -> Void = {}
 	var onCopyCompletedTranscript: () -> Void = {}
 	var onDismissCompletedTranscript: () -> Void = {}
 	var onCardSizeChange: (CGSize?) -> Void = { _ in }
@@ -82,6 +106,26 @@ struct TranscriptionIndicatorView: View {
 	}
 	private var hiddenScale: CGFloat { status == .hidden ? 0.8 : 1 }
 	private var isScreenAware: Bool { status == .screenAware }
+	private var activeRecordingCapabilities: [RecordingCapability] {
+		guard status.showsWaveform else { return [] }
+		var capabilities: [RecordingCapability] = []
+		if isSpeakerIdentificationActive {
+			capabilities.append(.speakerIdentification)
+		}
+		if isSystemAudioActive {
+			capabilities.append(.systemAudio)
+		}
+		return capabilities
+	}
+	private var capabilityIconSize: CGFloat { metrics.height * 0.42 }
+	private var capabilityIconSpacing: CGFloat { 4 }
+	private var capabilityWaveformSpacing: CGFloat { 6 }
+	private var capabilityIndicatorWidth: CGFloat {
+		guard !activeRecordingCapabilities.isEmpty else { return 0 }
+		return CGFloat(activeRecordingCapabilities.count) * capabilityIconSize
+			+ CGFloat(activeRecordingCapabilities.count - 1) * capabilityIconSpacing
+			+ capabilityWaveformSpacing
+	}
 	private var pillCornerRadius: CGFloat { metrics.height * 0.28 }
 	private var expandedCardCornerRadius: CGFloat { max(12, pillCornerRadius) }
 	private var cardCornerRadius: CGFloat {
@@ -90,7 +134,7 @@ struct TranscriptionIndicatorView: View {
 	}
 	private var opensHistoryWhenTapped: Bool {
 		switch status {
-		case .hidden, .completedTranscript, .copied, .hidingCopied:
+		case .hidden, .handoff(_, _), .completedTranscript, .copied, .hidingCopied:
 			false
 		default:
 			true
@@ -105,10 +149,15 @@ struct TranscriptionIndicatorView: View {
 			recordingPillSize.width
 		case .screenAware:
 			// The added room reveals older waveform samples instead of resetting them.
-			metrics.waveformWidth + 58
-		case .transcribing, .refining, .prewarming:
+			// Capability indicators add separate room rather than shrinking the waveform.
+			metrics.waveformWidth + 58 + capabilityIndicatorWidth
+		case .transcribing, .prewarming:
 			// Loading is a continuation of recording, so retain the recording pill's width.
 			recordingPillSize.width
+		case let .refining(promptName):
+			loadingPillWidth(for: refinementLabel(promptName))
+		case let .handoff(label, _):
+			loadingPillWidth(for: label)
 		case let .completedTranscript(text):
 			expandedSize(for: text).width
 		case .copied, .hidingCopied:
@@ -160,35 +209,51 @@ struct TranscriptionIndicatorView: View {
 		return min(maximum, max(minimum, ceil(textBounds.height) + 28))
 	}
 
-	private var waveformWidth: CGFloat {
-		metrics.waveformWidth + (isScreenAware ? 24 : 0)
-	}
+	private var waveformWidth: CGFloat { metrics.waveformWidth + (isScreenAware ? 24 : 0) }
 
 	/// The copied confirmation reuses the exact recording-pill geometry.
 	private var recordingPillSize: CGSize {
-		.init(width: metrics.waveformWidth + 20, height: metrics.height)
+		.init(width: metrics.waveformWidth + 20 + capabilityIndicatorWidth, height: metrics.height)
+	}
+
+	private func refinementLabel(_ promptName: String?) -> String {
+		guard let promptName, !promptName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+			return "Refining"
+		}
+		return "Rewrite · \(promptName)"
+	}
+
+	private func loadingPillWidth(for label: String) -> CGFloat {
+		let font = NSFont.systemFont(ofSize: max(10, metrics.height * 0.38), weight: .semibold)
+		let labelWidth = (label as NSString).size(withAttributes: [.font: font]).width
+		return max(recordingPillSize.width, labelWidth + 72)
 	}
 
 	private var accessibilityLabel: String {
-		switch status {
+		let statusLabel = switch status {
 		case .hidden: "Dictation inactive"
 		case .optionKeyPressed: "Dictation hotkey pressed"
 		case .recording: "Recording"
 		case .screenAware: "Screen aware recording"
 		case .transcribing: "Transcribing"
-		case .refining: "Refining"
+		case let .refining(promptName): refinementLabel(promptName)
+		case let .handoff(label, _): "Agent handoff: \(label)"
 		case .prewarming: "Model prewarming"
 		case .completedTranscript: "Transcript ready to copy"
 		case .copied: "Transcript copied"
 		case .hidingCopied: "Transcript copied"
 		case let .error(message): "Error: \(message)"
 		}
+		guard status.showsWaveform, !activeRecordingCapabilities.isEmpty else { return statusLabel }
+		return "\(statusLabel), \(activeRecordingCapabilities.map(\.label).joined(separator: ", "))"
 	}
 
 	@ViewBuilder
 	var body: some View {
-		if opensHistoryWhenTapped {
+	if opensHistoryWhenTapped {
 			indicatorBody.onTapGesture(perform: onOpenHistory)
+		} else if case let .handoff(_, isReady) = status, isReady {
+			indicatorBody.onTapGesture(perform: onOpenAgentHandoff)
 		} else {
 			indicatorBody
 		}
@@ -253,20 +318,53 @@ struct TranscriptionIndicatorView: View {
 	@ViewBuilder
 	private var content: some View {
 		if status.showsWaveform {
-			HStack(spacing: isScreenAware ? 6 : 0) {
+			HStack(spacing: 0) {
+				if !activeRecordingCapabilities.isEmpty {
+					HStack(spacing: capabilityIconSpacing) {
+						ForEach(activeRecordingCapabilities, id: \.self) { capability in
+							Image(systemName: capability.systemImage)
+								.font(.system(size: capabilityIconSize, weight: .semibold))
+								.foregroundStyle(.white)
+								.frame(width: capabilityIconSize)
+								.help(capability.label)
+								.accessibilityHidden(true)
+						}
+					}
+					.frame(width: capabilityIndicatorWidth - capabilityWaveformSpacing)
+					.padding(.trailing, capabilityWaveformSpacing)
+				}
+
 				if isScreenAware {
 					Image(systemName: "rectangle.inset.filled")
-						.font(.system(size: metrics.height * 0.42, weight: .semibold))
+						.font(.system(size: capabilityIconSize, weight: .semibold))
 						.foregroundStyle(.white)
+						.padding(.trailing, capabilityWaveformSpacing)
 						.help("Screen aware")
+						.accessibilityHidden(true)
 				}
 
 				PillWaveform(samples: waveformSamples)
 					.frame(width: waveformWidth, height: metrics.height - 8)
 			}
 			.padding(.horizontal, 10)
-		} else if status == .refining {
-			LoadingWave(label: "Refining", width: metrics.waveformWidth, height: metrics.height)
+		} else if case let .refining(promptName) = status {
+			LoadingWave(
+				label: refinementLabel(promptName),
+				width: indicatorWidth - 20,
+				height: metrics.height
+			)
+		} else if case let .handoff(label, isReady) = status {
+			if isReady {
+				Label(label, systemImage: "checkmark")
+					.font(.system(size: max(10, metrics.height * 0.38), weight: .semibold))
+					.foregroundStyle(.white)
+			} else {
+				LoadingWave(
+					label: label,
+					width: indicatorWidth - 20,
+					height: metrics.height
+				)
+			}
 		} else if status.showsProcessing {
 			LoadingWave(label: "Processing", width: metrics.waveformWidth, height: metrics.height)
 		} else if case let .completedTranscript(text) = status {
@@ -467,10 +565,12 @@ struct TranscriptionIndicatorOverlayView: View {
 			}
 		} else if let error = store.error {
 			return .error(error)
+		} else if let handoff = store.agentHandoffPresentation {
+			return .handoff(handoff.label, isReady: handoff.isReady)
 		} else if store.isScreenAwareModeActive {
 			return .screenAware
 		} else if store.isRefining || (store.isTranscribing && store.forcedRefinementMode != nil) {
-			return .refining
+			return .refining(store.rewritePromptForRefinement?.name)
 		} else if store.isTranscribing {
 			return .transcribing
 		} else if store.isRecording {
@@ -488,7 +588,11 @@ struct TranscriptionIndicatorOverlayView: View {
 			status: indicatorStatus,
 			meter: indicatorStatus.showsWaveform ? store.meter : .init(averagePower: 0, peakPower: 0),
 			size: hexSettings.indicatorSize,
+			isSpeakerIdentificationActive: store.activeSpeakerIdentificationEnabled,
+			isSystemAudioActive: store.activeSystemAudioEnabled,
 			onOpenHistory: onOpenHistory,
+			onOpenAgentHandoff: { store.send(.openAgentHandoff) },
+			onDismissAgentHandoff: { store.send(.dismissAgentHandoff) },
 			onCopyCompletedTranscript: { store.send(.copyCompletedTranscript) },
 			onDismissCompletedTranscript: { store.send(.dismissCompletedTranscript) },
 			onCardSizeChange: { size in
@@ -512,7 +616,11 @@ struct TranscriptionIndicatorOverlayView: View {
 #Preview("Transcription Indicator") {
 	VStack(spacing: 16) {
 		TranscriptionIndicatorView(status: .recording, meter: .init(averagePower: 0.5, peakPower: 0.75), size: .regular)
+		TranscriptionIndicatorView(status: .recording, meter: .init(averagePower: 0.5, peakPower: 0.75), size: .regular, isSpeakerIdentificationActive: true)
+		TranscriptionIndicatorView(status: .recording, meter: .init(averagePower: 0.5, peakPower: 0.75), size: .regular, isSystemAudioActive: true)
+		TranscriptionIndicatorView(status: .recording, meter: .init(averagePower: 0.5, peakPower: 0.75), size: .regular, isSpeakerIdentificationActive: true, isSystemAudioActive: true)
 		TranscriptionIndicatorView(status: .screenAware, meter: .init(averagePower: 0.5, peakPower: 0.75), size: .regular)
+		TranscriptionIndicatorView(status: .screenAware, meter: .init(averagePower: 0.5, peakPower: 0.75), size: .regular, isSpeakerIdentificationActive: true, isSystemAudioActive: true)
 		TranscriptionIndicatorView(status: .transcribing, meter: .init(averagePower: 0, peakPower: 0), size: .regular)
 	}
 	.padding(40)

@@ -14,8 +14,10 @@ struct HexApp: App {
     var body: some Scene {
         MenuBarExtra {
             MenuBarCopyLastTranscriptButton()
-            MenuBarRefineSelectedTextButton()
-            MenuBarRefinementModelPicker()
+			MenuBarRefineSelectedTextButton()
+			MenuBarRefinementModelPicker()
+			MenuBarSpeakerIdentificationToggle()
+			MenuBarSystemAudioToggle()
 
             Button("History") {
                 appDelegate.presentHistoryView()
@@ -25,7 +27,9 @@ struct HexApp: App {
                 appDelegate.presentSettingsView()
             }.keyboardShortcut(",")
 
-            CheckForUpdatesView()
+			CheckForUpdatesView()
+
+			MenuBarRecentHandoffs()
 			
 			Divider()
 			

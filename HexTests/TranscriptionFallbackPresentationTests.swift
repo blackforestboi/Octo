@@ -104,6 +104,20 @@ final class TranscriptionFallbackPresentationTests: XCTestCase {
 		}
 		await store.finish()
 	}
+
+	func testEscapeDismissesReadyAgentHandoff() async {
+		var state = TranscriptionFeature.State()
+		state.agentHandoffPresentation = .init(label: "Tasks created", isReady: true)
+		let store = TestStore(initialState: state) {
+			TranscriptionFeature()
+		}
+
+		await store.send(.cancel)
+		await store.receive(\.dismissAgentHandoff) {
+			$0.agentHandoffPresentation = nil
+		}
+		await store.finish()
+	}
 }
 
 private actor ClipboardProbe {

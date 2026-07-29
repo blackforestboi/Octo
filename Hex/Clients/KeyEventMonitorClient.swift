@@ -31,22 +31,31 @@ public extension KeyEvent {
   init(cgEvent: CGEvent, type: CGEventType, isFnPressed: Bool) {
     let keyCode = Int(cgEvent.getIntegerValueField(.keyboardEventKeycode))
     // Accessing keyboard layout / input source via Sauce must be on main thread.
-    let key: Key?
-    if cgEvent.type == .keyDown {
+    let physicalKey: Key?
+    let phase: KeyEventPhase
+    switch type {
+    case .keyDown, .keyUp:
       if Thread.isMainThread {
-        key = Sauce.shared.key(for: keyCode)
+        physicalKey = Sauce.shared.key(for: keyCode)
       } else {
-        key = DispatchQueue.main.sync { Sauce.shared.key(for: keyCode) }
+        physicalKey = DispatchQueue.main.sync { Sauce.shared.key(for: keyCode) }
       }
-    } else {
-      key = nil
+      phase = type == .keyDown ? .keyDown : .keyUp
+    default:
+      physicalKey = nil
+      phase = .other
     }
 
     var modifiers = Modifiers.from(carbonFlags: cgEvent.flags)
     if !isFnPressed {
       modifiers = modifiers.removing(kind: .fn)
     }
-    self.init(key: key, modifiers: modifiers)
+    self.init(
+      key: phase == .keyDown ? physicalKey : nil,
+      modifiers: modifiers,
+      physicalKey: physicalKey,
+      phase: phase
+    )
   }
 }
 
@@ -57,6 +66,8 @@ struct KeyEventMonitorClient {
   }
   var handleKeyEvent: @Sendable (@Sendable @escaping (KeyEvent) -> Bool) -> KeyEventMonitorToken = { _ in .noop }
   var handleInputEvent: @Sendable (@Sendable @escaping (InputEvent) -> Bool) -> KeyEventMonitorToken = { _ in .noop }
+  /// Replays a deliberately delayed key press to the focused app.
+  var replayKeyPress: @Sendable (Key) -> Void = { _ in }
   var startMonitoring: @Sendable () async -> Void = {}
   var stopMonitoring: @Sendable () -> Void = {}
 }
@@ -73,6 +84,9 @@ extension KeyEventMonitorClient: DependencyKey {
       },
       handleInputEvent: { handler in
         live.handleInputEvent(handler)
+      },
+      replayKeyPress: { key in
+        live.replayKeyPress(key)
       },
       startMonitoring: {
         live.startMonitoring()
@@ -92,6 +106,7 @@ extension DependencyValues {
 }
 
 class KeyEventMonitorClientLive {
+	private static let replayEventUserData: Int64 = 0x4F_4354_4F
   private var eventTapPort: CFMachPort?
   private var runLoopSource: CFRunLoopSource?
   private var continuations: [UUID: @Sendable (KeyEvent) -> Bool] = [:]
@@ -238,6 +253,21 @@ class KeyEventMonitorClientLive {
 
     return KeyEventMonitorToken { [weak self] in
       self?.removeInputContinuation(uuid: uuid)
+    }
+  }
+
+  func replayKeyPress(_ key: Key) {
+    // A short number tap is held back while we determine whether it becomes a
+    // rewrite shortcut. Re-inject it after key-up so the foreground app sees
+    // the same ordinary tap, without our event tap handling it a second time.
+    DispatchQueue.main.async {
+      let source = CGEventSource(stateID: .combinedSessionState)
+      let keyCode = Sauce.shared.keyCode(for: key)
+      for isDown in [true, false] {
+        guard let event = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: isDown) else { continue }
+        event.setIntegerValueField(.eventSourceUserData, value: Self.replayEventUserData)
+        event.post(tap: .cghidEventTap)
+      }
     }
   }
 
@@ -414,6 +444,10 @@ class KeyEventMonitorClientLive {
             return Unmanaged.passUnretained(cgEvent)
           }
 
+          if cgEvent.getIntegerValueField(.eventSourceUserData) == KeyEventMonitorClientLive.replayEventUserData {
+            return Unmanaged.passUnretained(cgEvent)
+          }
+
           // An event arriving at the tap is authoritative proof the underlying permission is
           // granted. Never drop delivered events because a cached permission check went
           // stale (#250) — that turned recoverable TCC hiccups into dead hotkeys.
@@ -429,6 +463,16 @@ class KeyEventMonitorClientLive {
           let keyEvent = KeyEvent(cgEvent: cgEvent, type: type, isFnPressed: hotKeyClientLive.isFnPressed)
           let handledByKeyHandler = hotKeyClientLive.processKeyEvent(keyEvent)
           let handledByInputHandler = hotKeyClientLive.processInputEvent(.keyboard(keyEvent))
+
+          // Shift may select a hotkey gesture, but must still reach the focused app.
+          // Deliver it to Octo first, then force its modifier event to pass through.
+          let keyCode = Int(cgEvent.getIntegerValueField(.keyboardEventKeycode))
+          let isShiftModifierEvent = type == .flagsChanged
+            && (keyCode == kVK_Shift || keyCode == kVK_RightShift)
+
+          if isShiftModifierEvent {
+            return Unmanaged.passUnretained(cgEvent)
+          }
 
           return (handledByKeyHandler || handledByInputHandler) ? nil : Unmanaged.passUnretained(cgEvent)
         },

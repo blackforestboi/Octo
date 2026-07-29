@@ -10,10 +10,69 @@ import CoreGraphics
 import Foundation
 import HexCore
 import Inject
+import Sauce
 import SwiftUI
 import WhisperKit
 
 private let transcriptionFeatureLogger = HexLog.transcription
+
+/// Tracks a held number while the global event tap decides whether it is ordinary
+/// input or a rewrite-prompt shortcut. Access is synchronized because the timer
+/// task and the event-tap callback can complete at nearly the same instant.
+private final class RewritePromptHold: @unchecked Sendable {
+	let key: Key
+	private let lock = NSLock()
+	private var didTrigger = false
+
+	init(key: Key) {
+		self.key = key
+	}
+
+	func markTriggered() {
+		lock.lock()
+		didTrigger = true
+		lock.unlock()
+	}
+
+	func hasTriggered() -> Bool {
+		lock.lock()
+		defer { lock.unlock() }
+		return didTrigger
+	}
+}
+
+private final class RewritePromptHoldTracker: @unchecked Sendable {
+	private let lock = NSLock()
+	private var active: (hold: RewritePromptHold, task: Task<Void, Never>)?
+
+	func hasTriggered() -> Bool {
+		lock.lock()
+		defer { lock.unlock() }
+		return active?.hold.hasTriggered() == true
+	}
+
+	func matches(_ key: Key) -> Bool {
+		lock.lock()
+		defer { lock.unlock() }
+		return active?.hold.key == key
+	}
+
+	func replace(with hold: RewritePromptHold, task: Task<Void, Never>) {
+		lock.lock()
+		let previous = active
+		active = (hold, task)
+		lock.unlock()
+		previous?.task.cancel()
+	}
+
+	func take(for key: Key?) -> (hold: RewritePromptHold, task: Task<Void, Never>)? {
+		lock.lock()
+		defer { lock.unlock() }
+		guard let key, let active, active.hold.key == key else { return nil }
+		self.active = nil
+		return active
+	}
+}
 
 enum ScreenAwareActivation {
 	static let minimumHoldDuration: TimeInterval = 0.75
@@ -71,6 +130,57 @@ enum ScreenAwareActivation {
 	}
 }
 
+private func rewritePromptNumber(for key: Key?) -> Int? {
+	guard let key else { return nil }
+	switch key {
+	case .one: return 1
+	case .two: return 2
+	case .three: return 3
+	case .four: return 4
+	case .five: return 5
+	case .six: return 6
+	case .seven: return 7
+	case .eight: return 8
+	case .nine: return 9
+	default: return nil
+	}
+}
+
+/// A Shift-modified terminal hotkey routes the active ordinary recording to Agent Handoff.
+/// A configured hotkey that already includes Shift has no unambiguous handoff ending gesture.
+private enum AgentHandoffEndingGesture {
+	case none
+	case consume
+	case finish
+}
+
+private func agentHandoffEndingGesture(
+	for event: KeyEvent,
+	hotkey: HotKey,
+	processorState: HotKeyProcessor.State
+) -> AgentHandoffEndingGesture {
+	guard !hotkey.modifiers.contains(.shift) else { return .none }
+
+	let shiftedModifiers = hotkey.modifiers.union([.shift])
+	switch processorState {
+	case .pressAndHold:
+		return event.modifiers.matchesExactly(shiftedModifiers) ? .finish : .none
+
+	case .doubleTapLock, .endingHold:
+		// A locked recording may receive Shift before the configured hotkey. Keep
+		// those in-progress chord events out of the ordinary processor so they do
+		// not mark it dirty before the terminating hotkey arrives.
+		guard event.modifiers.contains(.shift), event.modifiers.isSubset(of: shiftedModifiers) else {
+			return .none
+		}
+		guard event.modifiers.matchesExactly(shiftedModifiers) else { return .consume }
+		return hotkey.key == nil || event.key == hotkey.key ? .finish : .consume
+
+	case .idle, .pendingPressAndHold:
+		return .none
+	}
+}
+
 @Reducer
 struct TranscriptionFeature {
   enum RecordingSource: Equatable {
@@ -90,12 +200,37 @@ struct TranscriptionFeature {
 		let duration: TimeInterval
 	}
 
+	struct TranscribedAudioChannel: Equatable, Sendable {
+		let source: TranscriptAudioSource
+		let audioURL: URL
+		let duration: TimeInterval
+		let startOffset: TimeInterval
+		let output: TranscriptionOutput
+	}
+
+	struct ProcessedAudioChannel: Equatable {
+		let source: TranscriptAudioSource
+		let audioURL: URL
+		let duration: TimeInterval
+		let startOffset: TimeInterval
+		let text: String
+		let timestampedSections: [TimestampedTranscriptSection]?
+		let speakerSegments: [SpeakerAttributedSegment]?
+		let displaySections: [TimestampedTranscriptSection]
+	}
+
 	/// A completed local transcription that is waiting for the parallel selected-text
 	/// lookup. Keeping it in the reducer avoids pasting raw text before a detected
 	/// selection can force the downstream refinement step.
 	struct PendingSelectedTextTranscription: Equatable {
-		let text: String
-		let audioURL: URL
+		let channels: [TranscribedAudioChannel]
+		let microphoneAudioURL: URL
+	}
+
+	struct AgentHandoffPresentation: Equatable {
+		var label: String
+		var threads: [AgentHandoffThread] = []
+		var isReady = false
 	}
 
   @ObservableState
@@ -126,18 +261,29 @@ struct TranscriptionFeature {
 			var screenContextCaptureErrorMessage: String?
 			var pendingScreenAwareTranscription: PendingScreenAwareTranscription?
 			var pendingSelectedTextTranscription: PendingSelectedTextTranscription?
-    var isPrewarming: Bool = false
+		var isPrewarming: Bool = false
 		var forcedRefinementMode: RefinementMode?
+		/// Captured at the finish gesture so settings edits cannot change an in-flight rewrite.
+		var rewritePromptForRefinement: RewritePrompt?
 		var completedTranscriptPresentation: CompletedTranscriptPresentation?
 		/// The most recent ordinary result remains eligible for the quick
 		/// post-hold refinement gesture even after it has been pasted.
 		var recentCompletedTranscript: RecentCompletedTranscript?
+		var agentHandoffPresentation: AgentHandoffPresentation?
+		/// Set only by the Shift-modified ending gesture for the active ordinary recording.
+		var isAgentHandoffRequestedForActiveRecording = false
 		var postHocRefinement: RecentCompletedTranscript?
 		var pendingPressAndHoldActivationID: UUID?
 		var pendingTerminalRefinementID: UUID?
 		var activeRecordingHotkey: HotKey?
 		var activeMinimumKeyTime: Double?
 		var activeRecordingSource: RecordingSource?
+		/// Snapshotted when recording begins so toggling the menu-bar control only
+		/// affects later recordings, never an in-flight transcription.
+		var activeSpeakerIdentificationEnabled = false
+		/// Captured at recording start for the same in-flight consistency guarantee as speaker ID.
+		var activeSystemAudioEnabled = false
+		var activeSystemAudioStartOffset: TimeInterval = 0
 	var error: String?
 	var recordingStartTime: Date?
 	var outputGenerationStartTime: Date?
@@ -175,6 +321,8 @@ struct TranscriptionFeature {
 			case refinedHotKeyPressed
 			case screenAwareModeActivated
 				case finishRecordingWithRefinement
+				case finishRecordingWithAgentHandoff
+				case finishRecordingWithRewritePrompt(Int)
 				case refineMostRecentTranscription
 				case recentTranscriptRefined(UUID, String)
 				case recentTranscriptRefinementFailed(UUID, String)
@@ -203,14 +351,21 @@ struct TranscriptionFeature {
 		case hotKeyDiscarded(RecordingSource)
 
     // Transcription result flow
-    case transcriptionAudioCaptured(URL, TimeInterval)
-		case transcriptionCheckpointPersisted(Transcript)
-    case transcriptionResult(String, URL)
+	case transcriptionAudioCaptured(URL, TimeInterval)
+	case systemAudioCaptureStarted(Date)
+	case systemAudioCaptured(URL, TimeInterval, startOffset: TimeInterval)
+	case transcriptionCheckpointPersisted(Transcript)
+	case transcriptionResult([TranscribedAudioChannel], microphoneAudioURL: URL)
 	case refinementResult(String, URL, TimeInterval)
     case transcriptionError(Error, URL?)
 	case showError(String)
 	case dismissError
 	case pasteCompletedTranscript(String)
+	case launchAgentHandoff(AgentHandoffRequest)
+	case agentHandoffEvent(AgentHandoffEvent)
+	case agentHandoffFailed(String)
+	case openAgentHandoff
+	case dismissAgentHandoff
 	case showCompletedTranscript(String)
 	case copyCompletedTranscript
 	case dismissCompletedTranscript
@@ -232,6 +387,7 @@ struct TranscriptionFeature {
     case recordingFinalize
     case transcription
 		case postHocRefinement
+	case agentHandoff
 		case selectedTextOnlyRefinement
 		case selectedTextRefinement
 		case errorPresentation
@@ -244,7 +400,10 @@ struct TranscriptionFeature {
   }
 
   @Dependency(\.transcription) var transcription
-  @Dependency(\.recording) var recording
+	@Dependency(\.speakerDiarization) var speakerDiarization
+	@Dependency(\.speakerIntroduction) var speakerIntroduction
+	@Dependency(\.recording) var recording
+	@Dependency(\.systemAudioCapture) var systemAudioCapture
   @Dependency(\.pasteboard) var pasteboard
   @Dependency(\.keyEventMonitor) var keyEventMonitor
   @Dependency(\.soundEffects) var soundEffect
@@ -255,6 +414,7 @@ struct TranscriptionFeature {
   @Dependency(\.transcriptPersistence) var transcriptPersistence
 	@Dependency(\.refinement) var refinement
 	@Dependency(\.screenCapture) var screenCapture
+	@Dependency(\.agentHandoff) var agentHandoff
 
   var body: some ReducerOf<Self> {
     Reduce { state, action in
@@ -461,6 +621,29 @@ struct TranscriptionFeature {
 						.send(.stopRecording)
 					)
 
+				case .finishRecordingWithAgentHandoff:
+					guard state.isRecording, state.activeRecordingSource == .regular else { return .none }
+					state.pendingTerminalRefinementID = nil
+					state.isAgentHandoffRequestedForActiveRecording = true
+					return .merge(
+						.cancel(id: CancelID.terminalRefinementHold),
+						.cancel(id: CancelID.screenAwareActivation),
+						.send(.stopRecording)
+					)
+
+				case let .finishRecordingWithRewritePrompt(promptNumber):
+					guard state.isRecording,
+						state.activeRecordingSource == .regular,
+						let prompt = state.hexSettings.rewritePrompt(at: promptNumber)
+					else { return .none }
+					state.pendingTerminalRefinementID = nil
+					state.forcedRefinementMode = .refined
+					state.rewritePromptForRefinement = prompt
+					return .merge(
+						.cancel(id: CancelID.terminalRefinementHold),
+						.send(.stopRecording)
+					)
+
 				case .refineMostRecentTranscription:
 					// If decoding is still underway, mark that active session for refinement.
 					// Otherwise refine the just-completed, already-pasted result retained below.
@@ -624,7 +807,7 @@ struct TranscriptionFeature {
 				state.refinedHotKeyReleasedWhileCapturingSelection = false
 				guard let pending = state.pendingSelectedTextTranscription else { return .none }
 				state.pendingSelectedTextTranscription = nil
-				return .send(.transcriptionResult(pending.text, pending.audioURL))
+				return .send(.transcriptionResult(pending.channels, microphoneAudioURL: pending.microphoneAudioURL))
 
 			case let .selectedTextCaptured(selectedText):
 				state.isCapturingSelectedTextForRefinement = false
@@ -634,7 +817,7 @@ struct TranscriptionFeature {
 					state.forcedRefinementMode = .refined
 					if let pending = state.pendingSelectedTextTranscription {
 						state.pendingSelectedTextTranscription = nil
-						return .send(.transcriptionResult(pending.text, pending.audioURL))
+						return .send(.transcriptionResult(pending.channels, microphoneAudioURL: pending.microphoneAudioURL))
 					}
 					return .none
 				}
@@ -716,6 +899,13 @@ struct TranscriptionFeature {
 				sourceAppBundleID: state.sourceAppBundleID,
 				sourceAppName: state.sourceAppName,
 				status: .processing,
+				audioChannels: [
+					.init(
+						source: .microphone,
+						audioPath: checkpoint.audioURL,
+						duration: 0
+					)
+				],
 				recoverySessionID: checkpoint.sessionID
 			)
 			state.activeHistoryTranscriptID = transcript.id
@@ -757,6 +947,10 @@ struct TranscriptionFeature {
 				guard let index = history.history.firstIndex(where: { $0.id == historyID }) else { return }
 				history.history[index].audioPath = audioURL
 				history.history[index].duration = duration
+				if let channelIndex = history.history[index].audioChannels?.firstIndex(where: { $0.source == .microphone }) {
+					history.history[index].audioChannels?[channelIndex].audioPath = audioURL
+					history.history[index].audioChannels?[channelIndex].duration = duration
+				}
 				history.history[index].status = status
 				// The final WAV is durable now, so this ordinary run can participate in
 				// regular retention instead of being treated as an unresolved crash recovery.
@@ -775,6 +969,33 @@ struct TranscriptionFeature {
         state.activeTranscriptionAudioURL = audioURL
         state.activeTranscriptionDuration = duration
         return .none
+
+		case let .systemAudioCaptureStarted(startedAt):
+			state.activeSystemAudioStartOffset = max(
+				0,
+				state.recordingStartTime.map { startedAt.timeIntervalSince($0) } ?? 0
+			)
+			return .none
+
+		case let .systemAudioCaptured(audioURL, duration, startOffset):
+			guard let historyID = state.activeHistoryTranscriptID else { return .none }
+			state.$transcriptionHistory.withLock { history in
+				guard let index = history.history.firstIndex(where: { $0.id == historyID }) else { return }
+				var channels = history.history[index].audioChannels ?? [
+					.init(
+						source: .microphone,
+						audioPath: history.history[index].audioPath,
+						duration: history.history[index].duration,
+						text: history.history[index].rawText ?? history.history[index].text,
+						timestampedSections: history.history[index].timestampedSections,
+						speakerSegments: history.history[index].speakerSegments
+					)
+				]
+				channels.removeAll { $0.source == .systemAudio }
+				channels.append(.init(source: .systemAudio, audioPath: audioURL, duration: duration, startOffset: startOffset))
+				history.history[index].audioChannels = channels
+			}
+			return .none
 
 		case let .transcriptionCheckpointPersisted(transcript):
 			state.activeHistoryTranscriptID = transcript.id
@@ -802,8 +1023,8 @@ struct TranscriptionFeature {
 				await recording.releaseRecordingSource(transcript.audioPath)
 			}
 
-      case let .transcriptionResult(result, audioURL):
-        return handleTranscriptionResult(&state, result: result, audioURL: audioURL)
+	  case let .transcriptionResult(channels, microphoneAudioURL):
+		return handleTranscriptionResult(&state, channels: channels, microphoneAudioURL: microphoneAudioURL)
 
 	  case let .refinementResult(result, audioURL, duration):
 		return handleRefinementResult(&state, result: result, audioURL: audioURL, duration: duration)
@@ -832,6 +1053,61 @@ struct TranscriptionFeature {
 		case .dismissError:
 			state.error = nil
 			return .cancel(id: CancelID.errorPresentation)
+
+		case let .launchAgentHandoff(request):
+			state.agentHandoffPresentation = .init(label: "Preparing agent handoff")
+			return .run { [agentHandoff] send in
+				do {
+					for try await event in agentHandoff.launch(request) {
+						await send(.agentHandoffEvent(event))
+					}
+				} catch is CancellationError {
+					return
+				} catch {
+					await send(.agentHandoffFailed(error.localizedDescription))
+				}
+			}
+			.cancellable(id: CancelID.agentHandoff, cancelInFlight: true)
+
+		case let .agentHandoffEvent(event):
+			guard var presentation = state.agentHandoffPresentation else { return .none }
+			switch event {
+			case .received:
+				presentation.label = "Agent handoff received"
+			case .processing:
+				presentation.label = "Preparing tasks"
+			case let .coordinatorStarted(thread):
+				presentation.threads = [thread]
+				presentation.label = "Creating task packages"
+			case let .tasksFound(count):
+				presentation.label = "Found \(count) \(count == 1 ? "task" : "tasks")"
+			case let .childStarted(thread, ordinal):
+				if !presentation.threads.contains(thread) {
+					presentation.threads.append(thread)
+				}
+				presentation.label = "Running \(ordinal) \(ordinal == 1 ? "task" : "tasks")"
+			case .completed:
+				presentation.label = presentation.threads.count == 1 ? "Task completed" : "Tasks completed"
+				presentation.isReady = true
+			}
+			state.agentHandoffPresentation = presentation
+			return .none
+
+		case let .agentHandoffFailed(message):
+			state.agentHandoffPresentation = nil
+			return .send(.showError(message))
+
+		case .openAgentHandoff:
+			guard let presentation = state.agentHandoffPresentation,
+				let thread = presentation.threads.first
+			else { return .none }
+			return .run { [agentHandoff] _ in
+				await agentHandoff.open(thread)
+			}
+
+		case .dismissAgentHandoff:
+			state.agentHandoffPresentation = nil
+			return .none
 
 		case let .pasteCompletedTranscript(text):
 			return .run { [pasteboard, soundEffect] send in
@@ -896,9 +1172,12 @@ struct TranscriptionFeature {
 
       // MARK: - Cancel/Discard Flow
 
-      case .cancel:
+		case .cancel:
 			if state.completedTranscriptPresentation != nil {
 				return .send(.dismissCompletedTranscript)
+			}
+			if state.agentHandoffPresentation?.isReady == true {
+				return .send(.dismissAgentHandoff)
 			}
         // Only cancel if we're in the middle of recording, transcribing, or post-processing
         guard state.isRecording || state.isTranscribing || state.isRefining || state.isCapturingSelectedTextForRefinement else {
@@ -946,6 +1225,7 @@ private extension TranscriptionFeature {
 		var hotKeyProcessor: HotKeyProcessor = .init(hotkey: HotKey(key: nil, modifiers: [.option]))
       @Shared(.isSettingHotKey) var isSettingHotKey: Bool
       @Shared(.hexSettings) var hexSettings: HexSettings
+		let rewritePromptHoldTracker = RewritePromptHoldTracker()
 
       // Handle incoming input events (keyboard and mouse)
       let token = keyEventMonitor.handleInputEvent { inputEvent in
@@ -967,11 +1247,58 @@ private extension TranscriptionFeature {
 	          ScreenAwareActivation.minimumHoldDuration
 	        )
 	        hotKeyProcessor.screenAwareSecondTapEnabled = supportsScreenAwareGesture
-	        hotKeyProcessor.postHoldRefinementEnabled = !hexSettings.doubleTapLockEnabled
+        hotKeyProcessor.postHoldRefinementEnabled = !hexSettings.doubleTapLockEnabled
         hotKeyProcessor.minimumKeyTime = hexSettings.minimumKeyTime
 
         switch inputEvent {
         case .keyboard(let keyEvent):
+		  if rewritePromptHoldTracker.hasTriggered() {
+			  hotKeyProcessor.reset()
+		  }
+
+		  if let promptNumber = rewritePromptNumber(for: keyEvent.physicalKey),
+			 keyEvent.modifiers.isEmpty
+		  {
+			  if keyEvent.isKeyDown,
+				 hotKeyProcessor.isMatched,
+				 hexSettings.rewritePrompt(at: promptNumber) != nil,
+				 let key = keyEvent.physicalKey
+			  {
+				  if rewritePromptHoldTracker.matches(key) {
+					  return true
+				  }
+				  let hold = RewritePromptHold(key: key)
+				  let duration = max(
+					hexSettings.minimumKeyTime,
+					ScreenAwareActivation.minimumHoldDuration
+				  )
+				  let task = Task {
+					  do {
+						  try await Task.sleep(for: .seconds(duration))
+					  } catch {
+						  return
+					  }
+					  guard !Task.isCancelled else { return }
+					  hold.markTriggered()
+					  await send(.finishRecordingWithRewritePrompt(promptNumber))
+				  }
+				  rewritePromptHoldTracker.replace(with: hold, task: task)
+				  return true
+			  }
+
+			  if keyEvent.isKeyUp,
+				 let activeHold = rewritePromptHoldTracker.take(for: keyEvent.physicalKey)
+			  {
+				  activeHold.task.cancel()
+				  if activeHold.hold.hasTriggered() {
+					  hotKeyProcessor.reset()
+				  } else {
+					  keyEventMonitor.replayKeyPress(activeHold.hold.key)
+				  }
+				  return true
+			  }
+		  }
+
 		  // The screen-area overlay owns Escape while a region is being drawn.
 		  // Let its local monitor reset/cancel the rectangle without the global
 		  // hotkey processor cancelling the active recording.
@@ -980,12 +1307,28 @@ private extension TranscriptionFeature {
 		  }
 
           // If Escape is pressed with no modifiers while idle, let's treat that as `cancel`.
-          if keyEvent.key == .escape, keyEvent.modifiers.isEmpty,
+		  if keyEvent.key == .escape, keyEvent.modifiers.isEmpty,
              hotKeyProcessor.state == .idle
           {
             Task { await send(.cancel) }
             return false
           }
+
+
+		  switch agentHandoffEndingGesture(
+			for: keyEvent,
+			hotkey: hexSettings.hotkey,
+			processorState: hotKeyProcessor.state
+		  ) {
+		  case .finish:
+			hotKeyProcessor.reset()
+			Task { await send(.finishRecordingWithAgentHandoff) }
+			return keyEvent.phase != .other
+		  case .consume:
+			return keyEvent.phase != .other
+		  case .none:
+			break
+		  }
 
 		  // Process the key event
 		  switch hotKeyProcessor.process(keyEvent: keyEvent) {
@@ -1142,6 +1485,8 @@ private extension TranscriptionFeature {
     }
 	state.isRecording = true
 	state.completedTranscriptPresentation = nil
+	state.agentHandoffPresentation = nil
+	state.isAgentHandoffRequestedForActiveRecording = false
 	state.originalTranscriptForRefinement = nil
 		state.outputGenerationStartTime = nil
 		state.screenContextForRefinement = nil
@@ -1155,9 +1500,13 @@ private extension TranscriptionFeature {
 			state.pendingPressAndHoldActivationID = nil
 			state.pendingTerminalRefinementID = nil
 		state.forcedRefinementMode = forcedRefinementMode
+		state.rewritePromptForRefinement = nil
 	state.activeRecordingHotkey = state.hexSettings.hotkey
 	state.activeMinimumKeyTime = state.hexSettings.minimumKeyTime
 		state.activeRecordingSource = source
+		state.activeSpeakerIdentificationEnabled = state.hexSettings.speakerIdentificationEnabled
+		state.activeSystemAudioEnabled = state.hexSettings.includeSystemAudio
+		state.activeSystemAudioStartOffset = 0
     let startTime = now
     state.recordingStartTime = startTime
     
@@ -1176,7 +1525,7 @@ private extension TranscriptionFeature {
 			.cancel(id: CancelID.terminalRefinementHold),
 			.cancel(id: CancelID.screenAwareActivation),
 			cancelsScreenContextCapture ? .cancel(id: CancelID.screenContextCapture) : .none,
-		.run { [sleepManagement, preventSleep = state.hexSettings.preventSystemSleep] send in
+		.run { [sleepManagement, preventSleep = state.hexSettings.preventSystemSleep, includeSystemAudio = state.activeSystemAudioEnabled] send in
         // Play sound immediately for instant feedback
         soundEffect.play(.startRecording)
 
@@ -1194,6 +1543,16 @@ private extension TranscriptionFeature {
 			switch startResult {
 			case let .started(checkpoint):
 				await send(.recordingCheckpointStarted(checkpoint))
+				if includeSystemAudio {
+					switch await systemAudioCapture.startCapture() {
+					case .started:
+						await send(.systemAudioCaptureStarted(Date()))
+					case .permissionDenied:
+						await send(.showError("System audio needs Screen Recording permission. Microphone recording will continue."))
+					case .failed:
+						await send(.showError("System audio could not be started. Microphone recording will continue."))
+					}
+				}
 			case .microphoneUnavailable:
 				await send(.recordingStartFailed)
 			case .failed:
@@ -1234,6 +1593,7 @@ private extension TranscriptionFeature {
 	let screenAwareCaptureInFlight = state.screenContextCaptureID != nil
 	let selectedTextRefinementRequested = state.selectedTextForRefinement != nil
 		|| state.isCapturingSelectedTextForRefinement
+	let includeSystemAudio = state.activeSystemAudioEnabled
     guard decision == .proceedToTranscription
 		|| screenAwareCaptureInFlight
 		|| selectedTextRefinementRequested
@@ -1245,9 +1605,13 @@ private extension TranscriptionFeature {
 			state.pendingScreenAwareTranscription = nil
 			state.pendingSelectedTextTranscription = nil
 			state.forcedRefinementMode = nil
+			state.rewritePromptForRefinement = nil
 		state.activeRecordingHotkey = nil
 		state.activeMinimumKeyTime = nil
 		state.activeRecordingSource = nil
+		state.isAgentHandoffRequestedForActiveRecording = false
+		state.activeSystemAudioEnabled = false
+		state.activeSystemAudioStartOffset = 0
       // Recording was below minimum duration. If it captured at least 1.0s of audio we still
       // persist it as a cancelled entry so the user can retry; otherwise discard silently
       // (covers accidental modifier-only taps).
@@ -1259,9 +1623,12 @@ private extension TranscriptionFeature {
 	      return .merge(
 	        .cancel(id: CancelID.recordingStart),
 			.cancel(id: CancelID.screenContextCapture),
-		.run { [duration, sleepManagement] send in
+		.run { [duration, sleepManagement, includeSystemAudio] send in
 			await selectedText?.cancel()
-          await sleepManagement.allowSleep()
+			await sleepManagement.allowSleep()
+			if includeSystemAudio, case let .captured(systemAudioURL, _) = await systemAudioCapture.stopCapture() {
+				FileManager.default.removeItemIfExists(at: systemAudioURL)
+			}
 		  let stopResult = await recording.stopRecording()
 		  guard !Task.isCancelled else { return }
 		  switch stopResult {
@@ -1321,23 +1688,34 @@ private extension TranscriptionFeature {
 	let stagedScreenshotPath = state.stagedScreenContextScreenshotPath
 	let sourceAppBundleID = state.sourceAppBundleID
 	let sourceAppName = state.sourceAppName
+	let speakerIdentificationEnabled = state.activeSpeakerIdentificationEnabled
+	let speakerDiarizationProvider = state.hexSettings.speakerDiarizationProvider
+	let speakerIntroductionSettings = state.hexSettings
+	let systemAudioStartOffset = state.activeSystemAudioStartOffset
 
     return .merge(
       .cancel(id: CancelID.recordingStart),
-		.run { [duration, sleepManagement, transcriptPersistence] send in
+		.run { [duration, sleepManagement, transcriptPersistence, speakerDiarization, speakerIntroduction, systemAudioCapture] send in
         // Allow system to sleep again
         await sleepManagement.allowSleep()
 
-        var unownedAudioURL: URL?
-        var capturedAudioURL: URL?
-        defer {
+		var unownedAudioURL: URL?
+		var capturedAudioURL: URL?
+		var unownedSystemAudioURL: URL?
+		defer {
           if let unownedAudioURL {
             FileManager.default.removeItemIfExists(at: unownedAudioURL)
-            RecordingRecoveryStore.releaseSource(forFinalAudioURL: unownedAudioURL)
-          }
-        }
-        do {
-          let stopResult = await recording.stopRecording()
+				RecordingRecoveryStore.releaseSource(forFinalAudioURL: unownedAudioURL)
+			}
+			if let unownedSystemAudioURL {
+				FileManager.default.removeItemIfExists(at: unownedSystemAudioURL)
+			}
+		}
+		do {
+			let systemAudioStopResult = includeSystemAudio
+				? await systemAudioCapture.stopCapture()
+				: .ignored(.noActiveCapture)
+			let stopResult = await recording.stopRecording()
           let capturedURL: URL
           switch stopResult {
 		  case let .captured(url):
@@ -1364,6 +1742,9 @@ private extension TranscriptionFeature {
 		  unownedAudioURL = capturedURL
 		  capturedAudioURL = capturedURL
 		  var audioURLForTranscription = capturedURL
+		  var transcriptionChannels: [(source: TranscriptAudioSource, audioURL: URL, duration: TimeInterval, startOffset: TimeInterval)] = [
+			  (.microphone, capturedURL, duration, 0)
+		  ]
 
 		  // The audio file is the first durable checkpoint. It is stored before
 		  // transcription begins, so a crash, cancellation, or provider failure can
@@ -1397,6 +1778,28 @@ private extension TranscriptionFeature {
 			  unownedAudioURL = nil
 			  await send(.recordingCheckpointFinalized(capturedURL, duration, .processing))
 		  }
+		  transcriptionChannels[0].audioURL = audioURLForTranscription
+
+		  if case let .captured(systemAudioURL, systemAudioDuration) = systemAudioStopResult {
+			  var systemAudioURLForTranscription = systemAudioURL
+			  unownedSystemAudioURL = systemAudioURL
+			  if let historyCheckpointID {
+				  do {
+					  systemAudioURLForTranscription = try await transcriptPersistence.saveAudioChannel(
+						  systemAudioURL,
+						  historyCheckpointID,
+						  .systemAudio
+					  )
+					  unownedSystemAudioURL = nil
+					  await send(.systemAudioCaptured(systemAudioURLForTranscription, systemAudioDuration, startOffset: systemAudioStartOffset))
+				  } catch {
+					  transcriptionFeatureLogger.warning("Failed to persist system audio: \(error.localizedDescription, privacy: .private)")
+				  }
+			  }
+			  transcriptionChannels.append((.systemAudio, systemAudioURLForTranscription, systemAudioDuration, systemAudioStartOffset))
+		  } else if case let .failed(message) = systemAudioStopResult {
+			  transcriptionFeatureLogger.warning("System audio capture ended without a transcript: \(message, privacy: .private)")
+		  }
 
           // Synchronously plumb the captured URL + accurate duration into state so cancel
           // and ownership-guard paths can see them.
@@ -1414,10 +1817,78 @@ private extension TranscriptionFeature {
             chunkingStrategy: .vad,
           )
 
-		  let result = try await transcription.transcribe(audioURLForTranscription, model, decodeOptions) { _ in }
+		  var channelResults = [TranscribedAudioChannel]()
+		  for channel in transcriptionChannels {
+			  do {
+				  var output = try await transcription.transcribe(channel.audioURL, model, decodeOptions) { _ in }
+				  var introducedSpeakerIDs = Set<String>()
 
-		  transcriptionFeatureLogger.notice("Transcribed audio from \(audioURLForTranscription.lastPathComponent, privacy: .private) to text length \(result.count)")
-		  await send(.transcriptionResult(result, audioURLForTranscription))
+				  if speakerIdentificationEnabled, !output.words.isEmpty, output.speakerAttribution == nil {
+					  do {
+						  let diarization: SpeakerDiarizationOutput
+						  if let suppliedDiarization = output.diarization {
+							  diarization = suppliedDiarization
+						  } else {
+							  diarization = try await speakerDiarization.analyze(channel.audioURL, speakerDiarizationProvider)
+						  }
+						  let introductionContexts = SpeakerIdentification.introductionContexts(
+							  transcription: output,
+							  diarization: diarization
+						  )
+						  let introductions: [SpeakerIntroduction]
+						  do {
+							  introductions = try await speakerIntroduction.classify(introductionContexts, speakerIntroductionSettings)
+						  } catch {
+							  transcriptionFeatureLogger.warning("Speaker introduction classification failed: \(error.localizedDescription, privacy: .private)")
+							  introductions = []
+						  }
+						  introducedSpeakerIDs = Set(introductions.map(\.speakerID))
+						  @Shared(.speakerVoiceLibrary) var voiceLibrary: SpeakerVoiceLibrary
+						  let savedLibrary = $voiceLibrary.withLock { $0 }
+						  let verifiedProfileIDs = await verifyKnownSpeakerMatches(
+							  diarization: diarization,
+							  library: savedLibrary,
+							  sourceURL: channel.audioURL,
+							  provider: speakerDiarizationProvider,
+							  analyze: speakerDiarization.analyze
+						  )
+						  output.speakerAttribution = $voiceLibrary.withLock { library in
+							  SpeakerIdentification.attribute(
+								  transcription: output,
+								  diarization: diarization,
+								  library: &library,
+								  now: Date(),
+								  introductions: introductions,
+								  verifiedProfileIDs: verifiedProfileIDs
+							  )
+						  }
+					  } catch {
+						  // Speaker identification is optional for each independently captured channel.
+						  transcriptionFeatureLogger.warning("Speaker identification failed: \(error.localizedDescription, privacy: .private)")
+				  }
+				  }
+
+				  if let attribution = output.speakerAttribution {
+					  await storeSpeakerVoiceSamples(
+						  from: attribution,
+						  sourceURL: channel.audioURL,
+						  replacingSamplesForSpeakerIDs: introducedSpeakerIDs
+					  )
+				  }
+
+			  transcriptionFeatureLogger.notice("Transcribed \(channel.source.rawValue, privacy: .public) audio to text length \(output.text.count)")
+				  channelResults.append(.init(source: channel.source, audioURL: channel.audioURL, duration: channel.duration, startOffset: channel.startOffset, output: output))
+			  } catch {
+				  guard channel.source == .systemAudio else { throw error }
+				  // A system-audio failure must not throw away a successful microphone transcription.
+				  transcriptionFeatureLogger.warning("System audio transcription failed: \(error.localizedDescription, privacy: .private)")
+			  }
+		  }
+
+		  guard channelResults.contains(where: { $0.source == .microphone }) else {
+			  throw RecordingFailure.noCapturedAudio
+		  }
+		  await send(.transcriptionResult(channelResults, microphoneAudioURL: audioURLForTranscription))
         } catch {
           transcriptionFeatureLogger.error("Transcription failed: \(error.localizedDescription, privacy: .private)")
           await send(.transcriptionError(error, capturedAudioURL))
@@ -1428,9 +1899,191 @@ private extension TranscriptionFeature {
   }
 }
 
+/// Retain the first local clip for each saved profile. This runs after speaker
+/// matching, so no audio is kept for anonymous labels or repeatedly added later.
+private func storeSpeakerVoiceSamples(
+	from attribution: SpeakerAttributedTranscript,
+	sourceURL: URL,
+	replacingSamplesForSpeakerIDs: Set<String>
+) async {
+	var candidates = [UUID: SpeakerAttributedSegment]()
+	for segment in attribution.segments {
+		guard let profileID = segment.profileID else { continue }
+		let existingDuration = candidates[profileID].map { $0.endTime - $0.startTime } ?? 0
+		if segment.endTime - segment.startTime > existingDuration {
+			candidates[profileID] = segment
+		}
+	}
+	@Shared(.speakerVoiceLibrary) var voiceLibrary: SpeakerVoiceLibrary
+	var samplesToDelete = [SpeakerVoiceSample]()
+	let profilesNeedingSample = $voiceLibrary.withLock { library -> Set<UUID> in
+		var profileIDs = Set<UUID>()
+		for index in library.profiles.indices {
+			let storedSamples = library.profiles[index].audioSamples ?? []
+			let usableSamples = storedSamples.filter { FileManager.default.fileExists(atPath: $0.audioURL.path) }
+			samplesToDelete.append(contentsOf: storedSamples.filter { !FileManager.default.fileExists(atPath: $0.audioURL.path) })
+			if let firstSample = usableSamples.first {
+				library.profiles[index].audioSamples = [firstSample]
+				samplesToDelete.append(contentsOf: usableSamples.dropFirst())
+			} else {
+				library.profiles[index].audioSamples = []
+				profileIDs.insert(library.profiles[index].id)
+			}
+		}
+		return profileIDs
+	}
+	SpeakerVoiceSampleStore.delete(samplesToDelete)
+	let profileIDsReplacingSample = Set(attribution.segments.compactMap { segment -> UUID? in
+		guard replacingSamplesForSpeakerIDs.contains(segment.speakerID) else { return nil }
+		return segment.profileID
+	})
+
+	var captured = [(profileID: UUID, sample: SpeakerVoiceSample)]()
+	for (profileID, segment) in candidates {
+		guard profilesNeedingSample.contains(profileID) || profileIDsReplacingSample.contains(profileID) else { continue }
+		do {
+			guard let sample = try await SpeakerVoiceSampleStore.capture(
+				from: sourceURL,
+				profileID: profileID,
+				startTime: segment.startTime,
+				endTime: segment.endTime
+			) else { continue }
+			captured.append((profileID, sample))
+		} catch {
+			transcriptionFeatureLogger.warning("Could not retain speaker audio sample: \(error.localizedDescription, privacy: .private)")
+		}
+	}
+
+	guard !captured.isEmpty else { return }
+	samplesToDelete = []
+	$voiceLibrary.withLock { library in
+		for (profileID, sample) in captured {
+			guard let index = library.profiles.firstIndex(where: { $0.id == profileID }) else {
+				samplesToDelete.append(sample)
+				continue
+			}
+			let hasSavedSample = (library.profiles[index].audioSamples ?? [])
+				.contains { FileManager.default.fileExists(atPath: $0.audioURL.path) }
+			if profileIDsReplacingSample.contains(profileID) {
+				samplesToDelete.append(contentsOf: library.profiles[index].audioSamples ?? [])
+				library.profiles[index].audioSamples = [sample]
+			} else if hasSavedSample {
+				samplesToDelete.append(sample)
+			} else {
+				library.profiles[index].audioSamples = [sample]
+			}
+		}
+	}
+	SpeakerVoiceSampleStore.delete(samplesToDelete)
+}
+
+/// Verifies the most likely saved voices in a single diarization run. Cluster IDs
+/// are local to one run, so placing a retained sample next to the new turn gives a
+/// much stronger signal than comparing embeddings produced in separate runs.
+private func verifyKnownSpeakerMatches(
+	diarization: SpeakerDiarizationOutput,
+	library: SpeakerVoiceLibrary,
+	sourceURL: URL,
+	provider: SpeakerDiarizationProvider,
+	analyze: @escaping @Sendable (URL, SpeakerDiarizationProvider) async throws -> SpeakerDiarizationOutput
+) async -> [String: UUID] {
+	let candidates = SpeakerIdentification.rankedVoiceMatchCandidates(
+		diarization: diarization,
+		library: library
+	)
+	guard !candidates.isEmpty else { return [:] }
+
+	var verified = [String: UUID]()
+	for (speakerID, speakerCandidates) in Dictionary(grouping: candidates, by: \.speakerID) {
+		guard let candidateSegment = diarization.segments
+			.filter({ $0.speakerID == speakerID })
+			.max(by: { ($0.endTime - $0.startTime) < ($1.endTime - $1.startTime) })
+		else { continue }
+
+		let references = speakerCandidates.compactMap { candidate -> SpeakerVoiceComparisonReference? in
+			guard let profile = library.profiles.first(where: { $0.id == candidate.profileID }),
+				let sample = (profile.audioSamples ?? [])
+					.first(where: { FileManager.default.fileExists(atPath: $0.audioURL.path) })
+			else { return nil }
+			return .init(profileID: profile.id, audioURL: sample.audioURL)
+		}
+		guard let input = try? await SpeakerVoiceSampleStore.comparisonInput(
+			references: references,
+			candidateURL: sourceURL,
+			candidateStartTime: candidateSegment.startTime,
+			candidateEndTime: candidateSegment.endTime
+		) else { continue }
+		defer { FileManager.default.removeItemIfExists(at: input.audioURL) }
+
+		do {
+			let jointDiarization = try await analyze(input.audioURL, provider)
+			guard let candidateCluster = dominantCluster(
+				in: jointDiarization,
+				startTime: input.candidateStartTime,
+				endTime: input.candidateEndTime
+			) else { continue }
+			let matchedProfiles = input.referenceRanges.compactMap { range -> UUID? in
+				dominantCluster(in: jointDiarization, startTime: range.startTime, endTime: range.endTime) == candidateCluster
+					? range.profileID
+					: nil
+			}
+			if matchedProfiles.count == 1, let profileID = matchedProfiles.first {
+				verified[speakerID] = profileID
+			}
+		} catch {
+			transcriptionFeatureLogger.warning("Speaker reference comparison failed: \(error.localizedDescription, privacy: .private)")
+		}
+	}
+	return verified
+}
+
+private func dominantCluster(
+	in diarization: SpeakerDiarizationOutput,
+	startTime: TimeInterval,
+	endTime: TimeInterval
+) -> String? {
+	guard endTime > startTime else { return nil }
+	let overlapBySpeaker = diarization.segments.reduce(into: [String: TimeInterval]()) { result, segment in
+		let overlap = max(0, min(endTime, segment.endTime) - max(startTime, segment.startTime))
+		guard overlap > 0 else { return }
+		result[segment.speakerID, default: 0] += overlap
+	}
+	guard let dominant = overlapBySpeaker.max(by: { $0.value < $1.value }),
+		dominant.value >= min(0.5, (endTime - startTime) * 0.25)
+	else { return nil }
+	return dominant.key
+}
+
 // MARK: - Transcription Handlers
 
 private extension TranscriptionFeature {
+	func agentHandoffRequest(
+		for transcript: String,
+		selectedText: String?,
+		screenContext: ScreenContext?,
+		screenAwareInputSource: ScreenAwareInputSource?,
+		settings: HexSettings
+	) -> AgentHandoffRequest? {
+		let provider: AgentHandoffRequest.Provider?
+		switch settings.refinementProvider {
+		case .codexCLI:
+			provider = .codex
+		case .claudeCLI:
+			provider = .claude
+		default:
+			provider = nil
+		}
+		guard let provider else { return nil }
+		return .init(
+			provider: provider,
+			modelID: settings.refinementRequest(for: transcript, mode: .refined).modelID,
+			transcript: transcript,
+			selectedText: selectedText,
+			screenContext: screenContext,
+			screenAwareInputSource: screenAwareInputSource ?? settings.screenAwareInputSource
+		)
+	}
+
   /// Finish an empty local transcription without deleting the audio checkpoint that was
   /// persisted before transcription began. This leaves an inspectable, retryable run in
   /// History instead of making a completed recording disappear.
@@ -1447,9 +2100,11 @@ private extension TranscriptionFeature {
     state.pendingScreenAwareTranscription = nil
     state.pendingSelectedTextTranscription = nil
     state.forcedRefinementMode = nil
+	state.rewritePromptForRefinement = nil
     state.activeRecordingHotkey = nil
     state.activeMinimumKeyTime = nil
     state.activeRecordingSource = nil
+	state.isAgentHandoffRequestedForActiveRecording = false
 
     if let historyCheckpointID {
       state.$transcriptionHistory.withLock { history in
@@ -1474,11 +2129,14 @@ private extension TranscriptionFeature {
     )
   }
 
-  func handleTranscriptionResult(
-    _ state: inout State,
-    result: String,
-    audioURL: URL
-  ) -> Effect<Action> {
+	func handleTranscriptionResult(
+		_ state: inout State,
+		channels: [TranscribedAudioChannel],
+		microphoneAudioURL: URL
+	) -> Effect<Action> {
+		guard channels.contains(where: { $0.source == .microphone }) else { return .none }
+		let audioURL = microphoneAudioURL
+		let rawResult = channels.map { $0.output.canonicalText }.filter { !$0.isEmpty }.joined(separator: " ")
     // Ownership guard MUST be first: drop late-arriving results from a cancelled transcription
     // before any state mutation, force-quit detection, empty-result handling, post-processing,
     // or side effects.
@@ -1490,7 +2148,7 @@ private extension TranscriptionFeature {
     // race, keep its result intact until the lookup can either force refinement or
     // confirm that there was no selection.
     if state.isCapturingSelectedTextForRefinement {
-      state.pendingSelectedTextTranscription = .init(text: result, audioURL: audioURL)
+		state.pendingSelectedTextTranscription = .init(channels: channels, microphoneAudioURL: microphoneAudioURL)
       return .none
     }
     let duration = state.activeTranscriptionDuration
@@ -1501,7 +2159,7 @@ private extension TranscriptionFeature {
     state.isPrewarming = false
 
     // Check for force quit command (emergency escape hatch)
-    if ForceQuitCommandDetector.matches(result) {
+	if ForceQuitCommandDetector.matches(rawResult) {
 		  state.activeTranscriptionAudioURL = nil
 		  state.activeTranscriptionDuration = nil
 		  state.screenContextForRefinement = nil
@@ -1509,9 +2167,11 @@ private extension TranscriptionFeature {
 		  state.pendingScreenAwareTranscription = nil
 		  state.pendingSelectedTextTranscription = nil
 	  state.forcedRefinementMode = nil
+	  state.rewritePromptForRefinement = nil
 	  state.activeRecordingHotkey = nil
 	  state.activeMinimumKeyTime = nil
 	  state.activeRecordingSource = nil
+	  state.isAgentHandoffRequestedForActiveRecording = false
       transcriptionFeatureLogger.fault("Force quit voice command recognized; terminating Octo.")
 	      return .merge(
 			.cancel(id: CancelID.screenContextCapture),
@@ -1528,35 +2188,35 @@ private extension TranscriptionFeature {
     let selectedText = state.selectedTextForRefinement
 		let screenContext = state.screenContextForRefinement
 
-    // A silent selected-text recording still has useful work to do: apply the configured
+		let processedChannels = channels.map { processTranscribedAudioChannel($0, state: state) }
+		let unifiedSections = processedChannels
+			.flatMap(\.displaySections)
+			.sorted {
+				if $0.startTime != $1.startTime { return $0.startTime < $1.startTime }
+				if $0.endTime != $1.endTime { return $0.endTime < $1.endTime }
+				return ($0.audioSource?.rawValue ?? "") < ($1.audioSource?.rawValue ?? "")
+			}
+		let modifiedResult = TimestampedTranscriptSectionBuilder.renderedText(from: unifiedSections)
+			.isEmpty
+			? processedChannels.map(\.text).filter { !$0.isEmpty }.joined(separator: " ")
+			: TimestampedTranscriptSectionBuilder.renderedText(from: unifiedSections)
+
+	// A silent selected-text recording still has useful work to do: apply the configured
     // refinement prompt to the captured selection without an extra spoken instruction.
-    guard !result.isEmpty || selectedText != nil || screenContext != nil || state.screenContextCaptureID != nil else {
+	guard !modifiedResult.isEmpty || selectedText != nil || screenContext != nil || state.screenContextCaptureID != nil else {
       return handleEmptyTranscriptionResult(&state, audioURL: audioURL)
     }
 
-    if !result.isEmpty {
-      transcriptionFeatureLogger.info("Raw transcription: '\(result, privacy: .private)'")
+	if !rawResult.isEmpty {
+	  transcriptionFeatureLogger.info("Raw transcription: '\(rawResult, privacy: .private)'")
     }
-    let modifiedResult: String
-    if result.isEmpty || state.isRemappingScratchpadFocused {
-      modifiedResult = result
-    } else {
-      let settings = state.hexSettings
-      let remapped = WordRemappingApplier.apply(result, remappings: settings.wordRemappings)
-      let removed = settings.wordRemovalsEnabled
-        ? WordRemovalApplier.apply(remapped, removals: settings.wordRemovals)
-        : remapped
-      modifiedResult = TranscriptFormattingApplier.apply(
-        removed,
-        lowercase: settings.lowercaseTranscripts,
-        removePunctuation: settings.removePunctuation
-      )
-    }
-    if modifiedResult != result {
-      transcriptionFeatureLogger.info("Applied word filters; processed length=\(modifiedResult.count)")
-    } else if state.isRemappingScratchpadFocused {
-      transcriptionFeatureLogger.info("Scratchpad focused; skipping word modifications")
-    }
+	if processedChannels.contains(where: { $0.speakerSegments?.isEmpty == false }) {
+		transcriptionFeatureLogger.info("Captured speaker labels for \(processedChannels.count) audio channel(s); processed length=\(modifiedResult.count)")
+	} else if modifiedResult != rawResult {
+		transcriptionFeatureLogger.info("Applied word filters; processed length=\(modifiedResult.count)")
+	} else if state.isRemappingScratchpadFocused {
+		transcriptionFeatureLogger.info("Scratchpad focused; skipping word modifications")
+	}
 
     // Empty after post-processing: keep the same durable checkpoint as an error.
     guard !modifiedResult.isEmpty || selectedText != nil || screenContext != nil || state.screenContextCaptureID != nil else {
@@ -1566,6 +2226,7 @@ private extension TranscriptionFeature {
 		// Refinement is selected by the terminal hold, selected text, or the
 		// screen-aware start gesture; the configured start hotkey stays unified.
 		let refinementMode = state.forcedRefinementMode ?? .raw
+		let isAgentHandoffRequested = state.isAgentHandoffRequestedForActiveRecording
 	    let sourceAppBundleID = state.sourceAppBundleID
     let sourceAppName = state.sourceAppName
     let transcriptionHistory = state.$transcriptionHistory
@@ -1574,8 +2235,80 @@ private extension TranscriptionFeature {
 			state.$transcriptionHistory.withLock { history in
 				guard let index = history.history.firstIndex(where: { $0.id == historyCheckpointID }) else { return }
 				history.history[index].rawText = modifiedResult
+				history.history[index].timestampedSections = unifiedSections.isEmpty ? nil : unifiedSections
+				history.history[index].speakerSegments = nil
+				var storedChannels = history.history[index].audioChannels ?? []
+				for channel in processedChannels {
+					let stored = TranscriptAudioChannel(
+						source: channel.source,
+						audioPath: channel.audioURL,
+						duration: channel.duration,
+						startOffset: channel.startOffset,
+						text: channel.text,
+						timestampedSections: channel.timestampedSections,
+						speakerSegments: channel.speakerSegments
+					)
+					if let channelIndex = storedChannels.firstIndex(where: { $0.source == channel.source }) {
+						storedChannels[channelIndex] = stored
+					} else {
+						storedChannels.append(stored)
+					}
+				}
+				history.history[index].audioChannels = storedChannels
 				history.history[index].selectedText = selectedText?.text ?? history.history[index].selectedText
 			}
+		}
+
+		// Agent Handoff is a distinct destination for the completed local transcript:
+		// keep the normal durable History behavior, but never run refinement or paste
+		// the text back into the focused app. The selected native provider receives the
+		// full refinement-equivalent input once as persistent child task(s).
+		if isAgentHandoffRequested {
+			let historyCheckpointID = state.activeHistoryTranscriptID
+			let handoffRequest = agentHandoffRequest(
+				for: modifiedResult,
+				selectedText: selectedText?.text,
+				screenContext: screenContext,
+				screenAwareInputSource: state.screenAwareInputSourceForRefinement,
+				settings: state.hexSettings
+			)
+			state.activeHistoryTranscriptID = nil
+			state.isAgentHandoffRequestedForActiveRecording = false
+			state.forcedRefinementMode = nil
+			state.rewritePromptForRefinement = nil
+			state.activeRecordingHotkey = nil
+			state.activeMinimumKeyTime = nil
+			state.activeRecordingSource = nil
+			state.activeSystemAudioEnabled = false
+			state.activeSystemAudioStartOffset = 0
+			state.activeTranscriptionAudioURL = nil
+			state.activeTranscriptionDuration = nil
+			state.recentCompletedTranscript = nil
+			return .run { send in
+				await finalizeRecordingAndStoreTranscript(
+					result: modifiedResult,
+					duration: duration,
+					sourceAppBundleID: sourceAppBundleID,
+					sourceAppName: sourceAppName,
+					audioURL: audioURL,
+					transcriptionHistory: transcriptionHistory,
+					selectedText: selectedText,
+					rawTranscript: modifiedResult,
+					timestampedSections: unifiedSections.isEmpty ? nil : unifiedSections,
+					speakerSegments: nil,
+					historyCheckpointID: historyCheckpointID
+				)
+				guard let handoffRequest else {
+					await send(.agentHandoffFailed(AgentHandoffError.providerUnavailable.localizedDescription))
+					return
+				}
+				guard handoffRequest.hasUserRequest else {
+					await send(.agentHandoffFailed(AgentHandoffError.noUserRequest.localizedDescription))
+					return
+				}
+				await send(.launchAgentHandoff(handoffRequest))
+			}
+			.cancellable(id: CancelID.transcription)
 		}
 
 	// Refinement is intentionally downstream-only: it receives the existing final transcript
@@ -1589,9 +2322,13 @@ private extension TranscriptionFeature {
 		)
 		state.activeHistoryTranscriptID = nil
 		state.forcedRefinementMode = nil
+		state.rewritePromptForRefinement = nil
 		state.activeRecordingHotkey = nil
 		state.activeMinimumKeyTime = nil
 		state.activeRecordingSource = nil
+		state.isAgentHandoffRequestedForActiveRecording = false
+		state.activeSystemAudioEnabled = false
+		state.activeSystemAudioStartOffset = 0
 		state.activeTranscriptionAudioURL = nil
 		state.activeTranscriptionDuration = nil
 		return finalizeTranscriptEffect(
@@ -1603,6 +2340,8 @@ private extension TranscriptionFeature {
 			transcriptionHistory: transcriptionHistory,
 			selectedText: selectedText,
 			rawTranscript: modifiedResult,
+			timestampedSections: unifiedSections.isEmpty ? nil : unifiedSections,
+			speakerSegments: nil,
 			historyCheckpointID: historyCheckpointID
 		)
 	}
@@ -1626,6 +2365,97 @@ private extension TranscriptionFeature {
 			screenContext: screenContext
 		)
 	  }
+
+	func processTranscribedAudioChannel(
+		_ channel: TranscribedAudioChannel,
+		state: State
+	) -> ProcessedAudioChannel {
+		let output = channel.output
+		let rawText = output.canonicalText
+		let timestampedSections: [TimestampedTranscriptSection]
+		let speakerSegments: [SpeakerAttributedSegment]?
+		let text: String
+
+		if rawText.isEmpty || state.isRemappingScratchpadFocused {
+			timestampedSections = output.timestampedSections.map { section in
+				var section = section
+				section.audioSource = channel.source
+				return section
+			}
+			speakerSegments = output.speakerAttribution?.segments
+			text = rawText
+		} else {
+			let settings = state.hexSettings
+			func format(_ text: String) -> String {
+				let remapped = WordRemappingApplier.apply(text, remappings: settings.wordRemappings)
+				let removed = settings.wordRemovalsEnabled
+					? WordRemovalApplier.apply(remapped, removals: settings.wordRemovals)
+					: remapped
+				return TranscriptFormattingApplier.apply(
+					removed,
+					lowercase: settings.lowercaseTranscripts,
+					removePunctuation: settings.removePunctuation
+				)
+			}
+
+			timestampedSections = output.timestampedSections.compactMap { section in
+				var section = section
+				section.text = format(section.text)
+				section.audioSource = channel.source
+				return section.text.isEmpty ? nil : section
+			}
+			speakerSegments = output.speakerAttribution?.segments.compactMap { segment in
+				var segment = segment
+				segment.text = format(segment.text)
+				return segment.text.isEmpty ? nil : segment
+			}
+			text = timestampedSections.isEmpty
+				? format(rawText)
+				: TimestampedTranscriptSectionBuilder.renderedText(from: timestampedSections)
+		}
+
+		let nonEmptySpeakerSegments = speakerSegments?.isEmpty == false ? speakerSegments : nil
+		let displaySections: [TimestampedTranscriptSection]
+		if let nonEmptySpeakerSegments {
+			displaySections = nonEmptySpeakerSegments.map {
+				.init(
+					text: $0.text,
+					startTime: $0.startTime + channel.startOffset,
+					endTime: $0.endTime + channel.startOffset,
+					audioSource: channel.source,
+					speakerName: $0.speakerName
+				)
+			}
+		} else {
+			displaySections = timestampedSections.map { section in
+				var section = section
+				section.startTime += channel.startOffset
+				section.endTime += channel.startOffset
+				return section
+			}
+		}
+		let fallbackDisplaySections = displaySections.isEmpty && !text.isEmpty
+			? [
+				TimestampedTranscriptSection(
+					text: text,
+					startTime: channel.startOffset,
+					endTime: channel.startOffset + channel.duration,
+					audioSource: channel.source
+				)
+			]
+			: displaySections
+
+		return .init(
+			source: channel.source,
+			audioURL: channel.audioURL,
+			duration: channel.duration,
+			startOffset: channel.startOffset,
+			text: text,
+			timestampedSections: timestampedSections.isEmpty ? nil : timestampedSections,
+			speakerSegments: nonEmptySpeakerSegments,
+			displaySections: fallbackDisplaySections
+		)
+	}
 
 	func beginRefinement(
 		_ state: inout State,
@@ -1654,7 +2484,8 @@ private extension TranscriptionFeature {
 			return settings.refinementRequest(
 				for: refinementInput,
 				mode: state.forcedRefinementMode ?? .refined,
-				spokenInstruction: spokenInstruction
+				spokenInstruction: spokenInstruction,
+				rewritePrompt: state.rewritePromptForRefinement
 			)
 		}()
 		state.originalTranscriptForRefinement = text.isEmpty ? nil : text
@@ -1710,9 +2541,11 @@ private extension TranscriptionFeature {
 			state.pendingScreenAwareTranscription = nil
 			state.pendingSelectedTextTranscription = nil
 		state.forcedRefinementMode = nil
-		state.activeRecordingHotkey = nil
-		state.activeMinimumKeyTime = nil
-		state.activeRecordingSource = nil
+		state.rewritePromptForRefinement = nil
+	state.activeRecordingHotkey = nil
+	state.activeMinimumKeyTime = nil
+	state.activeRecordingSource = nil
+	state.isAgentHandoffRequestedForActiveRecording = false
 
 	let sourceAppBundleID = state.sourceAppBundleID
 	let sourceAppName = state.sourceAppName
@@ -1763,6 +2596,8 @@ private extension TranscriptionFeature {
 			selectedText: SelectedTextCapture? = nil,
 			originalTranscript: String? = nil,
 			rawTranscript: String? = nil,
+			timestampedSections: [TimestampedTranscriptSection]? = nil,
+			speakerSegments: [SpeakerAttributedSegment]? = nil,
 			screenshotData: Data? = nil,
 			screenshotRecognizedText: String? = nil,
 			processingErrors: [TranscriptProcessingError]? = nil,
@@ -1780,8 +2615,10 @@ private extension TranscriptionFeature {
 				audioURL: audioURL,
 					transcriptionHistory: transcriptionHistory,
 					selectedText: selectedText,
-					originalTranscript: originalTranscript,
-					rawTranscript: rawTranscript,
+				originalTranscript: originalTranscript,
+				rawTranscript: rawTranscript,
+				timestampedSections: timestampedSections,
+				speakerSegments: speakerSegments,
 					screenshotData: screenshotData,
 					screenshotRecognizedText: screenshotRecognizedText,
 					processingErrors: processingErrors,
@@ -1835,9 +2672,11 @@ private extension TranscriptionFeature {
 			state.pendingScreenAwareTranscription = nil
 			state.pendingSelectedTextTranscription = nil
 		state.forcedRefinementMode = nil
+		state.rewritePromptForRefinement = nil
 		state.activeRecordingHotkey = nil
 		state.activeMinimumKeyTime = nil
 		state.activeRecordingSource = nil
+		state.isAgentHandoffRequestedForActiveRecording = false
     state.isPrewarming = false
     state.error = error.localizedDescription
 
@@ -1911,6 +2750,8 @@ private extension TranscriptionFeature {
 			selectedText: SelectedTextCapture? = nil,
 			originalTranscript: String? = nil,
 			rawTranscript: String? = nil,
+			timestampedSections: [TimestampedTranscriptSection]? = nil,
+			speakerSegments: [SpeakerAttributedSegment]? = nil,
 			screenshotData: Data? = nil,
 			screenshotRecognizedText: String? = nil,
 			processingErrors: [TranscriptProcessingError]? = nil,
@@ -1937,6 +2778,8 @@ private extension TranscriptionFeature {
 			var checkpoint = history.history[index]
 			checkpoint.text = result
 			checkpoint.rawText = rawTranscript ?? originalTranscript ?? result
+			checkpoint.timestampedSections = timestampedSections ?? checkpoint.timestampedSections
+			checkpoint.speakerSegments = speakerSegments ?? checkpoint.speakerSegments
 			checkpoint.selectedText = selectedText?.text ?? checkpoint.selectedText
 			checkpoint.screenshotPath = screenshotPath ?? checkpoint.screenshotPath
 			checkpoint.screenshotByteCount = screenshotData?.count ?? checkpoint.screenshotByteCount
@@ -1960,6 +2803,8 @@ private extension TranscriptionFeature {
 		  transcriptionHistory: transcriptionHistory,
 			  screenshotData: screenshotData,
 			  rawText: rawTranscript ?? originalTranscript ?? result,
+			  timestampedSections: timestampedSections,
+			  speakerSegments: speakerSegments,
 			  selectedText: selectedText?.text,
 			  screenshotRecognizedText: screenshotRecognizedText,
 			  processingErrors: processingErrors,
@@ -1997,6 +2842,8 @@ private extension TranscriptionFeature {
 	transcriptionHistory: Shared<TranscriptionHistory>,
 	screenshotData: Data? = nil,
 	rawText: String? = nil,
+	timestampedSections: [TimestampedTranscriptSection]? = nil,
+	speakerSegments: [SpeakerAttributedSegment]? = nil,
 	selectedText: String? = nil,
 		screenshotRecognizedText: String? = nil,
 		processingErrors: [TranscriptProcessingError]? = nil,
@@ -2017,6 +2864,8 @@ private extension TranscriptionFeature {
 		status: status,
 		screenshotData: screenshotData,
 		rawText: rawText,
+		timestampedSections: timestampedSections,
+		speakerSegments: speakerSegments,
 		selectedText: selectedText,
 			screenshotRecognizedText: screenshotRecognizedText,
 			processingErrors: processingErrors,
@@ -2143,9 +2992,11 @@ private extension TranscriptionFeature {
 			state.pendingSelectedTextTranscription = nil
     state.isRecording = false
 		state.forcedRefinementMode = nil
+		state.rewritePromptForRefinement = nil
 		state.activeRecordingHotkey = nil
 		state.activeMinimumKeyTime = nil
 		state.activeRecordingSource = nil
+		state.isAgentHandoffRequestedForActiveRecording = false
     state.isPrewarming = false
 
     // Snapshot any captured transcription metadata before clearing — handleCancel during
@@ -2245,9 +3096,11 @@ private extension TranscriptionFeature {
 	state.isCapturingSelectedTextForRefinement = false
 	state.refinedHotKeyReleasedWhileCapturingSelection = false
 	state.forcedRefinementMode = nil
+	state.rewritePromptForRefinement = nil
 	state.activeRecordingHotkey = nil
 	state.activeMinimumKeyTime = nil
 	state.activeRecordingSource = nil
+	state.isAgentHandoffRequestedForActiveRecording = false
 			let selectedText = state.selectedTextForRefinement
 			state.selectedTextForRefinement = nil
 			state.originalTranscriptForRefinement = nil
@@ -2295,7 +3148,7 @@ struct TranscriptionView: View {
 	} else if store.isScreenAwareModeActive {
 	  return .screenAware
 	} else if store.isRefining {
-	  return .refining
+	  return .refining(store.rewritePromptForRefinement?.name)
 	} else if store.isTranscribing {
       return .transcribing
     } else if store.isRecording {

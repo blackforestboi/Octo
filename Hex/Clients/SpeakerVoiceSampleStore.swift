@@ -1,0 +1,149 @@
+import AVFoundation
+import Foundation
+import HexCore
+
+/// Creates small, durable clips for the local speaker library. Samples are copied
+/// out of History so a profile remains audible when its originating recording is pruned.
+enum SpeakerVoiceSampleStore {
+	static let maximumSampleDuration: TimeInterval = 12
+	static let comparisonSilenceDuration: TimeInterval = 0.75
+
+	static func capture(
+		from sourceURL: URL,
+		profileID: UUID,
+		startTime: TimeInterval,
+		endTime: TimeInterval
+	) async throws -> SpeakerVoiceSample? {
+		let asset = AVURLAsset(url: sourceURL)
+		let sourceDuration = try await asset.load(.duration).seconds
+		let start = min(max(0, startTime), sourceDuration)
+		let requestedDuration = min(maximumSampleDuration, max(0, endTime - start))
+		let duration = min(requestedDuration, sourceDuration - start)
+		guard duration >= 0.25 else { return nil }
+
+		guard let exporter = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetAppleM4A),
+			exporter.supportedFileTypes.contains(.m4a)
+		else {
+			throw SpeakerVoiceSampleStoreError.unsupportedAudio
+		}
+
+		let directory = try samplesDirectory()
+		let destinationURL = directory
+			.appendingPathComponent("\(profileID.uuidString)-\(UUID().uuidString).m4a")
+		exporter.timeRange = CMTimeRange(
+			start: CMTime(seconds: start, preferredTimescale: 600),
+			duration: CMTime(seconds: duration, preferredTimescale: 600)
+		)
+		try await exporter.export(to: destinationURL, as: .m4a)
+
+		return .init(audioURL: destinationURL, duration: duration)
+	}
+
+	static func delete(_ samples: [SpeakerVoiceSample]) {
+		for sample in samples {
+			FileManager.default.removeItemIfExists(at: sample.audioURL)
+		}
+	}
+
+	static func comparisonInput(
+		references: [SpeakerVoiceComparisonReference],
+		candidateURL: URL,
+		candidateStartTime: TimeInterval,
+		candidateEndTime: TimeInterval
+	) async throws -> SpeakerVoiceComparisonInput? {
+		guard !references.isEmpty else { return nil }
+		let composition = AVMutableComposition()
+		guard let destinationTrack = composition.addMutableTrack(
+			withMediaType: .audio,
+			preferredTrackID: kCMPersistentTrackID_Invalid
+		) else {
+			throw SpeakerVoiceSampleStoreError.unsupportedAudio
+		}
+
+		var cursor = CMTime.zero
+		var ranges = [SpeakerVoiceComparisonRange]()
+		for reference in references {
+			let asset = AVURLAsset(url: reference.audioURL)
+			guard let sourceTrack = try await asset.loadTracks(withMediaType: .audio).first else { continue }
+			let duration = try await asset.load(.duration)
+			guard duration.seconds >= 0.25 else { continue }
+			try destinationTrack.insertTimeRange(
+				CMTimeRange(start: .zero, duration: duration),
+				of: sourceTrack,
+				at: cursor
+			)
+			ranges.append(.init(
+				profileID: reference.profileID,
+				startTime: cursor.seconds,
+				endTime: (cursor + duration).seconds
+			))
+			cursor = cursor + duration + CMTime(seconds: comparisonSilenceDuration, preferredTimescale: 600)
+		}
+
+		guard !ranges.isEmpty else { return nil }
+		let candidateAsset = AVURLAsset(url: candidateURL)
+		guard let candidateTrack = try await candidateAsset.loadTracks(withMediaType: .audio).first else {
+			throw SpeakerVoiceSampleStoreError.unsupportedAudio
+		}
+		let candidateDuration = try await candidateAsset.load(.duration).seconds
+		let start = min(max(0, candidateStartTime), candidateDuration)
+		let duration = min(maximumSampleDuration, min(candidateEndTime - start, candidateDuration - start))
+		guard duration >= 0.25 else { return nil }
+		let candidateRange = CMTimeRange(
+			start: CMTime(seconds: start, preferredTimescale: 600),
+			duration: CMTime(seconds: duration, preferredTimescale: 600)
+		)
+		try destinationTrack.insertTimeRange(candidateRange, of: candidateTrack, at: cursor)
+
+		guard let exporter = AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetAppleM4A),
+			exporter.supportedFileTypes.contains(.m4a)
+		else {
+			throw SpeakerVoiceSampleStoreError.unsupportedAudio
+		}
+		let destinationURL = FileManager.default.temporaryDirectory
+			.appendingPathComponent("speaker-comparison-\(UUID().uuidString).m4a")
+		try await exporter.export(to: destinationURL, as: .m4a)
+		return .init(
+			audioURL: destinationURL,
+			referenceRanges: ranges,
+			candidateStartTime: cursor.seconds,
+			candidateEndTime: (cursor + candidateRange.duration).seconds
+		)
+	}
+
+	private static func samplesDirectory() throws -> URL {
+		let directory = try URL.hexApplicationSupport
+			.appendingPathComponent("SpeakerSamples", isDirectory: true)
+		try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+		return directory
+	}
+}
+
+struct SpeakerVoiceComparisonReference {
+	let profileID: UUID
+	let audioURL: URL
+}
+
+struct SpeakerVoiceComparisonRange {
+	let profileID: UUID
+	let startTime: TimeInterval
+	let endTime: TimeInterval
+}
+
+struct SpeakerVoiceComparisonInput {
+	let audioURL: URL
+	let referenceRanges: [SpeakerVoiceComparisonRange]
+	let candidateStartTime: TimeInterval
+	let candidateEndTime: TimeInterval
+}
+
+private enum SpeakerVoiceSampleStoreError: LocalizedError {
+	case unsupportedAudio
+
+	var errorDescription: String? {
+		switch self {
+		case .unsupportedAudio:
+			"Unable to create an audio sample for this speaker."
+		}
+	}
+}

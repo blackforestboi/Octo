@@ -53,7 +53,7 @@ struct PermissionsSectionView: View {
 				.controlSize(.small)
 			}
 			.padding(12)
-			.background(Color(nsColor: .controlBackgroundColor))
+			.background(Color.octoCardBackground)
 			.clipShape(RoundedRectangle(cornerRadius: 10))
 		}
 
@@ -100,7 +100,7 @@ struct PermissionsSectionView: View {
 		.padding(.horizontal, 12)
 		.padding(.vertical, 8)
 		.frame(maxWidth: .infinity)
-		.background(Color(nsColor: .controlBackgroundColor))
+		.background(Color.octoCardBackground)
 		.clipShape(RoundedRectangle(cornerRadius: 8))
 	}
 

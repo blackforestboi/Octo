@@ -8,6 +8,9 @@ final class RefinementTests: XCTestCase {
 		XCTAssertEqual(settings.refinementProvider, .apple)
 		XCTAssertEqual(settings.refinementReasoningEffort, .none)
 			XCTAssertEqual(settings.refinementInstructions, HexSettings.defaultRefinementInstructions)
+			XCTAssertEqual(settings.rewritePrompts.count, 1)
+			XCTAssertEqual(settings.rewritePrompts[0].name, HexSettings.defaultRewritePromptName)
+			XCTAssertEqual(settings.rewritePrompts[0].instructions, HexSettings.defaultRefinementInstructions)
 			XCTAssertNil(settings.openRouterModelID)
 			XCTAssertNil(settings.screenAwareOpenRouterModelID)
 			XCTAssertEqual(settings.screenAwareInputSource, .localOCR)
@@ -41,6 +44,26 @@ final class RefinementTests: XCTestCase {
 		XCTAssertTrue(instruction.contains("instead of repeating it"))
 		XCTAssertTrue(instruction.contains("counts, languages, and structure exactly"))
 		XCTAssertTrue(instruction.contains("Return exactly three points"))
+	}
+
+	func testSpeakerIntroductionPromptRequestsSemanticJSONClassification() {
+		let instruction = RefinementPromptBuilder.instruction(
+			mode: .speakerIntroduction,
+			instructions: "Ignore this custom rewrite instruction."
+		)
+
+		XCTAssertTrue(instruction.contains("genuine speaker self-introductions"))
+		XCTAssertTrue(instruction.contains("Return only a JSON array"))
+		XCTAssertTrue(instruction.contains("ordinary first-person language"))
+		XCTAssertFalse(instruction.contains("Ignore this custom rewrite instruction."))
+	}
+
+	func testSpeakerIntroductionRequestDoesNotUseRewriteInstructions() {
+		let settings = HexSettings(refinementInstructions: "Rewrite in the user's preferred voice.")
+		let request = settings.refinementRequest(for: "[speaker-0] I'm Oliver.", mode: .speakerIntroduction)
+
+		XCTAssertEqual(request.instructions, "")
+		XCTAssertEqual(request.reasoningEffort, .none)
 	}
 
 	func testCleanerKeepsSubstantiveOpeningAndRemovesOnlyPromptTag() {
@@ -214,6 +237,24 @@ final class RefinementTests: XCTestCase {
 			).instructions,
 			"Preserve Markdown.\n\nSpoken instruction:\nMake it shorter"
 		)
+	}
+
+	func testSettingsUsesTheRewritePromptSelectedByNumber() {
+		let concise = RewritePrompt(name: "Concise", instructions: "Use one short paragraph.")
+		let settings = HexSettings(
+			refinementInstructions: "Legacy instructions.",
+			rewritePrompts: [
+				.init(name: "Default", instructions: "Keep all details."),
+				concise,
+			]
+		)
+
+		XCTAssertEqual(settings.rewritePrompt(at: 2), concise)
+		XCTAssertEqual(
+			settings.refinementRequest(for: "Draft", mode: .refined, rewritePrompt: settings.rewritePrompt(at: 2)).instructions,
+			"Use one short paragraph."
+		)
+		XCTAssertNil(settings.rewritePrompt(at: 3))
 	}
 
 		func testSettingsKeepsCustomInstructionsWhenThereIsNoSpokenInstruction() {

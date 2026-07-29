@@ -204,6 +204,7 @@ struct HistoryFeature {
 	struct ReplayResult: Equatable, Sendable {
 		let rawText: String
 		let outputText: String
+		let timestampedSections: [TimestampedTranscriptSection]?
 		let wasRefined: Bool
 		let outputGenerationDuration: TimeInterval?
 	}
@@ -285,9 +286,9 @@ struct HistoryFeature {
 				chunkingStrategy: .vad
 			)
 
-			let rawText: String
+			let transcriptionOutput: TranscriptionOutput
 			do {
-				rawText = try await transcription.transcribe(
+				transcriptionOutput = try await transcription.transcribe(
 					transcript.audioPath,
 					settings.selectedModel,
 					decodingOptions
@@ -296,6 +297,10 @@ struct HistoryFeature {
 				await send(.replayFailed(id, .transcription, error.localizedDescription))
 				return
 			}
+			let rawText = transcriptionOutput.canonicalText
+			let timestampedSections = transcriptionOutput.timestampedSections.isEmpty
+				? nil
+				: transcriptionOutput.timestampedSections
 
 			let shouldReprocess = includeProcessing && (
 				transcript.wasRefined == true
@@ -303,7 +308,13 @@ struct HistoryFeature {
 				|| transcript.screenshotPath != nil
 			)
 			guard shouldReprocess else {
-				await send(.replaySucceeded(id, .init(rawText: rawText, outputText: rawText, wasRefined: false, outputGenerationDuration: nil)))
+				await send(.replaySucceeded(id, .init(
+					rawText: rawText,
+					outputText: rawText,
+					timestampedSections: timestampedSections,
+					wasRefined: false,
+					outputGenerationDuration: nil
+				)))
 				return
 			}
 
@@ -342,6 +353,7 @@ struct HistoryFeature {
 				await send(.replaySucceeded(id, .init(
 					rawText: rawText,
 					outputText: outputText,
+					timestampedSections: timestampedSections,
 					wasRefined: true,
 					outputGenerationDuration: now.timeIntervalSince(outputGenerationStartedAt)
 				)))
@@ -469,8 +481,12 @@ struct HistoryFeature {
 					guard let index = history.history.firstIndex(where: { $0.id == id }) else { return }
 					history.history[index].rawText = result.rawText
 					history.history[index].text = result.outputText
+					history.history[index].timestampedSections = result.timestampedSections
 					history.history[index].wasRefined = result.wasRefined
 					history.history[index].outputGenerationDuration = result.outputGenerationDuration
+					// Replay does not run speaker identification, so retained labels would no
+					// longer describe the newly generated transcript.
+					history.history[index].speakerSegments = nil
 					history.history[index].status = .completed
 					history.history[index].processingErrors = nil
 				}
@@ -602,6 +618,11 @@ private struct AudioWaveformView: View {
 }
 
 private struct RunHistoryItemView: View {
+	private enum TranscriptPresentation: Hashable {
+		case textOnly
+		case timestampsAndSpeakerLabels
+	}
+
 	let transcript: Transcript
 	let legacyRawTranscript: String?
 	let isPlaying: Bool
@@ -616,9 +637,24 @@ private struct RunHistoryItemView: View {
 	let onRerunFullRun: () -> Void
 	let onDelete: () -> Void
 	let searchQuery: String
+	@State private var transcriptPresentation: TranscriptPresentation = .textOnly
+	@State private var isHoveringTranscription = false
+	@FocusState private var focusedTranscriptPresentation: TranscriptPresentation?
 
 	private var rawTranscript: String { transcript.rawText ?? legacyRawTranscript ?? transcript.text }
 	private var hasDistinctResult: Bool { transcript.text != rawTranscript || transcript.wasRefined == true }
+	private var timestampedSections: [TimestampedTranscriptSection] { transcript.timestampedSections ?? [] }
+	private var speakerSegments: [SpeakerAttributedSegment] { transcript.speakerSegments ?? [] }
+	private func speakerName(for section: TimestampedTranscriptSection) -> String? {
+		if let displayLabel = section.displayLabel { return displayLabel }
+		let matchingSegments = speakerSegments.filter {
+			$0.startTime <= section.startTime && $0.endTime >= section.endTime
+		}
+		return matchingSegments.count == 1 ? matchingSegments[0].speakerName : nil
+	}
+	private var shouldShowTranscriptPresentationControls: Bool {
+		isHoveringTranscription || focusedTranscriptPresentation != nil
+	}
 	private var screenshotByteCount: Int? {
 		if let screenshotByteCount = transcript.screenshotByteCount { return screenshotByteCount }
 		return try? transcript.screenshotPath?.resourceValues(forKeys: [.fileSizeKey]).fileSize
@@ -646,36 +682,7 @@ private struct RunHistoryItemView: View {
 				.foregroundStyle(.secondary)
 			}
 
-			section("Transcription", systemImage: "text.quote") {
-				if let status = transcript.status, status != .completed {
-					Label(status.historyLabel, systemImage: status.historySystemImage)
-						.font(.caption.weight(.semibold))
-						.foregroundStyle(status == .failed ? .red : .secondary)
-				}
-				Text(highlightedText(
-					rawTranscript.isEmpty
-						? (transcript.status == .processing ? "Transcription is still processing." : "No transcription was produced.")
-						: rawTranscript,
-					matching: searchQuery
-				))
-					.textSelection(.enabled)
-					.fixedSize(horizontal: false, vertical: true)
-				if hasDistinctResult {
-					Divider().padding(.vertical, 4)
-					Text("Result").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-					Text(highlightedText(
-						transcript.text.isEmpty ? "No result was produced." : transcript.text,
-						matching: searchQuery
-					))
-						.textSelection(.enabled)
-						.fixedSize(horizontal: false, vertical: true)
-					if let outputGenerationDuration = transcript.outputGenerationDuration {
-						Label("Generated in \(formatElapsed(outputGenerationDuration))", systemImage: "timer")
-							.font(.caption)
-							.foregroundStyle(.secondary)
-					}
-				}
-			}
+			transcriptionSection
 
 			if let selectedText = transcript.selectedText, !selectedText.isEmpty {
 				section("Selected text", systemImage: "selection.pin.in.out") {
@@ -721,7 +728,150 @@ private struct RunHistoryItemView: View {
 			Divider()
 			footer
 		}
-		.background(RoundedRectangle(cornerRadius: 8).fill(Color(.windowBackgroundColor).opacity(0.5)).overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Color.secondary.opacity(0.2), lineWidth: 1)))
+		.background(
+			Color.octoCardBackground,
+			in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+		)
+	}
+
+	private var transcriptionSection: some View {
+		VStack(alignment: .leading, spacing: 8) {
+			HStack(spacing: 8) {
+				Label("Transcription", systemImage: "text.quote")
+					.font(.caption.weight(.semibold))
+					.foregroundStyle(.secondary)
+				Spacer(minLength: 8)
+				transcriptPresentationControls
+			}
+
+			if let status = transcript.status, status != .completed {
+				Label(status.historyLabel, systemImage: status.historySystemImage)
+					.font(.caption.weight(.semibold))
+					.foregroundStyle(status == .failed ? .red : .secondary)
+			}
+
+			transcriptPresentationContent
+
+			if hasDistinctResult {
+				Divider().padding(.vertical, 4)
+				Text("Result").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+				Text(highlightedText(
+					transcript.text.isEmpty ? "No result was produced." : transcript.text,
+					matching: searchQuery
+				))
+					.textSelection(.enabled)
+					.fixedSize(horizontal: false, vertical: true)
+				if let outputGenerationDuration = transcript.outputGenerationDuration {
+					Label("Generated in \(formatElapsed(outputGenerationDuration))", systemImage: "timer")
+						.font(.caption)
+						.foregroundStyle(.secondary)
+				}
+			}
+		}
+		.padding(12)
+		.overlay(alignment: .bottom) { Divider() }
+		.onHover { isHoveringTranscription = $0 }
+		.accessibilityAction(named: "Show text only") {
+			transcriptPresentation = .textOnly
+		}
+		.accessibilityAction(named: "Show timestamps and speaker labels") {
+			transcriptPresentation = .timestampsAndSpeakerLabels
+		}
+	}
+
+	private var transcriptPresentationControls: some View {
+		HStack(spacing: 4) {
+			transcriptPresentationButton(
+				"Text only",
+				systemImage: "arrow.down.right.and.arrow.up.left",
+				presentation: .textOnly
+			)
+			transcriptPresentationButton(
+				"With timestamps",
+				systemImage: "clock",
+				presentation: .timestampsAndSpeakerLabels
+			)
+		}
+		.font(.caption)
+		.opacity(shouldShowTranscriptPresentationControls ? 1 : 0)
+		.animation(.easeInOut(duration: 0.15), value: shouldShowTranscriptPresentationControls)
+	}
+
+	private func transcriptPresentationButton(
+		_ title: String,
+		systemImage: String,
+		presentation: TranscriptPresentation
+	) -> some View {
+		let isSelected = transcriptPresentation == presentation
+		return Button {
+			transcriptPresentation = presentation
+		} label: {
+			Label(title, systemImage: systemImage)
+				.lineLimit(1)
+				.padding(.horizontal, 7)
+				.padding(.vertical, 4)
+				.background(
+					isSelected ? Color.accentColor.opacity(0.18) : .clear,
+					in: Capsule()
+				)
+		}
+		.buttonStyle(.plain)
+		.foregroundStyle(isSelected ? .primary : .secondary)
+		.focused($focusedTranscriptPresentation, equals: presentation)
+		.help(title)
+		.accessibilityLabel(title)
+		.accessibilityValue(isSelected ? "Selected" : "Not selected")
+	}
+
+	@ViewBuilder
+	private var transcriptPresentationContent: some View {
+		switch transcriptPresentation {
+		case .textOnly:
+			Text(highlightedText(
+				rawTranscript.isEmpty
+					? (transcript.status == .processing ? "Transcription is still processing." : "No transcription was produced.")
+					: rawTranscript,
+				matching: searchQuery
+			))
+				.textSelection(.enabled)
+				.fixedSize(horizontal: false, vertical: true)
+
+		case .timestampsAndSpeakerLabels:
+			if timestampedSections.isEmpty {
+				Text(highlightedText(
+					rawTranscript.isEmpty
+						? (transcript.status == .processing ? "Transcription is still processing." : "No transcription was produced.")
+						: rawTranscript,
+					matching: searchQuery
+				))
+					.textSelection(.enabled)
+					.fixedSize(horizontal: false, vertical: true)
+				Label("Timestamps were not captured for this recording.", systemImage: "info.circle")
+					.font(.caption)
+					.foregroundStyle(.secondary)
+			} else {
+				VStack(alignment: .leading, spacing: 10) {
+					ForEach(timestampedSections) { section in
+						HStack(alignment: .firstTextBaseline, spacing: 8) {
+							Text("\(format(section.startTime))–\(format(section.endTime))")
+								.font(.caption.monospacedDigit())
+								.foregroundStyle(.secondary)
+								.frame(width: 72, alignment: .leading)
+							VStack(alignment: .leading, spacing: 2) {
+								if let speakerName = speakerName(for: section) {
+									Text(speakerName)
+										.font(.caption.weight(.semibold))
+										.foregroundStyle(.secondary)
+								}
+								Text(highlightedText(section.text, matching: searchQuery))
+									.textSelection(.enabled)
+									.fixedSize(horizontal: false, vertical: true)
+							}
+						}
+					}
+				}
+			}
+		}
 	}
 
 	private var footer: some View {

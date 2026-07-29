@@ -40,10 +40,26 @@ public enum IndicatorLocation: String, Codable, CaseIterable, Equatable, Sendabl
 	}
 }
 
+/// A named instruction set that can be selected with a long-held number key
+/// while finishing a recording.
+public struct RewritePrompt: Codable, Equatable, Identifiable, Sendable {
+	public var id: UUID
+	public var name: String
+	public var instructions: String
+
+	public init(id: UUID = UUID(), name: String, instructions: String) {
+		self.id = id
+		self.name = name
+		self.instructions = instructions
+	}
+}
+
 /// User-configurable settings saved to disk.
 public struct HexSettings: Codable, Equatable, Sendable {
 	public static let defaultPasteLastTranscriptHotkey = HotKey(key: .v, modifiers: [.option, .shift])
 	public static let baseSoundEffectsVolume: Double = HexCoreConstants.baseSoundEffectsVolume
+	public static let maximumRewritePrompts = 9
+	public static let defaultRewritePromptName = "Default"
 	public static let defaultWordRemovals: [WordRemoval] = [
 		.init(pattern: "uh+"),
 		.init(pattern: "um+"),
@@ -109,6 +125,13 @@ public struct HexSettings: Codable, Equatable, Sendable {
 	public var wordRemappings: [WordRemapping]
 	public var lowercaseTranscripts: Bool
 	public var removePunctuation: Bool
+	/// Enables a second, local pass that assigns speaker labels to timed transcript words.
+	public var speakerIdentificationEnabled: Bool
+	/// Captures system playback as a second, independently transcribed audio stream.
+	public var includeSystemAudio: Bool
+	/// The local diarization implementation. Keeping this preference explicit makes
+	/// future on-device providers a settings change rather than a data migration.
+	public var speakerDiarizationProvider: SpeakerDiarizationProvider
 	/// Optional post-processing is deliberately separate from the transcription pipeline.
 	public var refinementMode: RefinementMode
 	public var refinementProvider: RefinementProvider
@@ -123,6 +146,8 @@ public struct HexSettings: Codable, Equatable, Sendable {
 	public var claudeCLIModelID: String?
 	/// User-authored instructions appended to Hex's refinement contract.
 	public var refinementInstructions: String
+	/// Named rewrite instructions. Their one-based positions map to long-held number keys.
+	public var rewritePrompts: [RewritePrompt]
 	public var openRouterModelID: String?
 	/// Vision-capable OpenRouter model used only when the selected refinement model
 	/// cannot accept an uploaded screenshot.
@@ -143,13 +168,37 @@ public struct HexSettings: Codable, Equatable, Sendable {
 		return !screenAwareOpenRouterModelID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
 	}
 
+	public func rewritePrompt(at oneBasedIndex: Int) -> RewritePrompt? {
+		guard rewritePrompts.indices.contains(oneBasedIndex - 1) else { return nil }
+		return rewritePrompts[oneBasedIndex - 1]
+	}
+
+	private var defaultRewritePrompt: RewritePrompt {
+		rewritePrompts.first ?? .init(
+			name: Self.defaultRewritePromptName,
+			instructions: refinementInstructions
+		)
+	}
+
 	public func refinementRequest(
 		for text: String,
 		mode: RefinementMode,
-		spokenInstruction: String? = nil
+		spokenInstruction: String? = nil,
+		rewritePrompt: RewritePrompt? = nil
 	) -> RefinementRequest {
 		let spokenInstruction = spokenInstruction?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-		var instructionParts = [refinementInstructions.trimmingCharacters(in: .whitespacesAndNewlines)]
+		if mode == .speakerIntroduction {
+			return .init(
+				text: text,
+				mode: mode,
+				instructions: "",
+				provider: refinementProvider,
+				reasoningEffort: .none,
+				modelID: selectedRefinementModelID
+			)
+		}
+		let prompt = rewritePrompt ?? defaultRewritePrompt
+		var instructionParts = [prompt.instructions.trimmingCharacters(in: .whitespacesAndNewlines)]
 		if !spokenInstruction.isEmpty {
 			instructionParts.append("Spoken instruction:\n\(spokenInstruction)")
 		}
@@ -177,7 +226,7 @@ public struct HexSettings: Codable, Equatable, Sendable {
 			return RefinementRequest(
 				text: spokenRequest,
 				mode: .refined,
-			instructions: refinementInstructions.trimmingCharacters(in: .whitespacesAndNewlines),
+			instructions: defaultRewritePrompt.instructions.trimmingCharacters(in: .whitespacesAndNewlines),
 			provider: usesUploadedImage && !refinementProvider.supportsImageInput ? .openRouter : refinementProvider,
 			reasoningEffort: refinementReasoningEffort,
 			modelID: usesUploadedImage ? (imageModelID ?? screenAwareOpenRouterModelID) : selectedRefinementModelID,
@@ -240,6 +289,9 @@ public struct HexSettings: Codable, Equatable, Sendable {
 		wordRemappings: [WordRemapping] = [],
 		lowercaseTranscripts: Bool = false,
 		removePunctuation: Bool = false,
+		speakerIdentificationEnabled: Bool = false,
+		includeSystemAudio: Bool = false,
+		speakerDiarizationProvider: SpeakerDiarizationProvider = .fluidAudio,
 		refinementMode: RefinementMode = .raw,
 		refinementProvider: RefinementProvider = .apple,
 		refinementReasoningEffort: RefinementReasoningEffort = .none,
@@ -249,6 +301,7 @@ public struct HexSettings: Codable, Equatable, Sendable {
 		codexCLIModelID: String? = nil,
 		claudeCLIModelID: String? = nil,
 			refinementInstructions: String = HexSettings.defaultRefinementInstructions,
+			rewritePrompts: [RewritePrompt]? = nil,
 			openRouterModelID: String? = nil,
 			screenAwareOpenRouterModelID: String? = nil,
 			screenAwareDictationEnabled: Bool = false,
@@ -285,6 +338,9 @@ public struct HexSettings: Codable, Equatable, Sendable {
 		self.wordRemappings = wordRemappings
 		self.lowercaseTranscripts = lowercaseTranscripts
 		self.removePunctuation = removePunctuation
+		self.speakerIdentificationEnabled = speakerIdentificationEnabled
+		self.includeSystemAudio = includeSystemAudio
+		self.speakerDiarizationProvider = speakerDiarizationProvider
 		self.refinementMode = refinementMode
 		self.refinementProvider = refinementProvider
 		self.refinementReasoningEffort = refinementReasoningEffort
@@ -294,6 +350,17 @@ public struct HexSettings: Codable, Equatable, Sendable {
 		self.codexCLIModelID = codexCLIModelID
 		self.claudeCLIModelID = claudeCLIModelID
 			self.refinementInstructions = refinementInstructions
+			let prompts = rewritePrompts ?? [.init(
+				name: Self.defaultRewritePromptName,
+				instructions: refinementInstructions
+			)]
+			self.rewritePrompts = Array(prompts.prefix(Self.maximumRewritePrompts))
+			if self.rewritePrompts.isEmpty {
+				self.rewritePrompts = [.init(
+					name: Self.defaultRewritePromptName,
+					instructions: refinementInstructions
+				)]
+			}
 			self.openRouterModelID = openRouterModelID
 			self.screenAwareOpenRouterModelID = screenAwareOpenRouterModelID
 			self.screenAwareDictationEnabled = screenAwareDictationEnabled
@@ -308,6 +375,16 @@ public struct HexSettings: Codable, Equatable, Sendable {
 		let hasStoredRefinementProviderDetection = container.contains(.hasCompletedRefinementProviderDetection)
 		for field in HexSettingsSchema.fields {
 			try field.decode(into: &self, from: container)
+		}
+		// Versions before named rewrite prompts stored one instruction string. Keep that
+		// exact string as the first prompt so existing refinements remain unchanged.
+		if !container.contains(.rewritePrompts) || rewritePrompts.isEmpty {
+			rewritePrompts = [.init(
+				name: Self.defaultRewritePromptName,
+				instructions: refinementInstructions
+			)]
+		} else {
+			rewritePrompts = Array(rewritePrompts.prefix(Self.maximumRewritePrompts))
 		}
 		// Existing installations already have a provider choice. Only a fresh
 		// settings store should receive the automatic subscription selection.
@@ -370,6 +447,9 @@ private enum HexSettingKey: String, CodingKey, CaseIterable {
 	case wordRemappings
 	case lowercaseTranscripts
 	case removePunctuation
+	case speakerIdentificationEnabled
+	case includeSystemAudio
+	case speakerDiarizationProvider
 	case refinementMode
 	case refinementProvider
 	case refinementReasoningEffort
@@ -379,6 +459,7 @@ private enum HexSettingKey: String, CodingKey, CaseIterable {
 	case codexCLIModelID
 	case claudeCLIModelID
 	case refinementInstructions
+	case rewritePrompts
 		case openRouterModelID
 		case screenAwareOpenRouterModelID
 		case screenAwareDictationEnabled
@@ -523,6 +604,9 @@ private enum HexSettingsSchema {
 		).eraseToAny(),
 		SettingsField(.lowercaseTranscripts, keyPath: \.lowercaseTranscripts, default: defaults.lowercaseTranscripts).eraseToAny(),
 		SettingsField(.removePunctuation, keyPath: \.removePunctuation, default: defaults.removePunctuation).eraseToAny(),
+		SettingsField(.speakerIdentificationEnabled, keyPath: \.speakerIdentificationEnabled, default: defaults.speakerIdentificationEnabled).eraseToAny(),
+		SettingsField(.includeSystemAudio, keyPath: \.includeSystemAudio, default: defaults.includeSystemAudio).eraseToAny(),
+		SettingsField(.speakerDiarizationProvider, keyPath: \.speakerDiarizationProvider, default: defaults.speakerDiarizationProvider).eraseToAny(),
 		SettingsField(.refinementMode, keyPath: \.refinementMode, default: defaults.refinementMode).eraseToAny(),
 		SettingsField(.refinementProvider, keyPath: \.refinementProvider, default: defaults.refinementProvider).eraseToAny(),
 		SettingsField(.refinementReasoningEffort, keyPath: \.refinementReasoningEffort, default: defaults.refinementReasoningEffort).eraseToAny(),
@@ -556,6 +640,7 @@ private enum HexSettingsSchema {
 			encode: { container, key, value in try container.encodeIfPresent(value, forKey: key) }
 		).eraseToAny(),
 		SettingsField(.refinementInstructions, keyPath: \.refinementInstructions, default: defaults.refinementInstructions).eraseToAny(),
+		SettingsField(.rewritePrompts, keyPath: \.rewritePrompts, default: defaults.rewritePrompts).eraseToAny(),
 			SettingsField(
 				.openRouterModelID,
 				keyPath: \.openRouterModelID,

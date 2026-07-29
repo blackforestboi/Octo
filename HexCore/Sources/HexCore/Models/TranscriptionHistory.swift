@@ -15,6 +15,57 @@ public enum TranscriptProcessingStage: String, Codable, CaseIterable, Equatable,
 	case processing
 }
 
+/// The independently captured audio input that produced a transcript channel.
+///
+/// A recording can include both the user's microphone and system playback. Keeping
+/// the source alongside the channel lets History preserve each recording and still
+/// render their timed sections as one conversation.
+public enum TranscriptAudioSource: String, Codable, CaseIterable, Equatable, Sendable, Identifiable {
+	case microphone
+	case systemAudio
+
+	public var id: Self { self }
+
+	public var displayName: String {
+		switch self {
+		case .microphone: "Microphone"
+		case .systemAudio: "System Audio"
+		}
+	}
+}
+
+/// One independently captured and transcribed audio stream in a recording.
+public struct TranscriptAudioChannel: Codable, Equatable, Identifiable, Sendable {
+	public var source: TranscriptAudioSource
+	public var audioPath: URL
+	public var duration: TimeInterval
+	/// Offset from the microphone recording's start, used only when merging channels for display.
+	public var startOffset: TimeInterval
+	public var text: String
+	public var timestampedSections: [TimestampedTranscriptSection]?
+	public var speakerSegments: [SpeakerAttributedSegment]?
+
+	public var id: TranscriptAudioSource { source }
+
+	public init(
+		source: TranscriptAudioSource,
+		audioPath: URL,
+		duration: TimeInterval,
+		startOffset: TimeInterval = 0,
+		text: String = "",
+		timestampedSections: [TimestampedTranscriptSection]? = nil,
+		speakerSegments: [SpeakerAttributedSegment]? = nil
+	) {
+		self.source = source
+		self.audioPath = audioPath
+		self.duration = duration
+		self.startOffset = startOffset
+		self.text = text
+		self.timestampedSections = timestampedSections
+		self.speakerSegments = speakerSegments
+	}
+}
+
 public struct TranscriptProcessingError: Codable, Equatable, Sendable, Identifiable {
 	public var id: UUID
 	public var stage: TranscriptProcessingStage
@@ -51,6 +102,13 @@ public struct Transcript: Codable, Equatable, Identifiable, Sendable {
 	public var selectedText: String?
 	/// Locally recognized text from the stored screenshot.
 	public var screenshotRecognizedText: String?
+	/// Timestamped sentence sections captured by a timing-capable ASR provider.
+	public var timestampedSections: [TimestampedTranscriptSection]?
+	/// Timed, local speaker labels when speaker identification was enabled for this recording.
+	public var speakerSegments: [SpeakerAttributedSegment]?
+	/// The microphone and, when enabled, system-audio streams retained independently.
+	/// Older recordings decode without this field and continue to use the legacy top-level fields.
+	public var audioChannels: [TranscriptAudioChannel]?
 	/// Diagnostics retained with the run so failures are inspectable and retryable.
 	public var processingErrors: [TranscriptProcessingError]?
 	/// Whether this run included an AI processing step after transcription.
@@ -79,6 +137,9 @@ public struct Transcript: Codable, Equatable, Identifiable, Sendable {
 		rawText: String? = nil,
 		selectedText: String? = nil,
 		screenshotRecognizedText: String? = nil,
+		timestampedSections: [TimestampedTranscriptSection]? = nil,
+		speakerSegments: [SpeakerAttributedSegment]? = nil,
+		audioChannels: [TranscriptAudioChannel]? = nil,
 		processingErrors: [TranscriptProcessingError]? = nil,
 		wasRefined: Bool? = nil,
 		outputGenerationDuration: TimeInterval? = nil,
@@ -99,6 +160,9 @@ public struct Transcript: Codable, Equatable, Identifiable, Sendable {
 		self.rawText = rawText
 		self.selectedText = selectedText
 		self.screenshotRecognizedText = screenshotRecognizedText
+		self.timestampedSections = timestampedSections
+		self.speakerSegments = speakerSegments
+		self.audioChannels = audioChannels
 		self.processingErrors = processingErrors
 		self.wasRefined = wasRefined
 		self.outputGenerationDuration = outputGenerationDuration

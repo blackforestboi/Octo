@@ -12,6 +12,8 @@ public struct TranscriptPersistenceRequest: Sendable {
 	/// A screenshot that was durably staged before the audio checkpoint existed.
 	public let screenshotPath: URL?
 	public let rawText: String?
+	public let timestampedSections: [TimestampedTranscriptSection]?
+	public let speakerSegments: [SpeakerAttributedSegment]?
 	public let selectedText: String?
 	public let screenshotRecognizedText: String?
 	public let processingErrors: [TranscriptProcessingError]?
@@ -29,6 +31,8 @@ public struct TranscriptPersistenceRequest: Sendable {
 		screenshotData: Data? = nil,
 		screenshotPath: URL? = nil,
 		rawText: String? = nil,
+		timestampedSections: [TimestampedTranscriptSection]? = nil,
+		speakerSegments: [SpeakerAttributedSegment]? = nil,
 		selectedText: String? = nil,
 		screenshotRecognizedText: String? = nil,
 		processingErrors: [TranscriptProcessingError]? = nil,
@@ -45,6 +49,8 @@ public struct TranscriptPersistenceRequest: Sendable {
 		self.screenshotData = screenshotData
 		self.screenshotPath = screenshotPath
 		self.rawText = rawText
+		self.timestampedSections = timestampedSections
+		self.speakerSegments = speakerSegments
 		self.selectedText = selectedText
 		self.screenshotRecognizedText = screenshotRecognizedText
 		self.processingErrors = processingErrors
@@ -56,6 +62,9 @@ public struct TranscriptPersistenceRequest: Sendable {
 
 public struct TranscriptPersistenceClient: Sendable {
 	public var save: @Sendable (_ request: TranscriptPersistenceRequest) async throws -> Transcript
+	/// Moves an additional audio stream into the app's durable recordings folder.
+	/// The returned URL is stored on the matching `TranscriptAudioChannel`.
+	public var saveAudioChannel: @Sendable (_ audioURL: URL, _ transcriptID: UUID, _ source: TranscriptAudioSource) async throws -> URL
 	public var saveScreenshot: @Sendable (_ imagePNGData: Data) async throws -> URL
 	public var deleteArtifacts: @Sendable (_ transcript: Transcript) async throws -> Void
 }
@@ -119,6 +128,18 @@ extension TranscriptPersistenceClient: DependencyKey {
 					rawText: request.rawText,
 					selectedText: request.selectedText,
 					screenshotRecognizedText: request.screenshotRecognizedText,
+					timestampedSections: request.timestampedSections,
+					speakerSegments: request.speakerSegments,
+					audioChannels: [
+						.init(
+							source: .microphone,
+							audioPath: finalURL,
+							duration: request.duration,
+							text: request.rawText ?? request.text,
+							timestampedSections: request.timestampedSections,
+							speakerSegments: request.speakerSegments
+						)
+					],
 					processingErrors: request.processingErrors,
 					wasRefined: request.wasRefined,
 					outputGenerationDuration: request.outputGenerationDuration,
@@ -126,6 +147,20 @@ extension TranscriptPersistenceClient: DependencyKey {
 					screenAwareInputSource: request.screenAwareInputSource,
 					recoverySessionID: recoverySessionID
                 )
+			},
+			saveAudioChannel: { audioURL, transcriptID, source in
+				let fm = FileManager.default
+				let recordingsFolder = try URL.hexApplicationSupport.appendingPathComponent("Recordings", isDirectory: true)
+				try fm.createDirectory(at: recordingsFolder, withIntermediateDirectories: true)
+				let pathExtension = audioURL.pathExtension.isEmpty ? "m4a" : audioURL.pathExtension
+				let finalURL = recordingsFolder.appendingPathComponent(
+					"\(transcriptID.uuidString)-\(source.rawValue).\(pathExtension)"
+				)
+				if fm.fileExists(atPath: finalURL.path) {
+					try fm.removeItem(at: finalURL)
+				}
+				try fm.moveItem(at: audioURL, to: finalURL)
+				return finalURL
 			},
 			saveScreenshot: { imagePNGData in
 				let fm = FileManager.default
@@ -136,7 +171,10 @@ extension TranscriptPersistenceClient: DependencyKey {
 				return url
 			},
 			deleteArtifacts: { transcript in
-				try? FileManager.default.removeItem(at: transcript.audioPath)
+				let audioURLs = Set((transcript.audioChannels ?? []).map(\.audioPath) + [transcript.audioPath])
+				for audioURL in audioURLs {
+					try? FileManager.default.removeItem(at: audioURL)
+				}
 				if let screenshotPath = transcript.screenshotPath {
 					try? FileManager.default.removeItem(at: screenshotPath)
 				}
@@ -148,6 +186,7 @@ extension TranscriptPersistenceClient: DependencyKey {
 		save: { _ in
             Transcript(timestamp: Date(), text: "", audioPath: URL(fileURLWithPath: "/"), duration: 0)
         },
+		saveAudioChannel: { _, _, _ in URL(fileURLWithPath: "/") },
 		saveScreenshot: { _ in URL(fileURLWithPath: "/") },
 		deleteArtifacts: { _ in }
     )

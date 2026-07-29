@@ -7,6 +7,26 @@ import XCTest
 
 @MainActor
 final class AppFeatureTests: XCTestCase {
+	func testSpeakersTabCanBeSelected() async {
+		let store = TestStore(initialState: AppFeature.State()) {
+			AppFeature()
+		}
+
+		await store.send(.setActiveTab(.speakers)) {
+			$0.activeTab = .speakers
+		}
+	}
+
+	func testHandoffsTabCanBeSelected() async {
+		let store = TestStore(initialState: AppFeature.State()) {
+			AppFeature()
+		}
+
+		await store.send(.setActiveTab(.handoffs)) {
+			$0.activeTab = .handoffs
+		}
+	}
+
 	func testSupportTabCanBeSelected() async {
 		let store = TestStore(initialState: AppFeature.State()) {
 			AppFeature()

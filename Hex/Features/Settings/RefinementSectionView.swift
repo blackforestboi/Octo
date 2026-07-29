@@ -7,6 +7,7 @@ import SwiftUI
 struct RefinementSectionView: View {
 	@ObserveInjection var inject
 	@Bindable var store: StoreOf<SettingsFeature>
+	@Dependency(\.agentHandoff) private var agentHandoff
 	@State private var geminiAPIKey = ""
 	@State private var openRouterAPIKey = ""
 	@State private var openAIAPIKey = ""
@@ -15,6 +16,10 @@ struct RefinementSectionView: View {
 	@State private var isShowingScreenAwareModelPicker = false
 	@State private var directModelPickerTarget: DirectModelPickerTarget?
 	@State private var subscriptionModelPickerTarget: SubscriptionModelPickerTarget?
+	@State private var selectedRewritePromptID: RewritePrompt.ID?
+	@State private var isShowingRewritePromptDeletionConfirmation = false
+	@State private var codexProjectPath: String?
+	@State private var codexProjectError: String?
 
 	private enum DirectModelPickerTarget: Identifiable {
 		case refinement
@@ -177,6 +182,33 @@ struct RefinementSectionView: View {
 						}
 						.frame(maxWidth: .infinity, alignment: .leading)
 						.contentShape(Rectangle())
+						Button {
+							Task {
+								do {
+									codexProjectPath = try await agentHandoff.chooseCodexProject()
+									codexProjectError = nil
+								} catch is CancellationError {
+									return
+								} catch {
+									codexProjectError = error.localizedDescription
+								}
+							}
+						} label: {
+							LabeledContent("Agent Handoff project (optional)") {
+								Text(codexProjectPath ?? "Octo managed workspace")
+									.foregroundStyle(codexProjectPath == nil ? .secondary : .primary)
+							}
+						}
+						.frame(maxWidth: .infinity, alignment: .leading)
+						.contentShape(Rectangle())
+						Text("By default, Agent Handoff uses Octo’s managed workspace. Choose a project only when you want tasks to use that project’s files, AGENTS.md, .codex configuration, skills, plugins, and MCP servers.")
+							.font(.caption)
+							.foregroundStyle(.secondary)
+						if let codexProjectError {
+							Text(codexProjectError)
+								.font(.caption)
+								.foregroundStyle(.red)
+						}
 						Text("Uses your signed-in OpenAI subscription through the local Codex CLI. Octo sends only the completed refinement prompt; audio is never sent.")
 							.font(.caption)
 							.foregroundStyle(.secondary)
@@ -200,17 +232,7 @@ struct RefinementSectionView: View {
 					}
 				}
 
-			VStack(alignment: .leading, spacing: 8) {
-				Label("Refinement Instructions", systemImage: "sparkles")
-					.font(.headline)
-				TextEditor(text: $store.hexSettings.refinementInstructions)
-					.font(.body)
-					.multilineTextAlignment(.leading)
-					.frame(maxWidth: .infinity, minHeight: 130, maxHeight: 180, alignment: .topLeading)
-					.padding(8)
-					.background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
-			}
-			.frame(maxWidth: .infinity, alignment: .leading)
+			rewritePromptsSection
 
 					VStack(alignment: .leading, spacing: 8) {
 						HStack {
@@ -288,7 +310,12 @@ struct RefinementSectionView: View {
 			geminiAPIKey = GeminiAPIKeyStore.read() ?? ""
 			openRouterAPIKey = OpenRouterAPIKeyStore.read() ?? ""
 			openAIAPIKey = OpenAIAPIKeyStore.read() ?? ""
-			anthropicAPIKey = AnthropicAPIKeyStore.read() ?? ""
+				anthropicAPIKey = AnthropicAPIKeyStore.read() ?? ""
+				codexProjectPath = agentHandoff.codexProjectPath()
+				selectFirstRewritePromptIfNeeded()
+		}
+		.onChange(of: store.hexSettings.rewritePrompts.map(\.id)) { _, _ in
+			selectFirstRewritePromptIfNeeded()
 		}
 		.onChange(of: store.hexSettings.refinementProvider) { oldProvider, _ in
 			if oldProvider == .gemini { persistGeminiAPIKey() }
@@ -342,6 +369,187 @@ struct RefinementSectionView: View {
 				)
 			}
 		.enableInjection()
+	}
+
+	private var rewritePromptsSection: some View {
+		VStack(alignment: .leading, spacing: 8) {
+			Label("Rewrite Prompts", systemImage: "sparkles")
+				.font(.headline)
+			Text("Long-press 1–9 while recording to finish with that prompt. Short taps still go to the active app.")
+				.font(.caption)
+				.foregroundStyle(.secondary)
+
+			HStack(spacing: 0) {
+				List(selection: $selectedRewritePromptID) {
+					rewritePromptListHeader
+						.listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
+						.listRowSeparator(.hidden)
+						.listRowBackground(Color.clear)
+
+					Color.clear
+						.frame(height: 8)
+						.allowsHitTesting(false)
+						.listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
+						.listRowSeparator(.hidden)
+						.listRowBackground(Color.clear)
+
+					ForEach(Array(store.hexSettings.rewritePrompts.enumerated()), id: \.element.id) { index, prompt in
+						rewritePromptListItem(prompt, index: index)
+					}
+				}
+				.listStyle(.sidebar)
+				.contentMargins(.top, 0, for: .scrollContent)
+				.scrollContentBackground(.hidden)
+				.frame(maxWidth: .infinity, maxHeight: .infinity)
+				.frame(width: 185)
+				.frame(maxHeight: .infinity, alignment: .leading)
+				.background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
+				.clipShape(RoundedRectangle(cornerRadius: 8))
+
+				if let prompt = selectedRewritePrompt {
+					VStack(alignment: .leading, spacing: 8) {
+						rewritePromptNameField(for: prompt)
+						TextEditor(text: rewritePromptBinding(for: prompt.id).instructions)
+							.font(.body)
+							.multilineTextAlignment(.leading)
+							.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+							.padding(8)
+							.background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
+					}
+					.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+					.padding(.leading, 12)
+					.layoutPriority(1)
+				} else {
+					ContentUnavailableView("Select a rewrite prompt", systemImage: "sparkles")
+						.frame(maxWidth: .infinity, maxHeight: .infinity)
+				}
+			}
+			.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+		}
+		.frame(maxWidth: .infinity)
+		.frame(height: 500, alignment: .topLeading)
+		.confirmationDialog(
+			"Delete \(selectedRewritePrompt?.name ?? "rewrite prompt")?",
+			isPresented: $isShowingRewritePromptDeletionConfirmation,
+			titleVisibility: .visible
+		) {
+			Button("Delete", role: .destructive, action: removeSelectedRewritePrompt)
+			Button("Cancel", role: .cancel) {}
+		} message: {
+			Text("This will permanently delete the selected rewrite prompt.")
+		}
+	}
+
+	private var selectedRewritePrompt: RewritePrompt? {
+		let prompts = store.hexSettings.rewritePrompts
+		guard let id = selectedRewritePromptID ?? prompts.first?.id else { return nil }
+		return prompts.first(where: { $0.id == id })
+	}
+
+	private var rewritePromptListHeader: some View {
+		HStack(spacing: 0) {
+			Button(action: addRewritePrompt) {
+				Image(systemName: "plus")
+			}
+			.buttonStyle(.borderless)
+			.frame(maxWidth: .infinity, maxHeight: .infinity)
+			.contentShape(Rectangle())
+			.disabled(store.hexSettings.rewritePrompts.count >= HexSettings.maximumRewritePrompts)
+			.accessibilityLabel("Add rewrite prompt")
+
+			Button {
+				isShowingRewritePromptDeletionConfirmation = true
+			} label: {
+				Image(systemName: "minus")
+			}
+			.buttonStyle(.borderless)
+			.frame(maxWidth: .infinity, maxHeight: .infinity)
+			.contentShape(Rectangle())
+			.disabled(store.hexSettings.rewritePrompts.count <= 1)
+			.accessibilityLabel("Remove selected rewrite prompt")
+		}
+		.frame(maxWidth: .infinity)
+		.frame(height: 32)
+	}
+
+	private func rewritePromptNameField(for prompt: RewritePrompt) -> some View {
+		HStack(spacing: 0) {
+			TextField("", text: rewritePromptBinding(for: prompt.id).name)
+				.labelsHidden()
+				.textFieldStyle(.roundedBorder)
+				.multilineTextAlignment(.leading)
+				.accessibilityLabel("Prompt name")
+				.frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
+		}
+		.frame(maxWidth: .infinity, alignment: .leading)
+	}
+
+	private func rewritePromptListRow(_ prompt: RewritePrompt, index: Int) -> some View {
+		HStack(spacing: 6) {
+			Image(systemName: "keyboard")
+				.foregroundStyle(.secondary)
+			Text("\(index + 1)")
+				.font(.caption.monospacedDigit())
+				.foregroundStyle(.secondary)
+			Text(prompt.name)
+				.lineLimit(1)
+		}
+	}
+
+	private func rewritePromptListItem(_ prompt: RewritePrompt, index: Int) -> some View {
+		rewritePromptListRow(prompt, index: index)
+			.tag(prompt.id)
+			.listRowSeparator(.hidden)
+			.accessibilityLabel(rewritePromptAccessibilityLabel(prompt, index: index))
+	}
+
+	private func rewritePromptAccessibilityLabel(_ prompt: RewritePrompt, index: Int) -> String {
+		"Long-press \(index + 1) to use \(prompt.name)"
+	}
+
+	private func rewritePromptBinding(for id: RewritePrompt.ID) -> Binding<RewritePrompt> {
+		Binding(
+			get: {
+				store.hexSettings.rewritePrompts.first(where: { $0.id == id })
+					?? .init(name: "", instructions: "")
+			},
+			set: { prompt in
+				guard let index = store.hexSettings.rewritePrompts.firstIndex(where: { $0.id == id }) else { return }
+				store.hexSettings.rewritePrompts[index] = prompt
+			}
+		)
+	}
+
+	private func selectFirstRewritePromptIfNeeded() {
+		guard let firstID = store.hexSettings.rewritePrompts.first?.id else {
+			selectedRewritePromptID = nil
+			return
+		}
+		guard let selectedRewritePromptID,
+			store.hexSettings.rewritePrompts.contains(where: { $0.id == selectedRewritePromptID })
+		else {
+			self.selectedRewritePromptID = firstID
+			return
+		}
+	}
+
+	private func addRewritePrompt() {
+		guard store.hexSettings.rewritePrompts.count < HexSettings.maximumRewritePrompts else { return }
+		let prompt = RewritePrompt(
+			name: "Rewrite \(store.hexSettings.rewritePrompts.count + 1)",
+			instructions: ""
+		)
+		store.hexSettings.rewritePrompts.append(prompt)
+		selectedRewritePromptID = prompt.id
+	}
+
+	private func removeSelectedRewritePrompt() {
+		guard store.hexSettings.rewritePrompts.count > 1,
+			let id = selectedRewritePrompt?.id,
+			let index = store.hexSettings.rewritePrompts.firstIndex(where: { $0.id == id })
+		else { return }
+		store.hexSettings.rewritePrompts.remove(at: index)
+		selectedRewritePromptID = store.hexSettings.rewritePrompts[min(index, store.hexSettings.rewritePrompts.count - 1)].id
 	}
 
 	private func persistGeminiAPIKey() {
