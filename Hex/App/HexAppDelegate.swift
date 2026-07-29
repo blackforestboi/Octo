@@ -7,7 +7,6 @@ private let cacheLogger = HexLog.caches
 
 class HexAppDelegate: NSObject, NSApplicationDelegate {
 	var invisibleWindow: InvisibleWindow?
-	private var pillInteractionPanel: PillInteractionPanel?
 	var settingsWindow: NSWindow?
 	var statusItem: NSStatusItem!
 	private var launchedAtLogin = false
@@ -126,41 +125,24 @@ class HexAppDelegate: NSObject, NSApplicationDelegate {
 			return
 		}
 		let transcriptionStore = HexApp.appStore.scope(state: \.transcription, action: \.transcription)
-		pillInteractionPanel = PillInteractionPanel { [weak self] in
-			self?.presentHistoryView()
-		}
 		let transcriptionView = TranscriptionIndicatorOverlayView(
 			store: transcriptionStore,
-			onPillFrameChange: { [weak self] frame in
-				self?.updatePillInteractionFrame(frame)
+			onOpenHistory: { [weak self] in
+				self?.presentHistoryView()
+			},
+			onPillSizeChange: { [weak self] size in
+				self?.updatePillSize(size)
 			}
 		)
-		.frame(maxWidth: .infinity, maxHeight: .infinity)
 		invisibleWindow = InvisibleWindow.fromView(transcriptionView)
 		invisibleWindow?.orderFrontRegardless()
 	}
 
-	private func updatePillInteractionFrame(_ frame: CGRect?) {
-		guard
-			let frame,
-			let invisibleWindow,
-			let contentView = invisibleWindow.contentView
-		else {
-			pillInteractionPanel?.update(frame: nil)
-			return
-		}
-
-		// SwiftUI's named coordinate space has a top-left origin; AppKit content
-		// coordinates have a bottom-left origin. Convert through the hosting view
-		// so the panel stays aligned on every display.
-		let contentFrame = NSRect(
-			x: frame.minX,
-			y: contentView.bounds.height - frame.maxY,
-			width: frame.width,
-			height: frame.height
+	private func updatePillSize(_ size: CGSize?) {
+		invisibleWindow?.update(
+			size: size,
+			location: hexSettings.indicatorLocation
 		)
-		let windowFrame = contentView.convert(contentFrame, to: nil)
-		pillInteractionPanel?.update(frame: invisibleWindow.convertToScreen(windowFrame))
 	}
 
 	func presentSettingsView() {

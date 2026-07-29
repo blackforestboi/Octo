@@ -78,6 +78,12 @@ struct TranscriptionFeature {
     case refined
   }
 
+	enum CompletedTranscriptPresentation: Equatable {
+		case expanded(String)
+		case copied(String)
+		case hidingCopied(String)
+	}
+
 	struct PendingScreenAwareTranscription: Equatable {
 		let text: String
 		let audioURL: URL
@@ -122,6 +128,7 @@ struct TranscriptionFeature {
 			var pendingSelectedTextTranscription: PendingSelectedTextTranscription?
     var isPrewarming: Bool = false
 		var forcedRefinementMode: RefinementMode?
+		var completedTranscriptPresentation: CompletedTranscriptPresentation?
 		/// The most recent ordinary result remains eligible for the quick
 		/// post-hold refinement gesture even after it has been pasted.
 		var recentCompletedTranscript: RecentCompletedTranscript?
@@ -185,6 +192,7 @@ struct TranscriptionFeature {
     case startRecording
 		case startRefinedRecording
     case stopRecording
+	case recordingStartFailed
 	case recordingCheckpointStarted(RecordingCheckpoint)
 	case recordingCheckpointFinalized(URL, TimeInterval, TranscriptStatus)
 
@@ -202,6 +210,12 @@ struct TranscriptionFeature {
     case transcriptionError(Error, URL?)
 	case showError(String)
 	case dismissError
+	case pasteCompletedTranscript(String)
+	case showCompletedTranscript(String)
+	case copyCompletedTranscript
+	case dismissCompletedTranscript
+	case completedTranscriptPresentationExpired
+	case completedTranscriptPresentationDismissalFinished
 
     // Model availability
     case modelMissing
@@ -221,6 +235,8 @@ struct TranscriptionFeature {
 		case selectedTextOnlyRefinement
 		case selectedTextRefinement
 		case errorPresentation
+		case completedTranscriptPresentation
+		case transcriptPaste
 		case pendingPressAndHold
 		case terminalRefinementHold
 		case screenAwareActivation
@@ -488,7 +504,7 @@ struct TranscriptionFeature {
 						historyID: transcript.historyID
 					)
 					let transcriptionHistory = state.$transcriptionHistory
-					return .run { [pasteboard] _ in
+					return .run { send in
 						if let historyID = transcript.historyID {
 							transcriptionHistory.withLock { history in
 								guard let index = history.history.firstIndex(where: { $0.id == historyID }) else { return }
@@ -499,8 +515,7 @@ struct TranscriptionFeature {
 								history.history[index] = entry
 							}
 						}
-						await pasteboard.paste(result)
-						soundEffect.play(.pasteTranscript)
+						await send(.pasteCompletedTranscript(result))
 					}
 					.cancellable(id: CancelID.postHocRefinement, cancelInFlight: true)
 
@@ -651,10 +666,7 @@ struct TranscriptionFeature {
 				state.selectedTextForRefinement = nil
 				state.isRefining = false
 				state.outputGenerationStartTime = nil
-				return .run { [pasteboard] _ in
-					await pasteboard.paste(result)
-					soundEffect.play(.pasteTranscript)
-				}
+				return .send(.pasteCompletedTranscript(result))
 
 			case let .selectedTextOnlyRefinementFailed(message):
 				state.isRefining = false
@@ -682,6 +694,16 @@ struct TranscriptionFeature {
 			.cancel(id: CancelID.screenAwareActivation),
 			handleStopRecording(&state)
 		)
+
+		case .recordingStartFailed:
+			guard state.isRecording else { return .none }
+			return .merge(
+				handleDiscard(&state),
+				.run { _ in
+					soundEffect.play(.cancel)
+				},
+				.send(.showError("Microphone not available"))
+			)
 
 		case let .recordingCheckpointStarted(checkpoint):
 			guard state.isRecording, state.hexSettings.saveTranscriptionHistory else { return .none }
@@ -811,12 +833,73 @@ struct TranscriptionFeature {
 			state.error = nil
 			return .cancel(id: CancelID.errorPresentation)
 
+		case let .pasteCompletedTranscript(text):
+			return .run { [pasteboard, soundEffect] send in
+				switch await pasteboard.focusedEditableDestination() {
+				case .available:
+					await pasteboard.paste(text)
+					soundEffect.play(.pasteTranscript)
+				case .absent, .indeterminate:
+					await send(.showCompletedTranscript(text))
+				}
+			}
+			.cancellable(id: CancelID.transcriptPaste, cancelInFlight: true)
+
+		case let .showCompletedTranscript(text):
+			state.completedTranscriptPresentation = .expanded(text)
+			return .cancel(id: CancelID.completedTranscriptPresentation)
+
+		case .copyCompletedTranscript:
+			guard let presentation = state.completedTranscriptPresentation,
+				case let .expanded(text) = presentation
+			else { return .none }
+			state.completedTranscriptPresentation = .copied(text)
+			return .merge(
+				.run { [pasteboard] _ in
+					await pasteboard.copy(text)
+				},
+				.run { [clock] send in
+					do {
+						try await clock.sleep(for: .seconds(2))
+						await send(.completedTranscriptPresentationExpired)
+					} catch {
+						return
+					}
+				}
+				.cancellable(id: CancelID.completedTranscriptPresentation, cancelInFlight: true)
+			)
+
+		case .dismissCompletedTranscript:
+			state.completedTranscriptPresentation = nil
+			return .cancel(id: CancelID.completedTranscriptPresentation)
+
+		case .completedTranscriptPresentationExpired:
+			guard case let .copied(text) = state.completedTranscriptPresentation else { return .none }
+			state.completedTranscriptPresentation = .hidingCopied(text)
+			return .run { [clock] send in
+				do {
+					try await clock.sleep(for: .milliseconds(220))
+					await send(.completedTranscriptPresentationDismissalFinished)
+				} catch {
+					return
+				}
+			}
+			.cancellable(id: CancelID.completedTranscriptPresentation, cancelInFlight: true)
+
+		case .completedTranscriptPresentationDismissalFinished:
+			guard case .hidingCopied = state.completedTranscriptPresentation else { return .none }
+			state.completedTranscriptPresentation = nil
+			return .cancel(id: CancelID.completedTranscriptPresentation)
+
       case .modelMissing:
         return .none
 
       // MARK: - Cancel/Discard Flow
 
       case .cancel:
+			if state.completedTranscriptPresentation != nil {
+				return .send(.dismissCompletedTranscript)
+			}
         // Only cancel if we're in the middle of recording, transcribing, or post-processing
         guard state.isRecording || state.isTranscribing || state.isRefining || state.isCapturingSelectedTextForRefinement else {
           return .none
@@ -1058,6 +1141,7 @@ private extension TranscriptionFeature {
       )
     }
 	state.isRecording = true
+	state.completedTranscriptPresentation = nil
 	state.originalTranscriptForRefinement = nil
 		state.outputGenerationStartTime = nil
 		state.screenContextForRefinement = nil
@@ -1085,7 +1169,9 @@ private extension TranscriptionFeature {
     transcriptionFeatureLogger.notice("Recording started at \(startTime.ISO8601Format())")
 
     // Prevent system sleep during recording
-    return .merge(
+	return .merge(
+			.cancel(id: CancelID.completedTranscriptPresentation),
+			.cancel(id: CancelID.transcriptPaste),
 			.cancel(id: CancelID.recordingCleanup),
 			.cancel(id: CancelID.terminalRefinementHold),
 			.cancel(id: CancelID.screenAwareActivation),
@@ -1104,8 +1190,15 @@ private extension TranscriptionFeature {
           return
         }
 			let startResult = await recording.startRecording()
-			guard case let .started(checkpoint) = startResult, !Task.isCancelled else { return }
-			await send(.recordingCheckpointStarted(checkpoint))
+			guard !Task.isCancelled else { return }
+			switch startResult {
+			case let .started(checkpoint):
+				await send(.recordingCheckpointStarted(checkpoint))
+			case .microphoneUnavailable:
+				await send(.recordingStartFailed)
+			case .failed:
+				return
+			}
       }
       .cancellable(id: CancelID.recordingStart, cancelInFlight: true)
     )
@@ -1678,7 +1771,7 @@ private extension TranscriptionFeature {
 			screenAwareInputSource: ScreenAwareInputSource? = nil,
 			historyCheckpointID: UUID? = nil
 	) -> Effect<Action> {
-		.run { _ in
+		.run { send in
 			await finalizeRecordingAndStoreTranscript(
 				result: result,
 				duration: duration,
@@ -1697,6 +1790,7 @@ private extension TranscriptionFeature {
 					screenAwareInputSource: screenAwareInputSource,
 					historyCheckpointID: historyCheckpointID
 			)
+			await send(.pasteCompletedTranscript(result))
 		}
 		.cancellable(id: CancelID.transcription)
 	}
@@ -1804,9 +1898,9 @@ private extension TranscriptionFeature {
 	)
   }
 
-  /// Move file to permanent location, create a transcript record, paste text, and play sound.
-  /// Storage failures are logged but do not block the paste — the transcription succeeded
-  /// from the user's perspective and they should still get their text.
+  /// Move file to permanent location and create a transcript record.
+  /// Storage failures are logged but do not block result delivery — the transcription succeeded
+  /// from the user's perspective and they should still receive their text.
   func finalizeRecordingAndStoreTranscript(
     result: String,
     duration: TimeInterval,
@@ -1888,10 +1982,6 @@ private extension TranscriptionFeature {
       RecordingRecoveryStore.releaseSource(forFinalAudioURL: audioURL)
     }
 
-	// Selected text is refinement context only. Always paste the generated output
-	// at the insertion point that is active when processing completes.
-	await pasteboard.paste(result)
-	soundEffect.play(.pasteTranscript)
   }
 
   /// Persist an entry in history (move audio + insert + prune to maxHistoryEntries).

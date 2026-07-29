@@ -6,41 +6,46 @@
 //
 
 import AppKit
+import HexCore
 import SwiftUI
 
-/// This allows us to render SwiftUI views anywhere on the screen, without dealing with the awkward
-/// rendering issues that come with normal MacOS windows. Essentially, we create one giant invisible
-/// window that covers the entire screen, and render our SwiftUI views into it.
-///
-/// I'm pretty sure this is what CleanShot X and other apps do to render their floating widgets.
-/// But if there's a better way to do this, I'd love to know!
+private final class FirstMouseHostingView: NSHostingView<AnyView> {
+  override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+    true
+  }
+}
+
+/// The transcription indicator's single overlay window. Its frame always
+/// matches the visible pill/card so it can accept input without covering any
+/// other part of the screen.
 class InvisibleWindow: NSPanel {
   override var canBecomeKey: Bool { false }
   override var canBecomeMain: Bool { false }
 
   private var currentScreen: NSScreen?
   private var mouseMonitor: Any?
+  private var indicatorSize: CGSize?
+  private var indicatorLocation: IndicatorLocation = .topCenter
 
   init() {
     let screen = NSScreen.main ?? NSScreen.screens[0]
     let styleMask: NSWindow.StyleMask = [.fullSizeContentView, .borderless, .utilityWindow, .nonactivatingPanel]
 
-    super.init(contentRect: screen.frame,
+    super.init(contentRect: .init(x: -2, y: -2, width: 1, height: 1),
                styleMask: styleMask,
                backing: .buffered,
                defer: false)
 
+    currentScreen = screen
     level = .statusBar
     backgroundColor = .clear
     isOpaque = false
     hasShadow = false
     ignoresMouseEvents = true
+    acceptsMouseMovedEvents = true
     hidesOnDeactivate = false // Prevent hiding when app loses focus
     canHide = false
     collectionBehavior = [.fullScreenAuxiliary, .canJoinAllSpaces, .stationary, .ignoresCycle]
-
-    // Set initial frame
-    updateToScreenWithMouse()
 
     // Start observing screen changes
     NotificationCenter.default.addObserver(
@@ -71,11 +76,28 @@ class InvisibleWindow: NSPanel {
     }
   }
 
+  func update(size: CGSize?, location: IndicatorLocation) {
+    let previousSize = indicatorSize
+    indicatorSize = size
+    indicatorLocation = location
+
+    guard let size, size.width > 0, size.height > 0 else {
+      ignoresMouseEvents = true
+      setFrame(.init(x: -2, y: -2, width: 1, height: 1), display: false)
+      return
+    }
+
+    ignoresMouseEvents = false
+    updateFrame(size: size, animated: previousSize != nil)
+  }
+
   private func updateToScreenWithMouse() {
     let mouseLocation = NSEvent.mouseLocation
     guard let screenWithMouse = NSScreen.screens.first(where: { $0.frame.contains(mouseLocation) }) else { return }
     currentScreen = screenWithMouse
-    setFrame(screenWithMouse.frame, display: true)
+    if let indicatorSize {
+      updateFrame(size: indicatorSize, animated: false)
+    }
   }
 
   private func checkForScreenChange() {
@@ -85,64 +107,59 @@ class InvisibleWindow: NSPanel {
     // Only update if screen actually changed
     if newScreen !== currentScreen {
       currentScreen = newScreen
-      setFrame(newScreen.frame, display: true)
+      if let indicatorSize {
+        updateFrame(size: indicatorSize, animated: false)
+      }
     }
   }
 
   @objc private func screenDidChange(_: Notification) {
     updateToScreenWithMouse()
   }
+
+  private func updateFrame(size: CGSize, animated: Bool) {
+    guard let screen = currentScreen else { return }
+
+    let horizontalInset: CGFloat = 24
+    let verticalInset: CGFloat = 18
+    let screenFrame = screen.frame
+    let originX: CGFloat
+    let originY: CGFloat
+
+    switch indicatorLocation {
+    case .topLeading, .bottomLeading:
+      originX = screenFrame.minX + horizontalInset
+    case .topCenter, .bottomCenter:
+      originX = screenFrame.midX - size.width / 2
+    case .topTrailing, .bottomTrailing:
+      originX = screenFrame.maxX - horizontalInset - size.width
+    }
+
+    switch indicatorLocation {
+    case .topLeading, .topCenter, .topTrailing:
+      originY = screenFrame.maxY - verticalInset - size.height
+    case .bottomLeading, .bottomCenter, .bottomTrailing:
+      originY = screenFrame.minY + verticalInset
+    }
+
+    let newFrame = NSRect(origin: .init(x: originX, y: originY), size: size)
+    guard animated else {
+      setFrame(newFrame, display: true)
+      return
+    }
+
+    NSAnimationContext.runAnimationGroup { context in
+      context.duration = 0.22
+      animator().setFrame(newFrame, display: true)
+    }
+  }
 }
 
 extension InvisibleWindow: NSWindowDelegate {
   static func fromView<V: View>(_ view: V) -> InvisibleWindow {
     let window = InvisibleWindow()
-    window.contentView = NSHostingView(rootView: view)
+    window.contentView = FirstMouseHostingView(rootView: AnyView(view))
     window.delegate = window
     return window
-  }
-}
-
-/// A tightly-scoped transparent panel used to make the otherwise click-through
-/// transcription indicator interactive without swallowing unrelated desktop clicks.
-final class PillInteractionPanel: NSPanel {
-  init(onTap: @escaping () -> Void) {
-    super.init(
-      contentRect: .zero,
-      styleMask: [.borderless, .nonactivatingPanel],
-      backing: .buffered,
-      defer: false
-    )
-
-    level = .statusBar + 1
-    backgroundColor = .clear
-    isOpaque = false
-    hasShadow = false
-    hidesOnDeactivate = false
-    canHide = false
-    collectionBehavior = [.fullScreenAuxiliary, .canJoinAllSpaces, .stationary, .ignoresCycle]
-    contentView = NSHostingView(rootView: PillInteractionView(onTap: onTap))
-    orderOut(nil)
-  }
-
-  func update(frame: NSRect?) {
-    guard let frame, frame.width > 0, frame.height > 0 else {
-      orderOut(nil)
-      return
-    }
-
-    setFrame(frame, display: true)
-    orderFrontRegardless()
-  }
-}
-
-private struct PillInteractionView: View {
-  let onTap: () -> Void
-
-  var body: some View {
-    Color.clear
-      .contentShape(Rectangle())
-      .onTapGesture(perform: onTap)
-      .accessibilityLabel("Open History")
   }
 }

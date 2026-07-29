@@ -75,6 +75,7 @@ enum RecordingFailure: Error, Equatable {
   case captureWriteFailed(String)
   case captureFinalizationTimedOut
   case fallbackExportFailed(String)
+  case microphoneUnavailable
   case noCapturedAudio
 }
 
@@ -87,6 +88,8 @@ extension RecordingFailure: LocalizedError {
       "The microphone did not finish delivering the final audio. Please try again."
     case let .fallbackExportFailed(message):
       "Failed to export recorded audio: \(message)"
+    case .microphoneUnavailable:
+      "The microphone is not sending audio. Check its connection and try again."
     case .noCapturedAudio:
       "Recording stopped without captured audio."
     }
@@ -108,6 +111,7 @@ struct RecordingCheckpoint: Equatable, Sendable {
 
 enum RecordingStartResult: Equatable, Sendable {
   case started(RecordingCheckpoint)
+  case microphoneUnavailable
   case failed
 }
 
@@ -374,6 +378,10 @@ private enum ScreenLockNotifications {
 }
 
 actor RecordingClientLive {
+  /// Recording only becomes active after Core Audio has supplied a live input buffer. This is
+  /// deliberately short so an unavailable microphone does not leave the indicator recording.
+  private static let firstAudioBufferTimeout: Duration = .seconds(1)
+
   private struct AudioHardwareObserver {
     let selector: AudioObjectPropertySelector
     let reason: String
@@ -1360,19 +1368,35 @@ actor RecordingClientLive {
         mode: mode
       )
       let startedAt = Date()
+      let checkpoint = RecordingCheckpoint(
+        sessionID: session.id,
+        createdAt: session.createdAt,
+        audioURL: RecordingRecoveryStore.finalAudioURL(for: session.id)
+      )
       activeRecordingSession = ActiveRecordingSession(
         startedAt: startedAt,
         mode: mode,
         backend: .captureEngine
       )
+      guard await captureController.waitForFirstAudioBuffer(timeout: Self.firstAudioBufferTimeout) else {
+        guard recordingSessionID == sessionID else { return .failed }
+        // A buffer can arrive exactly as the timeout fires. Keep the recording in that case;
+        // only discard when the capture queue confirms no live input has been received.
+        guard captureController.cancelRecordingIfNoAudioReceived() else {
+          return .started(checkpoint)
+        }
+        recordingLogger.error("Recording start failed: no microphone audio buffer received within \(Self.firstAudioBufferTimeout)")
+        clearActiveRecordingMetadata()
+        endRecordingSession()
+        lastRecordingEndedAt = Date()
+        finalizeCaptureStateAfterRecording()
+        await resumeMediaIfNeeded()
+        return .microphoneUnavailable
+      }
       recordingLogger.notice(
         "Recording started mode=\(mode.rawValue) backend=\(RecordingBackend.captureEngine.rawValue) startup=\(self.formatDuration(startedAt.timeIntervalSince(startRequestAt)))"
       )
-      return .started(.init(
-        sessionID: session.id,
-        createdAt: session.createdAt,
-        audioURL: RecordingRecoveryStore.finalAudioURL(for: session.id)
-      ))
+      return .started(checkpoint)
     } catch {
       recoverySession?.abandonForRecovery()
       if let recoverySession {
@@ -1393,19 +1417,33 @@ actor RecordingClientLive {
         mode: .standard
       )
       let startedAt = Date()
+      let checkpoint = RecordingCheckpoint(
+        sessionID: session.id,
+        createdAt: session.createdAt,
+        audioURL: RecordingRecoveryStore.finalAudioURL(for: session.id)
+      )
       activeRecordingSession = ActiveRecordingSession(
         startedAt: startedAt,
         mode: mode,
         backend: .fallbackCaptureEngine
       )
+      guard await controller.waitForFirstAudioBuffer(timeout: Self.firstAudioBufferTimeout) else {
+        guard recordingSessionID == sessionID else { return .failed }
+        guard controller.cancelRecordingIfNoAudioReceived() else {
+          return .started(checkpoint)
+        }
+        recordingLogger.error("Fallback recording start failed: no microphone audio buffer received within \(Self.firstAudioBufferTimeout)")
+        clearActiveRecordingMetadata()
+        endRecordingSession()
+        lastRecordingEndedAt = Date()
+        finalizeCaptureStateAfterRecording()
+        await resumeMediaIfNeeded()
+        return .microphoneUnavailable
+      }
       recordingLogger.notice(
         "Recording started mode=\(mode.rawValue) backend=\(RecordingBackend.fallbackCaptureEngine.rawValue) startup=\(self.formatDuration(startedAt.timeIntervalSince(startRequestAt)))"
       )
-      return .started(.init(
-        sessionID: session.id,
-        createdAt: session.createdAt,
-        audioURL: RecordingRecoveryStore.finalAudioURL(for: session.id)
-      ))
+      return .started(checkpoint)
     } catch {
       fallbackRecoverySession?.abandonForRecovery()
       if let fallbackRecoverySession {

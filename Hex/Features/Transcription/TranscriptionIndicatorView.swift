@@ -9,16 +9,6 @@ import HexCore
 import Inject
 import SwiftUI
 
-private let indicatorOverlayCoordinateSpace = "transcriptionIndicatorOverlay"
-
-private struct IndicatorFramePreferenceKey: PreferenceKey {
-	static var defaultValue: CGRect?
-
-	static func reduce(value: inout CGRect?, nextValue: () -> CGRect?) {
-		value = nextValue()
-	}
-}
-
 struct TranscriptionIndicatorView: View {
 	@ObserveInjection var inject
 
@@ -30,6 +20,9 @@ struct TranscriptionIndicatorView: View {
 		case transcribing
 		case refining
 		case prewarming
+		case completedTranscript(String)
+		case copied(String)
+		case hidingCopied(String)
 		case error(String)
 
 		var showsWaveform: Bool {
@@ -69,32 +62,111 @@ struct TranscriptionIndicatorView: View {
 	var status: Status
 	var meter: Meter
 	var size: IndicatorSize
+	var availableSize: CGSize = .zero
+	var onOpenHistory: () -> Void = {}
+	var onCopyCompletedTranscript: () -> Void = {}
+	var onDismissCompletedTranscript: () -> Void = {}
+	var onCardSizeChange: (CGSize?) -> Void = { _ in }
 
 	@State private var waveformSamples: [CGFloat] = []
+	@State private var isHoveringCompletedTranscript = false
 
 	private var metrics: Metrics { .init(size: size) }
-	private var isHidden: Bool { status == .hidden }
+	private var isHidden: Bool {
+		switch status {
+		case .hidden, .hidingCopied:
+			true
+		default:
+			false
+		}
+	}
+	private var hiddenScale: CGFloat { status == .hidden ? 0.8 : 1 }
 	private var isScreenAware: Bool { status == .screenAware }
+	private var pillCornerRadius: CGFloat { metrics.height * 0.28 }
+	private var expandedCardCornerRadius: CGFloat { max(12, pillCornerRadius) }
+	private var cardCornerRadius: CGFloat {
+		if case .completedTranscript = status { return expandedCardCornerRadius }
+		return pillCornerRadius
+	}
+	private var opensHistoryWhenTapped: Bool {
+		switch status {
+		case .hidden, .completedTranscript, .copied, .hidingCopied:
+			false
+		default:
+			true
+		}
+	}
 
 	private var indicatorWidth: CGFloat {
 		switch status {
 		case .hidden, .optionKeyPressed:
 			metrics.height
 		case .recording:
-			metrics.waveformWidth + 20
+			recordingPillSize.width
 		case .screenAware:
 			// The added room reveals older waveform samples instead of resetting them.
 			metrics.waveformWidth + 58
 		case .transcribing, .refining, .prewarming:
 			// Loading is a continuation of recording, so retain the recording pill's width.
-			metrics.waveformWidth + 20
+			recordingPillSize.width
+		case let .completedTranscript(text):
+			expandedSize(for: text).width
+		case .copied, .hidingCopied:
+			recordingPillSize.width
 		case .error:
 			300
 		}
 	}
 
+	private var indicatorHeight: CGFloat {
+		if case let .completedTranscript(text) = status {
+			return expandedSize(for: text).height
+		}
+		return metrics.height
+	}
+
+	private var cardSize: CGSize {
+		.init(width: indicatorWidth, height: indicatorHeight)
+	}
+
+	private func expandedSize(for text: String) -> CGSize {
+		let maximumSize = maximumTranscriptCardSize
+		return .init(
+			width: maximumSize.width,
+			height: transcriptCardHeight(for: text, width: maximumSize.width, maximum: maximumSize.height)
+		)
+	}
+
+	private var maximumTranscriptCardSize: CGSize {
+		let proposedWidth = recordingPillSize.width * 3
+		let proposedMaximumHeight = metrics.height * 5
+		guard availableSize.width > 0, availableSize.height > 0 else {
+			return .init(width: proposedWidth, height: proposedMaximumHeight)
+		}
+		return .init(
+			width: min(proposedWidth, max(metrics.height * 4, availableSize.width - 48)),
+			height: min(proposedMaximumHeight, max(metrics.height * 3, availableSize.height - 36))
+		)
+	}
+
+	private func transcriptCardHeight(for text: String, width: CGFloat, maximum: CGFloat) -> CGFloat {
+		let textBounds = (text as NSString).boundingRect(
+			with: .init(width: max(1, width - 28), height: .greatestFiniteMagnitude),
+			options: [.usesLineFragmentOrigin, .usesFontLeading],
+			attributes: [.font: NSFont.systemFont(ofSize: 14)],
+			context: nil
+		)
+		let minimum = min(maximum, metrics.height * 2.5)
+		return min(maximum, max(minimum, ceil(textBounds.height) + 28))
+	}
+
 	private var waveformWidth: CGFloat {
 		metrics.waveformWidth + (isScreenAware ? 24 : 0)
+	}
+
+	/// The copied confirmation reuses the exact recording-pill geometry.
+	private var recordingPillSize: CGSize {
+		.init(width: metrics.waveformWidth + 20, height: metrics.height)
 	}
 
 	private var accessibilityLabel: String {
@@ -106,37 +178,31 @@ struct TranscriptionIndicatorView: View {
 		case .transcribing: "Transcribing"
 		case .refining: "Refining"
 		case .prewarming: "Model prewarming"
+		case .completedTranscript: "Transcript ready to copy"
+		case .copied: "Transcript copied"
+		case .hidingCopied: "Transcript copied"
 		case let .error(message): "Error: \(message)"
 		}
 	}
 
+	@ViewBuilder
 	var body: some View {
-		RoundedRectangle(cornerRadius: metrics.height * 0.28, style: .continuous)
-			.fill(backgroundColor)
-			.overlay {
-				RoundedRectangle(cornerRadius: metrics.height * 0.28, style: .continuous)
-					.stroke(strokeColor, lineWidth: 1)
-			}
-			.overlay {
-				content
-			}
-			.frame(width: indicatorWidth, height: metrics.height)
+		if opensHistoryWhenTapped {
+			indicatorBody.onTapGesture(perform: onOpenHistory)
+		} else {
+			indicatorBody
+		}
+	}
+
+	private var indicatorBody: some View {
+		visualCard
 			.opacity(isHidden ? 0 : 1)
-			.scaleEffect(isHidden ? 0.8 : 1)
-			.animation(.snappy(duration: 0.22), value: status)
-			.animation(.snappy(duration: 0.22), value: size)
+			.scaleEffect(hiddenScale)
 			.accessibilityLabel(accessibilityLabel)
 			.accessibilityHidden(isHidden)
-			.background {
-				GeometryReader { proxy in
-					Color.clear.preference(
-						key: IndicatorFramePreferenceKey.self,
-						value: isHidden ? nil : proxy.frame(in: .named(indicatorOverlayCoordinateSpace))
-					)
-				}
-			}
 			.onAppear {
 				appendMeterSample(meter)
+				onCardSizeChange(isHidden ? nil : cardSize)
 			}
 			.onChange(of: meter) { _, meter in
 				appendMeterSample(meter)
@@ -145,8 +211,43 @@ struct TranscriptionIndicatorView: View {
 				if oldStatus.showsWaveform && !newStatus.showsWaveform {
 					waveformSamples.removeAll(keepingCapacity: true)
 				}
+				if case .completedTranscript = newStatus {
+					onCardSizeChange(cardSize)
+				} else {
+					isHoveringCompletedTranscript = false
+					onCardSizeChange(isHidden ? nil : cardSize)
+				}
+			}
+			.onChange(of: size) { _, _ in
+				onCardSizeChange(isHidden ? nil : cardSize)
 			}
 			.enableInjection()
+	}
+
+	private var visualCard: some View {
+		ZStack {
+			cardSurface
+				.frame(width: cardSize.width, height: cardSize.height)
+
+			content
+				.frame(width: cardSize.width, height: cardSize.height)
+		}
+			.frame(width: cardSize.width, height: cardSize.height)
+	}
+
+	private var cardSurface: some View {
+		RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous)
+			.fill(backgroundStyle)
+			.overlay {
+				if usesGlassBackground {
+					RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous)
+						.fill(Color(nsColor: .windowBackgroundColor).opacity(0.68))
+				}
+			}
+			.overlay {
+				RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous)
+					.stroke(strokeColor, lineWidth: 1)
+			}
 	}
 
 	@ViewBuilder
@@ -168,6 +269,12 @@ struct TranscriptionIndicatorView: View {
 			LoadingWave(label: "Refining", width: metrics.waveformWidth, height: metrics.height)
 		} else if status.showsProcessing {
 			LoadingWave(label: "Processing", width: metrics.waveformWidth, height: metrics.height)
+		} else if case let .completedTranscript(text) = status {
+			completedTranscript(text)
+		} else if case .copied = status {
+			copiedLabel
+		} else if case .hidingCopied = status {
+			copiedLabel
 		} else if case let .error(message) = status {
 			Label(message, systemImage: "exclamationmark.triangle.fill")
 				.font(.system(size: 10, weight: .semibold))
@@ -178,12 +285,83 @@ struct TranscriptionIndicatorView: View {
 		}
 	}
 
-	private var backgroundColor: Color {
-		isHidden ? .clear : Color(nsColor: mixedNSColor(.systemRed, with: .black, by: 0.42))
+	private func completedTranscript(_ text: String) -> some View {
+		ZStack(alignment: .topTrailing) {
+			ScrollView(.vertical) {
+				VStack(alignment: .leading, spacing: 0) {
+					Text(text)
+						.font(.system(size: 14))
+						.foregroundStyle(.primary)
+						.frame(maxWidth: .infinity, alignment: .leading)
+						.textSelection(.enabled)
+				}
+				.frame(maxWidth: .infinity, alignment: .leading)
+				.padding(14)
+			}
+			.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+
+			if isHoveringCompletedTranscript {
+				ZStack(alignment: .topTrailing) {
+					Button(action: onCopyCompletedTranscript) {
+						ZStack {
+							RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous)
+								.fill(.thinMaterial)
+								.opacity(0.48)
+								.accessibilityHidden(true)
+
+							Label("Click to Copy", systemImage: "doc.on.doc")
+								.font(.system(size: 15, weight: .semibold))
+								.padding(.horizontal, 18)
+								.padding(.vertical, 12)
+						}
+						.frame(maxWidth: .infinity, maxHeight: .infinity)
+					}
+					.buttonStyle(.plain)
+					.frame(maxWidth: .infinity, maxHeight: .infinity)
+					.contentShape(RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous))
+					.accessibilityLabel("Copy to Clipboard")
+					.accessibilityHint("Copies the completed transcript")
+
+					Button(action: onDismissCompletedTranscript) {
+						Image(systemName: "xmark.circle.fill")
+							.font(.system(size: 28, weight: .semibold))
+							.symbolRenderingMode(.hierarchical)
+							.foregroundStyle(.primary)
+							.padding(10)
+					}
+					.buttonStyle(.plain)
+					.accessibilityLabel("Dismiss transcript")
+					.accessibilityHint("Closes the transcript without copying it")
+					.help("Close")
+				}
+				.clipShape(RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous))
+			}
+		}
+		.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+		.contentShape(RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous))
+		.onHover { isHoveringCompletedTranscript = $0 }
+		.accessibilityElement(children: .contain)
+	}
+
+	private var copiedLabel: some View {
+		Label("Copied", systemImage: "checkmark")
+			.font(.system(size: max(10, metrics.height * 0.38), weight: .semibold))
+			.foregroundStyle(.white)
+	}
+
+	private var backgroundStyle: AnyShapeStyle {
+		if case .completedTranscript = status { return AnyShapeStyle(.regularMaterial) }
+		return AnyShapeStyle(isHidden ? .clear : Color(nsColor: mixedNSColor(.systemRed, with: .black, by: 0.42)))
+	}
+
+	private var usesGlassBackground: Bool {
+		if case .completedTranscript = status { return true }
+		return false
 	}
 
 	private var strokeColor: Color {
-		isHidden ? .clear : .white.opacity(0.28)
+		if case .completedTranscript = status { return .primary.opacity(0.16) }
+		return isHidden ? Color.clear : Color.white.opacity(0.28)
 	}
 
 	private func appendMeterSample(_ meter: Meter) {
@@ -276,10 +454,18 @@ struct TranscriptionIndicatorOverlayView: View {
 	@Bindable var store: StoreOf<TranscriptionFeature>
 	@ObserveInjection var inject
 	@Shared(.hexSettings) var hexSettings: HexSettings
-	let onPillFrameChange: (CGRect?) -> Void
+	let onOpenHistory: () -> Void
+	let onPillSizeChange: (CGSize?) -> Void
+	@State private var currentPillSize: CGSize?
 
 	var status: TranscriptionIndicatorView.Status {
-		if let error = store.error {
+		if let presentation = store.completedTranscriptPresentation {
+			switch presentation {
+			case let .expanded(text): return .completedTranscript(text)
+			case let .copied(text): return .copied(text)
+			case let .hidingCopied(text): return .hidingCopied(text)
+			}
+		} else if let error = store.error {
 			return .error(error)
 		} else if store.isScreenAwareModeActive {
 			return .screenAware
@@ -296,32 +482,26 @@ struct TranscriptionIndicatorOverlayView: View {
 		}
 	}
 
-	private var alignment: Alignment {
-		switch hexSettings.indicatorLocation {
-		case .topLeading: .topLeading
-		case .topCenter: .top
-		case .topTrailing: .topTrailing
-		case .bottomLeading: .bottomLeading
-		case .bottomCenter: .bottom
-		case .bottomTrailing: .bottomTrailing
-		}
-	}
-
 	var body: some View {
 		let indicatorStatus = status
-		ZStack(alignment: alignment) {
-			Color.clear
-			TranscriptionIndicatorView(
-				status: indicatorStatus,
-				meter: indicatorStatus.showsWaveform ? store.meter : .init(averagePower: 0, peakPower: 0),
-				size: hexSettings.indicatorSize
-			)
-			.padding(.horizontal, 24)
-			.padding(.vertical, 18)
+		TranscriptionIndicatorView(
+			status: indicatorStatus,
+			meter: indicatorStatus.showsWaveform ? store.meter : .init(averagePower: 0, peakPower: 0),
+			size: hexSettings.indicatorSize,
+			onOpenHistory: onOpenHistory,
+			onCopyCompletedTranscript: { store.send(.copyCompletedTranscript) },
+			onDismissCompletedTranscript: { store.send(.dismissCompletedTranscript) },
+			onCardSizeChange: { size in
+				currentPillSize = size
+				onPillSizeChange(size)
+			}
+		)
+		.animation(.snappy(duration: 0.22), value: indicatorStatus)
+		.animation(.snappy(duration: 0.22), value: hexSettings.indicatorSize)
+		.onChange(of: hexSettings.indicatorLocation) { _, _ in
+			onPillSizeChange(currentPillSize)
 		}
-		.coordinateSpace(name: indicatorOverlayCoordinateSpace)
-		.onPreferenceChange(IndicatorFramePreferenceKey.self, perform: onPillFrameChange)
-		.onDisappear { onPillFrameChange(nil) }
+		.onDisappear { onPillSizeChange(nil) }
 		.task {
 			await store.send(.task).finish()
 		}

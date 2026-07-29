@@ -23,6 +23,12 @@ enum SelectedTextReplacementResult: Equatable, Sendable {
     case pasteFailed
 }
 
+enum FocusedEditableDestination: Equatable, Sendable {
+    case available
+    case absent
+    case indeterminate
+}
+
 @MainActor
 final class SelectedTextCapture: Equatable {
     let text: String
@@ -56,12 +62,23 @@ final class SelectedTextCapture: Equatable {
 struct PasteboardClient {
     var paste: @Sendable (String) async -> Void
     var copy: @Sendable (String) async -> Void
+    /// Whether Accessibility can verify that the active app has an editable text destination.
+    /// Results other than `.available` retain the transcript so the user never loses it.
+    var focusedEditableDestination: @Sendable () async -> FocusedEditableDestination = { .available }
     var sendKeyboardCommand: @Sendable (KeyboardCommand) async -> Void
     /// Copies the current selection while saving the user's clipboard for later restoration.
     var captureSelectedText: @Sendable () async -> SelectedTextCapture?
 }
 
 extension PasteboardClient: DependencyKey {
+    static let testValue = Self(
+        paste: { _ in },
+        copy: { _ in },
+        focusedEditableDestination: { .available },
+        sendKeyboardCommand: { _ in },
+        captureSelectedText: { nil }
+    )
+
     static var liveValue: Self {
         let live = PasteboardClientLive()
         return .init(
@@ -70,6 +87,9 @@ extension PasteboardClient: DependencyKey {
             },
             copy: { text in
                 await live.copy(text: text)
+            },
+            focusedEditableDestination: {
+                await live.focusedEditableDestination()
             },
             sendKeyboardCommand: { command in
                 await live.sendKeyboardCommand(command)
@@ -139,6 +159,46 @@ final class PasteboardClientLive {
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)
+    }
+
+    @MainActor
+    func focusedEditableDestination() -> FocusedEditableDestination {
+        let systemWideElement = AXUIElementCreateSystemWide()
+        var focusedElementRef: CFTypeRef?
+        let focusedElementResult = AXUIElementCopyAttributeValue(
+            systemWideElement,
+            kAXFocusedUIElementAttribute as CFString,
+            &focusedElementRef
+        )
+
+        guard focusedElementResult == .success else {
+            return focusedElementResult == .noValue ? .absent : .indeterminate
+        }
+        guard let focusedElementRef else { return .indeterminate }
+        let focusedElement = focusedElementRef as! AXUIElement
+
+        var selectedTextIsSettable: DarwinBoolean = false
+        let selectedTextResult = AXUIElementIsAttributeSettable(
+            focusedElement,
+            kAXSelectedTextAttribute as CFString,
+            &selectedTextIsSettable
+        )
+        var valueIsSettable: DarwinBoolean = false
+        let valueResult = AXUIElementIsAttributeSettable(
+            focusedElement,
+            kAXValueAttribute as CFString,
+            &valueIsSettable
+        )
+
+        if (selectedTextResult == .success && selectedTextIsSettable.boolValue)
+            || (valueResult == .success && valueIsSettable.boolValue)
+        {
+            return .available
+        }
+        if selectedTextResult == .attributeUnsupported, valueResult == .attributeUnsupported {
+            return .absent
+        }
+        return .indeterminate
     }
 
     /// Reads the current selection through Accessibility without synthesizing a Copy command.

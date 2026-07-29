@@ -133,6 +133,7 @@ final class SuperFastCaptureController {
   private var stopBoundary: StopBoundary?
   private var pendingFinish: PendingFinish?
   private var pendingFinishWaiters: [CheckedContinuation<Void, Never>] = []
+  private var firstAudioBufferWaiters: [UUID: CheckedContinuation<Bool, Never>] = [:]
   private var stopDrainTimeoutTask: Task<Void, Never>?
   private let onEngineConfigurationChange: @Sendable (Int) -> Void
 
@@ -264,6 +265,7 @@ final class SuperFastCaptureController {
         activeRecording = nil
         recordingFailure = nil
         ringBuffer.clear()
+        resumeFirstAudioBufferWaiters(receivedAudio: false)
       }
     }
     engine?.stop()
@@ -327,6 +329,40 @@ final class SuperFastCaptureController {
     }
   }
 
+  /// Wait for the first frame received after a recording begins. Starting a durable PCM file
+  /// only proves that we could open storage; this confirms that Core Audio is actually feeding
+  /// the selected microphone into the capture path.
+  func waitForFirstAudioBuffer(timeout: Duration) async -> Bool {
+    let waiterID = UUID()
+    return await withCheckedContinuation { continuation in
+      processingQueue.async { [weak self] in
+        guard let self, let recording = self.activeRecording else {
+          continuation.resume(returning: false)
+          return
+        }
+        guard !recording.didLogFirstBuffer else {
+          continuation.resume(returning: true)
+          return
+        }
+
+        self.firstAudioBufferWaiters[waiterID] = continuation
+        Task { [weak self] in
+          try? await Task.sleep(for: timeout)
+          guard !Task.isCancelled else { return }
+          self?.resumeFirstAudioBufferWaiter(id: waiterID, receivedAudio: false)
+        }
+      }
+    }
+  }
+
+  /// Atomically discard a session that is still waiting for its first input frame. If a frame
+  /// arrived as the timeout fired, the caller keeps the recording instead.
+  func cancelRecordingIfNoAudioReceived() -> Bool {
+    processingQueue.sync {
+      discardRecordingIfNoAudioReceived()
+    }
+  }
+
   /// Prevents a new capture file from replacing one that is still draining its final PCM
   /// frames. RecordingClient awaits this before it opens a new session.
   func waitForPendingFinish() async {
@@ -365,6 +401,12 @@ final class SuperFastCaptureController {
         guard self.activeRecording != nil else {
           self.clearStopBoundary()
           continuation.resume(returning: self.finishResult())
+          self.resumePendingFinishWaiters()
+          return
+        }
+
+        if self.discardRecordingIfNoAudioReceived() {
+          continuation.resume(returning: .failed(.microphoneUnavailable))
           self.resumePendingFinishWaiters()
           return
         }
@@ -420,6 +462,7 @@ final class SuperFastCaptureController {
       )
       recording.didLogFirstBuffer = true
       activeRecording = recording
+      resumeFirstAudioBufferWaiters(receivedAudio: true)
     }
 
     let stopBoundary = currentStopBoundary()
@@ -634,6 +677,32 @@ final class SuperFastCaptureController {
     let waiters = pendingFinishWaiters
     pendingFinishWaiters.removeAll(keepingCapacity: false)
     waiters.forEach { $0.resume() }
+  }
+
+  private func discardRecordingIfNoAudioReceived() -> Bool {
+    guard let recording = activeRecording, !recording.didLogFirstBuffer else { return false }
+
+    logger.error("Capture engine stopped before receiving a microphone audio buffer")
+    recording.recoverySession.abandonForRecovery()
+    RecordingRecoveryStore.releaseSource(for: recording.recoverySession.id)
+    activeRecording = nil
+    recordingFailure = nil
+    clearStopBoundary()
+    ringBuffer.clear()
+    resumeFirstAudioBufferWaiters(receivedAudio: false)
+    return true
+  }
+
+  private func resumeFirstAudioBufferWaiter(id: UUID, receivedAudio: Bool) {
+    processingQueue.async { [weak self] in
+      self?.firstAudioBufferWaiters.removeValue(forKey: id)?.resume(returning: receivedAudio)
+    }
+  }
+
+  private func resumeFirstAudioBufferWaiters(receivedAudio: Bool) {
+    let waiters = firstAudioBufferWaiters.values
+    firstAudioBufferWaiters.removeAll(keepingCapacity: false)
+    waiters.forEach { $0.resume(returning: receivedAudio) }
   }
 
   private func convert(_ inputBuffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {

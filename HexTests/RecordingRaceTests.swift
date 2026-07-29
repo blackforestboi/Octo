@@ -10,6 +10,37 @@ import XCTest
 
 @MainActor
 final class RecordingRaceTests: XCTestCase {
+  func testMicrophoneUnavailableAtRecordingStartShowsErrorAndPlaysCancelSound() async {
+    let now = Date(timeIntervalSince1970: 1_234)
+    let clock = TestClock()
+    let soundProbe = SoundEffectProbe()
+    let store = TestStore(initialState: Self.makeState()) {
+      TranscriptionFeature()
+    } withDependencies: {
+      $0.date.now = now
+      $0.continuousClock = clock
+      $0.recording.startRecording = { .microphoneUnavailable }
+      $0.recording.stopRecording = { .ignored(.noActiveRecording) }
+      $0.sleepManagement.preventSleep = { _ in }
+      $0.sleepManagement.allowSleep = {}
+      $0.soundEffects.play = { effect in await soundProbe.record(effect) }
+    }
+    store.exhaustivity = .off(showSkippedAssertions: false)
+
+    await store.send(.startRecording)
+    await store.receive(\.recordingStartFailed)
+    await store.receive(\.showError)
+
+    XCTAssertFalse(store.state.isRecording)
+    XCTAssertEqual(store.state.error, "Microphone not available")
+    let playedEffects = await soundProbe.effects
+    XCTAssertEqual(playedEffects, [.startRecording, .cancel])
+
+    await clock.advance(by: .seconds(5))
+    await store.receive(\.dismissError)
+    await store.finish()
+  }
+
   func testNewRecordingCancelsPendingDiscardCleanup() async throws {
     let now = Date(timeIntervalSince1970: 1_234)
     let activeApp = NSWorkspace.shared.frontmostApplication
@@ -1478,6 +1509,18 @@ private actor SleepProbe {
 
   func counts() -> (preventSleepCalls: Int, allowSleepCalls: Int) {
     (preventSleepCalls, allowSleepCalls)
+  }
+}
+
+private actor SoundEffectProbe {
+  private var playedEffects: [SoundEffect] = []
+
+  func record(_ effect: SoundEffect) {
+    playedEffects.append(effect)
+  }
+
+  var effects: [SoundEffect] {
+    playedEffects
   }
 }
 
