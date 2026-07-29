@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026.7.29
+
+### Minor Changes
+
+- 3703f0b: Show transcription or rewrite output in a copyable field when no editable text field is active
+
+### Patch Changes
+
+- 3703f0b: Warn when a recording starts without microphone input
+
 ## 2026.7.28
 
 ### Patch Changes
