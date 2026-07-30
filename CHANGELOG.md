@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026.7.30
+
+### Minor Changes
+
+- Add native agent handoffs that turn recordings into durable Codex or Claude tasks, with a new Handoffs sidebar and task lifecycle status.
+- Add speaker identification and optional system-audio transcription, including durable recovery after interrupted captures.
+
+### Patch Changes
+
+- Keep handoff progress in the recording pill, guide it toward the menu bar when tasks launch, and show recent handoffs there.
+- Improve handoff routing, provider and model settings, task management, and recording recovery.
+
 ## 2026.7.29
 
 ### Minor Changes

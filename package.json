@@ -1,6 +1,6 @@
 {
   "name": "octo-app",
-  "version": "2026.7.29",
+  "version": "2026.7.30",
   "description": "Release metadata + changelog automation for the Octo macOS app.",
   "private": true,
   "license": "MIT",
