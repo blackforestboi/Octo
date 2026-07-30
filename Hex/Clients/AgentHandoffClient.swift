@@ -15,11 +15,8 @@ struct AgentHandoffClient {
 	}
 	var open: @Sendable (AgentHandoffThread) async -> Void = { _ in }
 	var tasks: @Sendable () throws -> [AgentHandoffTask] = { [] }
+	var acknowledgeTaskCompletions: @Sendable ([UUID]) throws -> Void = { _ in }
 	var deleteTask: @Sendable (UUID) throws -> Void = { _ in }
-	/// The user-selected local Codex project in which new handoff threads run.
-	var codexProjectPath: @Sendable () -> String? = { nil }
-	/// Presents the native folder picker and saves the selected project for future handoffs.
-	var chooseCodexProject: @Sendable () async throws -> String = { throw AgentHandoffError.workspaceUnavailable }
 }
 
 struct AgentHandoffRequest: Equatable, Sendable {
@@ -72,6 +69,32 @@ struct AgentHandoffTask: Equatable, Identifiable, Sendable {
 	let thread: AgentHandoffThread?
 	/// The complete text delivered to the child task.
 	let handoff: String
+	/// The project root the coordinator discovered for this handoff package.
+	let projectPath: String?
+	/// Whether the user has opened this completed task since Octo recorded its completion.
+	let isCompletionAcknowledged: Bool
+
+	init(
+		id: UUID,
+		createdAt: Date,
+		provider: AgentHandoffRequest.Provider,
+		title: String,
+		state: Status,
+		thread: AgentHandoffThread?,
+		handoff: String,
+		projectPath: String? = nil,
+		isCompletionAcknowledged: Bool = false
+	) {
+		self.id = id
+		self.createdAt = createdAt
+		self.provider = provider
+		self.title = title
+		self.state = state
+		self.thread = thread
+		self.handoff = handoff
+		self.projectPath = projectPath
+		self.isCompletionAcknowledged = isCompletionAcknowledged
+	}
 
 	var isOpenable: Bool {
 		thread != nil
@@ -83,6 +106,10 @@ struct AgentHandoffTask: Equatable, Identifiable, Sendable {
 
 	var isCompleted: Bool {
 		state == .completed
+	}
+
+	var hasUnacknowledgedCompletion: Bool {
+		isCompleted && !isCompletionAcknowledged
 	}
 }
 
@@ -101,6 +128,8 @@ enum AgentHandoffEvent: Equatable, Sendable {
 
 enum AgentHandoffError: LocalizedError, Equatable {
 	case providerUnavailable
+	case claudeAgentViewUnavailable
+	case claudeAuthenticationRequired
 	case noUserRequest
 	case executableNotFound(String)
 	case workspaceUnavailable
@@ -110,12 +139,16 @@ enum AgentHandoffError: LocalizedError, Equatable {
 		switch self {
 		case .providerUnavailable:
 			"Agent Handoff requires Codex or Claude as the refinement provider."
+		case .claudeAgentViewUnavailable:
+			"Claude handoffs require Claude Code Agent View (version 2.1.139 or later). Update Claude Code or enable Agent View, then use `claude agents` to view or attach to handoffs. Claude Desktop cannot import these local sessions."
+		case .claudeAuthenticationRequired:
+			"Claude CLI is not signed in. Run `claude auth login`, then start the handoff again."
 		case .noUserRequest:
 			"Agent Handoff requires a spoken request or selected text."
 		case let .executableNotFound(provider):
 			"\(provider) CLI was not found."
-		case .workspaceUnavailable:
-			"Choose a Codex project folder before starting an agent handoff."
+	case .workspaceUnavailable:
+			"Choose an Agent Handoff workspace or Agent Handoffs folder before starting an agent handoff."
 		case let .launchFailed(provider):
 			"\(provider) could not start the agent handoff."
 		}
@@ -138,7 +171,7 @@ extension AgentHandoffClient: DependencyKey {
 								yield: { continuation.yield($0) }
 							)
 						case .claude:
-							let workspace = try await AgentHandoffWorkspace.resolve()
+							let workspace = try await AgentHandoffWorkspace.openClaudeHandoffRoot()
 							continuation.yield(.processing)
 							try await ClaudeHandoffCoordinator.run(
 								request: request,
@@ -164,14 +197,11 @@ extension AgentHandoffClient: DependencyKey {
 		tasks: {
 			try AgentHandoffJournal.shared.tasks()
 		},
+		acknowledgeTaskCompletions: { taskIDs in
+			try AgentHandoffJournal.shared.acknowledgeCompletions(of: taskIDs)
+		},
 		deleteTask: { taskID in
 			try AgentHandoffJournal.shared.deleteTask(id: taskID)
-		},
-		codexProjectPath: {
-			AgentHandoffWorkspace.codexProjectPath()
-		},
-		chooseCodexProject: {
-			try await AgentHandoffWorkspace.chooseCodexProject().root.path
 		}
 	)
 
@@ -189,10 +219,11 @@ extension DependencyValues {
 
 private enum AgentHandoffWorkspace {
 	private static let bookmarkKey = "agent-handoff-workspace-bookmark"
-	private static let codexProjectBookmarkKey = "agent-handoff-codex-project-bookmark"
-	/// The bookmark used by the first Codex handoff implementation. Keep using it
-	/// as a migration source so an existing setup never asks for the same folder again.
-	private static let legacyCodexProjectBookmarkKey = "agent-handoff-codex-projectless-bookmark"
+	private static let codexDiscoveryBookmarkKey = "agent-handoff-codex-discovery-bookmark"
+	private static let obsoleteCodexProjectBookmarkKeys = [
+		"agent-handoff-codex-project-bookmark",
+		"agent-handoff-codex-projectless-bookmark",
+	]
 
 	final class SecurityScopedDirectory: @unchecked Sendable {
 		let root: URL
@@ -208,7 +239,9 @@ private enum AgentHandoffWorkspace {
 		}
 	}
 
-	static func resolve() async throws -> URL {
+	/// Resolves the dedicated Claude workspace and retains its sandbox access until
+	/// the caller finishes launching native sessions from it.
+	static func openClaudeHandoffRoot() async throws -> SecurityScopedDirectory {
 		var bookmarkIsStale = false
 		let bookmarkedFolder: URL?
 		if let bookmark = UserDefaults.standard.data(forKey: bookmarkKey) {
@@ -225,8 +258,16 @@ private enum AgentHandoffWorkspace {
 		   !bookmarkIsStale,
 		   resolved.startAccessingSecurityScopedResource()
 		{
-			defer { resolved.stopAccessingSecurityScopedResource() }
-			return try ensureHandoffFolder(in: resolved)
+			do {
+				let folder = try ensureHandoffFolder(in: resolved)
+				// Older builds stored the parent directory. Migrate them to an exact
+				// workspace bookmark while the user-granted parent scope is active.
+				try saveClaudeHandoffBookmark(for: folder)
+				return .init(root: folder, accessURL: resolved)
+			} catch {
+				resolved.stopAccessingSecurityScopedResource()
+				throw error
+			}
 		}
 
 		return try await MainActor.run {
@@ -242,25 +283,28 @@ private enum AgentHandoffWorkspace {
 			guard panel.runModal() == .OK, let selected = panel.url,
 				selected.startAccessingSecurityScopedResource()
 			else { throw AgentHandoffError.workspaceUnavailable }
-			defer { selected.stopAccessingSecurityScopedResource() }
-
-			let folder = try ensureHandoffFolder(in: selected)
-			let bookmark = try selected.bookmarkData(
-				options: [.withSecurityScope],
-				includingResourceValuesForKeys: nil,
-				relativeTo: nil
-			)
-			UserDefaults.standard.set(bookmark, forKey: bookmarkKey)
-			return folder
+			do {
+				let folder = try ensureHandoffFolder(in: selected)
+				try saveClaudeHandoffBookmark(for: folder)
+				return .init(root: folder, accessURL: selected)
+			} catch {
+				selected.stopAccessingSecurityScopedResource()
+				throw error
+			}
 		}
 	}
 
 	private static func ensureHandoffFolder(in selectedFolder: URL) throws -> URL {
-		let handoffFolder = selectedFolder.lastPathComponent == "Agent Handoffs"
-			? selectedFolder
-			: selectedFolder.appendingPathComponent("Agent Handoffs", isDirectory: true)
-		try FileManager.default.createDirectory(at: handoffFolder, withIntermediateDirectories: true)
-		return handoffFolder
+		try AgentHandoffWorkspaceDirectory.ensureHandoffFolder(in: selectedFolder)
+	}
+
+	private static func saveClaudeHandoffBookmark(for folder: URL) throws {
+		let bookmark = try folder.bookmarkData(
+			options: [.withSecurityScope],
+			includingResourceValuesForKeys: nil,
+			relativeTo: nil
+		)
+		UserDefaults.standard.set(bookmark, forKey: bookmarkKey)
 	}
 
 	static func persistClaudeScreenshot(
@@ -271,91 +315,122 @@ private enum AgentHandoffWorkspace {
 		guard request.screenAwareInputSource.uploadsScreenshot,
 			let imageData = request.screenContext?.imagePNGData
 		else { return nil }
-		let inputDirectory = workspace.appendingPathComponent("Handoff Inputs", isDirectory: true)
-		try FileManager.default.createDirectory(at: inputDirectory, withIntermediateDirectories: true)
+		let inputDirectory = try ClaudeHandoffArtifacts.provision(in: workspace)
 		let url = inputDirectory.appendingPathComponent("\(handoffToken).png")
 		try imageData.write(to: url, options: .atomic)
 		return url
 	}
 
-	/// Resolves the actual project folder for Codex handoffs. The folder is used as
-	/// the thread's cwd and workspace root, so Codex discovers the same project
-	/// configuration, instructions, skills, and files as a normal local task.
-	static func openCodexProjectRoot() async throws -> SecurityScopedDirectory {
-		for key in [codexProjectBookmarkKey, legacyCodexProjectBookmarkKey] {
-			guard let selected = savedCodexProjectURL(for: key),
-				selected.startAccessingSecurityScopedResource()
-			else { continue }
-
-			if key == legacyCodexProjectBookmarkKey {
-				try? saveCodexProjectBookmark(for: selected)
-			}
-			return SecurityScopedDirectory(root: selected, accessURL: selected)
+	/// Grants Octo access to one broad workspace so the ephemeral coordinator can
+	/// identify a project root. Octo stores no project list or project metadata.
+	static func openCodexDiscoveryRoot() async throws -> SecurityScopedDirectory {
+		// The previous one-project configuration is deliberately not a migration
+		// source: it would make the coordinator's discovery boundary implicit.
+		obsoleteCodexProjectBookmarkKeys.forEach { UserDefaults.standard.removeObject(forKey: $0) }
+		var bookmarkIsStale = false
+		if let bookmark = UserDefaults.standard.data(forKey: codexDiscoveryBookmarkKey),
+			let resolved = try? URL(
+				resolvingBookmarkData: bookmark,
+				options: [.withSecurityScope],
+				relativeTo: nil,
+				bookmarkDataIsStale: &bookmarkIsStale
+			),
+			!bookmarkIsStale,
+			resolved.startAccessingSecurityScopedResource()
+		{
+			return .init(root: resolved.standardizedFileURL, accessURL: resolved)
 		}
 
-		// Codex runs as Octo's child process, so a handoff must be rooted in a
-		// folder the user explicitly granted to Octo. Do not silently fall back to
-		// an internal workspace: that would make the task unable to reach the
-		// user's project while hiding the missing permission.
-		return try await chooseCodexProject()
-	}
-
-	/// Lets the user replace the project used by future Codex handoff threads.
-	static func chooseCodexProject() async throws -> SecurityScopedDirectory {
 		return try await MainActor.run {
 			let panel = NSOpenPanel()
-			panel.title = "Choose Codex Agent Handoff Project"
-			panel.message = "Agent Handoff starts each Codex task in this project folder, with its normal files, instructions, tools, skills, plugins, and MCP configuration."
-			panel.prompt = "Use Project"
+			panel.title = "Choose Agent Handoff Workspace"
+			panel.message = "Choose a folder containing the projects you want to hand off. The coordinator discovers the right project for each task; Octo does not store or manage a project catalog."
+			panel.prompt = "Allow Workspace"
 			panel.canChooseFiles = false
 			panel.canChooseDirectories = true
 			panel.allowsMultipleSelection = false
-			panel.directoryURL = FileManager.default.homeDirectoryForCurrentUser
+			let gitHubDirectory = FileManager.default.homeDirectoryForCurrentUser
+				.appendingPathComponent("GitHub", isDirectory: true)
+			panel.directoryURL = FileManager.default.fileExists(atPath: gitHubDirectory.path)
+				? gitHubDirectory
+				: FileManager.default.homeDirectoryForCurrentUser
 
 			guard panel.runModal() == .OK,
-				let selected = panel.url,
+				let selected = panel.url?.standardizedFileURL,
 				selected.startAccessingSecurityScopedResource()
 			else { throw AgentHandoffError.workspaceUnavailable }
 			do {
-				try saveCodexProjectBookmark(for: selected)
-				return SecurityScopedDirectory(root: selected, accessURL: selected)
+				let bookmark = try selected.bookmarkData(
+					options: [.withSecurityScope],
+					includingResourceValuesForKeys: nil,
+					relativeTo: nil
+				)
+				UserDefaults.standard.set(bookmark, forKey: codexDiscoveryBookmarkKey)
+				return .init(root: selected, accessURL: selected)
 			} catch {
 				selected.stopAccessingSecurityScopedResource()
 				throw error
 			}
 		}
 	}
+}
 
-	static func codexProjectPath() -> String? {
-		for key in [codexProjectBookmarkKey, legacyCodexProjectBookmarkKey] {
-			if let project = savedCodexProjectURL(for: key) {
-				return project.path
-			}
+/// Pure and file-system setup helpers kept separate from the security-scoped
+/// bookmark flow so the first-use workspace contract can be regression tested.
+enum AgentHandoffWorkspaceDirectory {
+	static func handoffFolderURL(in selectedFolder: URL) -> URL {
+		selectedFolder.lastPathComponent == "Agent Handoffs"
+			? selectedFolder
+			: selectedFolder.appendingPathComponent("Agent Handoffs", isDirectory: true)
+	}
+
+	static func ensureHandoffFolder(in selectedFolder: URL) throws -> URL {
+		let handoffFolder = handoffFolderURL(in: selectedFolder)
+		var isDirectory: ObjCBool = false
+		if FileManager.default.fileExists(atPath: handoffFolder.path, isDirectory: &isDirectory), !isDirectory.boolValue {
+			throw AgentHandoffError.workspaceUnavailable
 		}
-		return nil
+		try FileManager.default.createDirectory(at: handoffFolder, withIntermediateDirectories: true)
+		return handoffFolder
+	}
+}
+
+/// Octo owns only the handoff input files it writes into the user-authorized
+/// workspace. Claude Code owns its supervisor, sessions, and `~/.claude`
+/// configuration, so this integration must never bootstrap or clean those paths.
+enum ClaudeHandoffArtifacts {
+	private static let inputDirectoryName = "Handoff Inputs"
+
+	static func inputDirectoryURL(in workspace: URL) -> URL {
+		workspace.appendingPathComponent(inputDirectoryName, isDirectory: true)
 	}
 
-	private static func savedCodexProjectURL(for key: String) -> URL? {
-		var bookmarkIsStale = false
-		guard let bookmark = UserDefaults.standard.data(forKey: key),
-			let project = try? URL(
-				resolvingBookmarkData: bookmark,
-				options: [.withSecurityScope],
-				relativeTo: nil,
-				bookmarkDataIsStale: &bookmarkIsStale
-			),
-			!bookmarkIsStale
-		else { return nil }
-		return project
+	/// Creating an existing input directory is deliberately harmless, so every
+	/// launch can provision it without a separate first-run state machine.
+	static func provision(in workspace: URL) throws -> URL {
+		var isDirectory: ObjCBool = false
+		guard FileManager.default.fileExists(atPath: workspace.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+			throw AgentHandoffError.workspaceUnavailable
+		}
+		let inputDirectory = inputDirectoryURL(in: workspace)
+		if FileManager.default.fileExists(atPath: inputDirectory.path, isDirectory: &isDirectory), !isDirectory.boolValue {
+			throw AgentHandoffError.workspaceUnavailable
+		}
+		try FileManager.default.createDirectory(at: inputDirectory, withIntermediateDirectories: true)
+		return inputDirectory
 	}
 
-	private static func saveCodexProjectBookmark(for project: URL) throws {
-		let bookmark = try project.bookmarkData(
-			options: [.withSecurityScope],
-			includingResourceValuesForKeys: nil,
-			relativeTo: nil
-		)
-		UserDefaults.standard.set(bookmark, forKey: codexProjectBookmarkKey)
+	/// Failed launches may leave an image that no native Claude session can read.
+	/// Delete only the UUID-named file created for that launch; never remove the
+	/// shared directory or a sibling session's still-needed input.
+	static func removeFailedLaunchInput(at url: URL, in workspace: URL) {
+		let inputDirectory = inputDirectoryURL(in: workspace).standardizedFileURL
+		let candidate = url.standardizedFileURL
+		guard candidate.deletingLastPathComponent().path == inputDirectory.path,
+			candidate.pathExtension.lowercased() == "png",
+			UUID(uuidString: candidate.deletingPathExtension().lastPathComponent) != nil
+		else { return }
+		try? FileManager.default.removeItem(at: candidate)
 	}
 }
 
@@ -370,22 +445,29 @@ private enum CodexHandoffCoordinator {
 		yield: @escaping @Sendable (AgentHandoffEvent) -> Void
 	) async throws {
 		let journal = AgentHandoffJournal.shared
-		let packages = try await plan(request, journal: journal)
+		let discoveryWorkspace = try await AgentHandoffWorkspace.openCodexDiscoveryRoot()
+		// Retain the security scope while the planner discovers roots and the child
+		// runners begin inside those roots.
+		defer { _ = discoveryWorkspace }
+		let packages = try await plan(request, workspaceRoot: discoveryWorkspace.root, journal: journal)
 		let handoff = try journal.append(request: request, packages: packages)
 		let input = handoff.input ?? .init(request: request, screenshotPath: nil)
 		yield(.tasksFound(handoff.packages.count))
-		let projectAccess = try await AgentHandoffWorkspace.openCodexProjectRoot()
 
 		try await withThrowingTaskGroup(of: Void.self) { group in
 			for (offset, package) in handoff.packages.enumerated() {
 				group.addTask {
 					do {
+						guard let projectRoot = validatedProjectRoot(
+							at: package.projectPath,
+							inside: discoveryWorkspace.root
+						) else { throw AgentHandoffError.launchFailed("Codex project routing") }
 						try await CodexChildRunner.run(
 							handoffID: handoff.id,
 							package: package,
 							input: input,
 							modelID: request.modelID,
-							projectRoot: projectAccess.root,
+							projectRoot: projectRoot,
 							journal: journal,
 						onRegistered: { threadID in
 							yield(.childStarted(.codex(threadID), ordinal: offset + 1))
@@ -407,6 +489,7 @@ private enum CodexHandoffCoordinator {
 
 	private static func plan(
 		_ request: AgentHandoffRequest,
+		workspaceRoot: URL,
 		journal: AgentHandoffJournal
 	) async throws -> [AgentHandoffPackage] {
 		let executable = try executable(named: "codex", fallback: "/Applications/ChatGPT.app/Contents/Resources/codex")
@@ -423,7 +506,7 @@ private enum CodexHandoffCoordinator {
 			"exec", "--ephemeral", "--sandbox", "read-only", "--skip-git-repo-check",
 			"--output-schema", schemaURL.path,
 			"--output-last-message", resultURL.path,
-			HandoffPrompt.codexPlannerRequest(request),
+			HandoffPrompt.codexPlannerRequest(request, workspaceRoot: workspaceRoot),
 		]
 		if let imageURL {
 			arguments.insert(contentsOf: ["--image", imageURL.path], at: 1)
@@ -434,19 +517,34 @@ private enum CodexHandoffCoordinator {
 		let result = try await runProcess(
 			executable: executable,
 			arguments: arguments,
-			currentDirectoryURL: journal.directory
+			currentDirectoryURL: workspaceRoot
 		)
 		guard result.status == 0,
 			let output = try? String(contentsOf: resultURL, encoding: .utf8)
 		else { throw AgentHandoffError.launchFailed("Codex planner") }
-		return try AgentHandoffManifest.decode(output).packages
+		return try AgentHandoffManifest.decode(output, workspaceRoot: workspaceRoot).packages
+	}
+
+	fileprivate static func validatedProjectRoot(at path: String?, inside workspaceRoot: URL) -> URL? {
+		guard let path = path?.trimmingCharacters(in: .whitespacesAndNewlines), !path.isEmpty else {
+			return nil
+		}
+		let root = workspaceRoot.standardizedFileURL
+		let candidate = URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
+		let rootPrefix = root.path.hasSuffix("/") ? root.path : root.path + "/"
+		guard candidate.path == root.path || candidate.path.hasPrefix(rootPrefix) else { return nil }
+		var isDirectory: ObjCBool = false
+		guard FileManager.default.fileExists(atPath: candidate.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+			return nil
+		}
+		return candidate
 	}
 }
 
 private struct AgentHandoffManifest: Codable, Sendable {
 	let packages: [AgentHandoffPackage]
 
-	static func decode(_ output: String) throws -> AgentHandoffManifest {
+	static func decode(_ output: String, workspaceRoot: URL) throws -> AgentHandoffManifest {
 		let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
 		let json = trimmed
 			.replacingOccurrences(of: "```json", with: "")
@@ -454,7 +552,10 @@ private struct AgentHandoffManifest: Codable, Sendable {
 			.trimmingCharacters(in: .whitespacesAndNewlines)
 		let manifest = try JSONDecoder().decode(Self.self, from: Data(json.utf8))
 		guard !manifest.packages.isEmpty,
-			manifest.packages.allSatisfy({ !$0.title.isEmpty && !$0.objective.isEmpty })
+			manifest.packages.allSatisfy({
+				!$0.title.isEmpty && !$0.objective.isEmpty
+				&& CodexHandoffCoordinator.validatedProjectRoot(at: $0.projectPath, inside: workspaceRoot) != nil
+			})
 		else { throw AgentHandoffError.launchFailed("Codex planner") }
 		return manifest
 	}
@@ -465,15 +566,23 @@ private struct AgentHandoffPackage: Codable, Equatable, Identifiable, Sendable {
 	let title: String
 	let objective: String
 	let context: String
+	let projectPath: String?
 
-	init(id: UUID = UUID(), title: String, objective: String, context: String = "") {
+	init(
+		id: UUID = UUID(),
+		title: String,
+		objective: String,
+		context: String = "",
+		projectPath: String? = nil
+	) {
 		self.id = id
 		self.title = title.trimmingCharacters(in: .whitespacesAndNewlines)
 		self.objective = objective.trimmingCharacters(in: .whitespacesAndNewlines)
 		self.context = context.trimmingCharacters(in: .whitespacesAndNewlines)
+		self.projectPath = projectPath?.trimmingCharacters(in: .whitespacesAndNewlines)
 	}
 
-	private enum CodingKeys: String, CodingKey { case title, objective, context }
+	private enum CodingKeys: String, CodingKey { case title, objective, context, projectPath }
 }
 
 private enum AgentHandoffPackageState: String, Codable, Sendable {
@@ -511,17 +620,21 @@ private struct StoredAgentHandoffPackage: Codable, Identifiable, Sendable {
 	var threadID: String?
 	var state: AgentHandoffPackageState
 	var failure: String?
+	/// Nil keeps journals written before completion acknowledgements compatible;
+	/// those existing completions are intentionally presented as unseen updates.
+	var completionAcknowledged: Bool?
 
 	init(_ package: AgentHandoffPackage) {
 		id = package.id
 		title = package.title
 		objective = package.objective
 		context = package.context
+		projectPath = package.projectPath
 		state = .pending
 	}
 
 	var package: AgentHandoffPackage {
-		.init(id: id, title: title, objective: objective, context: context)
+		.init(id: id, title: title, objective: objective, context: context, projectPath: projectPath)
 	}
 }
 
@@ -606,7 +719,10 @@ private final class AgentHandoffJournal: @unchecked Sendable {
 		journalURL = directory.appendingPathComponent("journal.json")
 	}
 
-	func append(request: AgentHandoffRequest, packages: [AgentHandoffPackage]) throws -> StoredAgentHandoff {
+	func append(
+		request: AgentHandoffRequest,
+		packages: [AgentHandoffPackage]
+	) throws -> StoredAgentHandoff {
 		try withLock {
 			var handoffs = try load()
 			let id = UUID()
@@ -648,7 +764,9 @@ private final class AgentHandoffJournal: @unchecked Sendable {
 							title: package.title,
 							state: .init(package.state),
 							thread: thread(for: handoff.provider, id: package.threadID),
-							handoff: HandoffPrompt.childRequest(package.package, input: input)
+							handoff: HandoffPrompt.childRequest(package.package, input: input),
+							projectPath: package.projectPath,
+							isCompletionAcknowledged: package.completionAcknowledged ?? false
 						)
 					}
 				}
@@ -669,6 +787,29 @@ private final class AgentHandoffJournal: @unchecked Sendable {
 				handoffs.remove(at: handoffIndex)
 			}
 			try save(handoffs)
+		}
+	}
+
+	func acknowledgeCompletions(of taskIDs: [UUID]) throws {
+		let taskIDs = Set(taskIDs)
+		guard !taskIDs.isEmpty else { return }
+		try withLock {
+			var handoffs = try load()
+			var didChange = false
+			for handoffIndex in handoffs.indices {
+				for packageIndex in handoffs[handoffIndex].packages.indices {
+					guard taskIDs.contains(handoffs[handoffIndex].packages[packageIndex].id),
+						handoffs[handoffIndex].packages[packageIndex].state == .completed,
+						handoffs[handoffIndex].packages[packageIndex].completionAcknowledged != true
+					else { continue }
+
+					handoffs[handoffIndex].packages[packageIndex].completionAcknowledged = true
+					didChange = true
+				}
+			}
+			if didChange {
+				try save(handoffs)
+			}
 		}
 	}
 
@@ -717,7 +858,10 @@ private final class AgentHandoffJournal: @unchecked Sendable {
 	}
 
 	func markCompleted(handoffID: UUID, packageID: UUID) throws {
-		try update(handoffID: handoffID, packageID: packageID) { $0.state = .completed }
+		try update(handoffID: handoffID, packageID: packageID) {
+			$0.state = .completed
+			$0.completionAcknowledged = false
+		}
 	}
 
 	func markFailed(handoffID: UUID, packageID: UUID, error: Error) {
@@ -735,13 +879,19 @@ private final class AgentHandoffJournal: @unchecked Sendable {
 		for handoffIndex in handoffs.indices where handoffs[handoffIndex].provider == .codex {
 			for packageIndex in handoffs[handoffIndex].packages.indices {
 				let package = handoffs[handoffIndex].packages[packageIndex]
-				guard package.state == .running || package.state == .registered || package.state == .threadCreated,
+				let wasIncorrectlyMarkedFailedAfterCompletion = package.state == .failed
+					&& package.failure == AgentHandoffError.launchFailed("Codex child").localizedDescription
+				guard package.state == .running || package.state == .registered || package.state == .threadCreated
+					|| wasIncorrectlyMarkedFailedAfterCompletion,
 					let threadID = package.threadID,
 					let terminalState = terminalState(forCodexThread: threadID, createdAt: handoffs[handoffIndex].createdAt)
 				else { continue }
 
 				handoffs[handoffIndex].packages[packageIndex].state = terminalState.state
 				handoffs[handoffIndex].packages[packageIndex].failure = terminalState.failure
+				if terminalState.state == .completed {
+					handoffs[handoffIndex].packages[packageIndex].completionAcknowledged = false
+				}
 				didChange = true
 			}
 		}
@@ -800,11 +950,12 @@ private final class AgentHandoffJournal: @unchecked Sendable {
 					"items": [
 						"type": "object",
 						"additionalProperties": false,
-						"required": ["title", "objective", "context"],
+						"required": ["title", "objective", "context", "projectPath"],
 						"properties": [
 							"title": ["type": "string"],
 							"objective": ["type": "string"],
 							"context": ["type": "string"],
+							"projectPath": ["type": "string"],
 						],
 					],
 				],
@@ -981,7 +1132,7 @@ private final class CodexChildRunState: @unchecked Sendable {
 	private let lock = NSLock()
 	private var finished = false
 	private var currentThreadID: String?
-	private var didNotifyTurnStarted = false
+	private var didNotifyLaunch = false
 
 	func takeFinish() -> Bool {
 		lock.lock()
@@ -1003,12 +1154,18 @@ private final class CodexChildRunState: @unchecked Sendable {
 		return currentThreadID
 	}
 
-	func takeTurnStartedNotification() -> Bool {
+	func takeLaunchNotification() -> Bool {
 		lock.lock()
 		defer { lock.unlock() }
-		guard !didNotifyTurnStarted else { return false }
-		didNotifyTurnStarted = true
+		guard !didNotifyLaunch else { return false }
+		didNotifyLaunch = true
 		return true
+	}
+
+	var isFinished: Bool {
+		lock.lock()
+		defer { lock.unlock() }
+		return finished
 	}
 
 	var hasThread: Bool {
@@ -1152,20 +1309,22 @@ private enum CodexChildRunner {
 								let id = thread["id"] as? String
 							else { finish(.failure(AgentHandoffError.launchFailed("Codex child"))); return }
 							do {
-								try journal.markThreadCreated(handoffID: handoffID, packageID: package.id, threadID: id)
-								try journal.markRegistered(handoffID: handoffID, packageID: package.id)
-								runState.setThreadID(id)
-								startTurn(id)
-							} catch {
-								finish(.failure(error))
+							try journal.markThreadCreated(handoffID: handoffID, packageID: package.id, threadID: id)
+							try journal.markRegistered(handoffID: handoffID, packageID: package.id)
+							runState.setThreadID(id)
+							startTurn(id)
+							// `turn/start` does not provide a stable progress boundary: some
+							// app-server versions respond only after the entire turn ends. The
+							// canonical thread already exists and the turn has been sent, so
+							// report it as launched now.
+							if runState.takeLaunchNotification() {
+								onRegistered(id)
 							}
-						case 3:
-							guard let threadID = runState.threadID else {
-								finish(.failure(AgentHandoffError.launchFailed("Codex child")))
-								return
-							}
-							guard runState.takeTurnStartedNotification() else { return }
-							onRegistered(threadID)
+						} catch {
+							finish(.failure(error))
+						}
+					case 3:
+						break
 						default:
 							break
 						}
@@ -1183,6 +1342,9 @@ private enum CodexChildRunner {
 					}
 				}
 				process.terminationHandler = { _ in
+					// A completed turn intentionally stops the app-server process in
+					// `finish`. Do not overwrite that terminal completion as a failure.
+					guard !runState.isFinished else { return }
 					let error = AgentHandoffError.launchFailed("Codex child")
 					journal.markFailed(handoffID: handoffID, packageID: package.id, error: error)
 					finish(.failure(error))
@@ -1214,49 +1376,63 @@ private enum CodexChildRunner {
 private enum ClaudeHandoffCoordinator {
 	static func run(
 		request: AgentHandoffRequest,
-		workspace: URL,
+		workspace: AgentHandoffWorkspace.SecurityScopedDirectory,
 		yield: @escaping @Sendable (AgentHandoffEvent) -> Void
 	) async throws {
+		// Keep the security scope alive through the coordinator launch and session
+		// lookup. Passing only the URL would let ARC release the bookmark before
+		// Claude Code receives the authorized working directory.
+		defer { _ = workspace }
+		let workspaceURL = workspace.root
 		let executable = try executable(named: "claude")
+		try await ClaudeHandoffSupport.preflight(executable: executable, workspace: workspaceURL)
+
 		let token = UUID().uuidString.lowercased()
 		let name = "Octo handoff \(token)"
 		let screenshotURL = try AgentHandoffWorkspace.persistClaudeScreenshot(
 			for: request,
-			in: workspace,
+			in: workspaceURL,
 			handoffToken: token
 		)
-		var arguments = [
-			"--bg",
-			"--name", name,
-			"--append-system-prompt", HandoffPrompt.claudeCoordinatorInstruction(token: token),
-			HandoffPrompt.userRequest(request, screenshotPath: screenshotURL?.path),
-		]
-		if let modelID = request.modelID?.trimmingCharacters(in: .whitespacesAndNewlines), !modelID.isEmpty {
-			arguments.insert(contentsOf: ["--model", modelID], at: 0)
+		var nativeSessionMayExist = false
+		defer {
+			if !nativeSessionMayExist, let screenshotURL {
+				ClaudeHandoffArtifacts.removeFailedLaunchInput(at: screenshotURL, in: workspaceURL)
+			}
 		}
+		let arguments = ClaudeHandoffCommand.coordinatorLaunchArguments(
+			name: name,
+			modelID: request.modelID,
+			coordinatorInstruction: HandoffPrompt.claudeCoordinatorInstruction(token: token),
+			userRequest: HandoffPrompt.userRequest(request, screenshotPath: screenshotURL?.path)
+		)
 
 		let result = try await runProcess(
 			executable: executable,
 			arguments: arguments,
-			currentDirectoryURL: workspace
+			currentDirectoryURL: workspaceURL
 		)
 		guard result.status == 0 else { throw AgentHandoffError.launchFailed("Claude") }
+		// A successful `--bg` call transfers ownership of the prompt and its file
+		// reference to Claude Code. Retain that exact input even if subsequent
+		// session discovery fails, because the background task can still be live.
+		nativeSessionMayExist = true
 
 		let coordinatorID: String
 		if let returnedID = uuid(in: result.output) {
 			coordinatorID = returnedID
 		} else {
-			coordinatorID = try await findClaudeAgent(named: name, executable: executable, workspace: workspace)
+			coordinatorID = try await findClaudeAgent(named: name, executable: executable, workspace: workspaceURL)
 		}
 		yield(.coordinatorStarted(.claude(coordinatorID)))
 
-		let children = try? await findClaudeAgents(
+		let children = (try? await findClaudeAgents(
 			withNamePrefix: "Octo handoff child \(token)",
 			executable: executable,
-			workspace: workspace
-		)
-		for (offset, childID) in (children ?? []).enumerated() {
-			yield(.tasksFound(offset + 1))
+			workspace: workspaceURL
+		)) ?? []
+		yield(.tasksFound(children.count))
+		for (offset, childID) in children.enumerated() {
 			yield(.childStarted(.claude(childID), ordinal: offset + 1))
 		}
 	}
@@ -1270,12 +1446,106 @@ private enum ClaudeHandoffCoordinator {
 	private static func findClaudeAgents(withNamePrefix name: String, executable: URL, workspace: URL) async throws -> [String] {
 		let result = try await runProcess(
 			executable: executable,
-			arguments: ["agents", "--json", "--all", "--cwd", workspace.path],
+			arguments: ClaudeHandoffCommand.agentListArguments(workspace: workspace),
 			currentDirectoryURL: workspace
 		)
 		guard result.status == 0 else { return [] }
 		let root = try JSONSerialization.jsonObject(with: Data(result.output.utf8))
 		return AgentJSON.findIDs(in: root, matchingNamePrefix: name)
+	}
+}
+
+/// The supported Claude Code command contract for an Octo handoff. Background
+/// sessions appear in Claude Code Agent View; Claude Desktop does not provide a
+/// route for importing those local Agent View sessions.
+enum ClaudeHandoffCommand {
+	static func coordinatorLaunchArguments(
+		name: String,
+		modelID: String?,
+		coordinatorInstruction: String,
+		userRequest: String
+	) -> [String] {
+		var arguments = [
+			"--bg",
+			"--name", name,
+			"--append-system-prompt", coordinatorInstruction,
+			userRequest,
+		]
+		if let modelID = modelID?.trimmingCharacters(in: .whitespacesAndNewlines), !modelID.isEmpty {
+			arguments.insert(contentsOf: ["--model", modelID], at: 0)
+		}
+		return arguments
+	}
+
+	static func agentListArguments(workspace: URL) -> [String] {
+		["agents", "--json", "--all", "--cwd", workspace.path]
+	}
+
+	static func attachArguments(sessionID: String) -> [String] {
+		["attach", sessionID]
+	}
+}
+
+/// Agent View is the only supported surface for locally launched background
+/// sessions. This performs read-only checks before writing a screenshot or
+/// launching a coordinator, so unsupported environments fail without an
+/// Octo-created Claude task or orphaned local input.
+enum ClaudeHandoffSupport {
+	static func preflight(executable: URL, workspace: URL) async throws {
+		let versionResult = try await runProcess(
+			executable: executable,
+			arguments: ["--version"],
+			currentDirectoryURL: workspace
+		)
+		guard versionResult.status == 0, supportsAgentView(versionOutput: versionResult.output) else {
+			throw AgentHandoffError.claudeAgentViewUnavailable
+		}
+
+		let authenticationResult = try await runProcess(
+			executable: executable,
+			arguments: ["auth", "status"],
+			currentDirectoryURL: workspace
+		)
+		guard authenticationResult.status == 0, isAuthenticated(statusOutput: authenticationResult.output) else {
+			throw AgentHandoffError.claudeAuthenticationRequired
+		}
+
+		let agentsResult = try await runProcess(
+			executable: executable,
+			arguments: ClaudeHandoffCommand.agentListArguments(workspace: workspace),
+			currentDirectoryURL: workspace
+		)
+		guard agentsResult.status == 0,
+			let json = try? JSONSerialization.jsonObject(with: Data(agentsResult.output.utf8)),
+			json is [Any] || json is [String: Any]
+		else { throw AgentHandoffError.claudeAgentViewUnavailable }
+	}
+
+	static func supportsAgentView(versionOutput: String) -> Bool {
+		guard let version = version(in: versionOutput) else { return false }
+		return version.major > 2
+			|| (version.major == 2 && (version.minor > 1 || (version.minor == 1 && version.patch >= 139)))
+	}
+
+	static func isAuthenticated(statusOutput: String) -> Bool {
+		guard let root = try? JSONSerialization.jsonObject(with: Data(statusOutput.utf8)) as? [String: Any] else {
+			return false
+		}
+		return root["loggedIn"] as? Bool == true
+	}
+
+	private static func version(in output: String) -> (major: Int, minor: Int, patch: Int)? {
+		let pattern = "\\b(\\d+)\\.(\\d+)\\.(\\d+)\\b"
+		guard let expression = try? NSRegularExpression(pattern: pattern),
+			let match = expression.firstMatch(in: output, range: NSRange(output.startIndex..., in: output)),
+			let majorRange = Range(match.range(at: 1), in: output),
+			let minorRange = Range(match.range(at: 2), in: output),
+			let patchRange = Range(match.range(at: 3), in: output),
+			let major = Int(output[majorRange]),
+			let minor = Int(output[minorRange]),
+			let patch = Int(output[patchRange])
+		else { return nil }
+		return (major, minor, patch)
 	}
 }
 
@@ -1303,14 +1573,29 @@ private enum AgentJSON {
 
 // MARK: - Provider utilities
 
-private enum HandoffPrompt {
+enum HandoffPrompt {
 	static let codexChildInstruction = """
 	You own one bounded Agent Handoff work package. First discover only the relevant configured native tools, skills, plugins, and MCP servers in the user's normal environment. Then execute this package under the user's ordinary approval rules. Do not add a Nomen dependency or a custom discovery bridge. Do not delegate, split, or broaden the package.
 	"""
 
-	static func codexPlannerRequest(_ request: AgentHandoffRequest) -> String {
-		"""
-		You are an ephemeral Agent Handoff planner. Split the user's request into independently executable, bounded work packages. Do not inspect tools, skills, plugins, MCP servers, files, or the workspace. Do not execute any work and do not create tasks. Return only JSON matching the supplied schema. Each package needs a short title, an objective that can be completed by one agent, and only the user context required for that objective. There is no arbitrary package limit. The full handoff input below, including any attached screenshot, is the same user context that each child task will receive.
+	static let workPackagePlanningGuidance = """
+	Respect user-provided manual handoff boundaries. The paired, case-insensitive markers `handoff start`/`handoff end` and `task start`/`task end` delimit manual work-package blocks. Create one separate work package for each marked block and never merge work across those boundaries. Keep all related steps, sub-tasks, and implementation details inside a marked block together unless the user creates another marked block inside it.
+
+	When no explicit markers define boundaries, default to the fewest cohesive master work packages necessary. Related steps, sub-tasks, and implementation details normally belong in one master package; lists, conjunctions, and several requested actions are not themselves split signals. Split only genuinely distinct, independent work streams. When separation is unclear, keep work together and expect the user to state a separation explicitly.
+	"""
+
+	static func codexPlannerRequest(
+		_ request: AgentHandoffRequest,
+		workspaceRoot: URL
+	) -> String {
+		return """
+		You are an ephemeral Agent Handoff planner. First inspect the current workspace only as needed to identify the existing project root for each bounded work package. Then split the user's request into independently executable, bounded work packages. Do not inspect or choose tools, skills, plugins, or MCP servers. Do not execute package work and do not create tasks. Return only JSON matching the supplied schema. Each package needs a short title, an objective that can be completed by one agent, only the user context required for that objective, and the exact absolute projectPath of an existing directory inside the authorized discovery workspace below. Never invent a path. The full handoff input below, including any attached screenshot, is the same user context that each child task will receive.
+
+		<handoff_discovery_workspace>
+		\(workspaceRoot.path)
+		</handoff_discovery_workspace>
+
+		\(workPackagePlanningGuidance)
 
 		\(sourceContext(
 			transcript: request.transcript,
@@ -1321,7 +1606,7 @@ private enum HandoffPrompt {
 		"""
 	}
 
-	static func childRequest(_ package: AgentHandoffPackage, input: StoredAgentHandoffInput) -> String {
+	fileprivate static func childRequest(_ package: AgentHandoffPackage, input: StoredAgentHandoffInput) -> String {
 		let context = package.context.isEmpty ? "" : "\n\nNecessary user context:\n\(package.context)"
 		return """
 		Complete this bounded objective:
@@ -1334,7 +1619,9 @@ private enum HandoffPrompt {
 
 	static func claudeCoordinatorInstruction(token: String) -> String {
 		"""
-		You are the Octo agent-handoff coordinator. Your only job is to split the user's request into independent, bounded work packages and start one new visible Claude background session for every package. Do not inspect configured tools, skills, plugins, MCP servers, the workspace, or project files. Do not perform any package's task work yourself. There is no task-count cap.
+		You are the Octo agent-handoff coordinator. Your only job is to split the user's request into independent, bounded work packages and start one new Claude Code Agent View background session for every package. Do not inspect configured tools, skills, plugins, MCP servers, the workspace, or project files. Do not perform any package's task work yourself.
+
+		\(workPackagePlanningGuidance)
 
 		Use Claude's native `claude --bg` sessions in the current working directory. Name each child `Octo handoff child \(token) <short title>`. Do not disable the child's normal configuration, skills, plugins, MCP servers, or approval rules. Pass this focused system instruction to every child with `--append-system-prompt`: first discover the relevant configured native tools, skills, plugins, and MCP servers in the user's normal environment; then execute only its bounded objective under the user's ordinary approval rules. Do not add a Nomen dependency or custom discovery bridge. Give each child the complete original handoff input as well as its bounded objective. If the input includes a `screen_screenshot_path`, include that path verbatim so the child can inspect the user-provided screenshot when relevant. Do not create a local task manifest and do not ask Octo to create the child sessions.
 		"""
@@ -1504,7 +1791,8 @@ private enum AgentHandoffThreadOpener {
 			guard let agentExecutable = try? executable(named: "claude") else { return }
 			let process = Process()
 			process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-			process.arguments = ["-a", "Terminal", "--args", agentExecutable.path, "--resume", id]
+			process.arguments = ["-a", "Terminal", "--args", agentExecutable.path]
+				+ ClaudeHandoffCommand.attachArguments(sessionID: id)
 			try? process.run()
 		}
 	}

@@ -18,6 +18,7 @@ final class HexSettingsMigrationTests: XCTestCase {
 		XCTAssertEqual(decoded.preventSystemSleep, true)
 		XCTAssertEqual(decoded.minimumKeyTime, 0.25)
 		XCTAssertEqual(decoded.stopDelayMilliseconds, 0)
+		XCTAssertEqual(decoded.longRecordingConfirmationThresholdMinutes, 5)
 		XCTAssertEqual(decoded.copyToClipboard, true)
 		XCTAssertTrue(decoded.superFastModeEnabled)
 		XCTAssertEqual(decoded.useDoubleTapOnly, true)
@@ -33,6 +34,8 @@ final class HexSettingsMigrationTests: XCTestCase {
 		XCTAssertFalse(decoded.removePunctuation)
 		XCTAssertEqual(decoded.refinementMode, .raw)
 		XCTAssertEqual(decoded.refinementProvider, .apple)
+		XCTAssertEqual(decoded.agentHandoffProvider, .codexCLI)
+		XCTAssertNil(decoded.agentHandoffModelID)
 		XCTAssertTrue(decoded.hasCompletedRefinementProviderDetection)
 		XCTAssertEqual(decoded.refinementInstructions, HexSettings.defaultRefinementInstructions)
 		XCTAssertEqual(decoded.rewritePrompts.count, 1)
@@ -52,9 +55,24 @@ final class HexSettingsMigrationTests: XCTestCase {
 		XCTAssertEqual(decoded, settings)
 	}
 
+	func testLegacyCLIRefinementSettingsMigrateToMatchingHandoffConfiguration() throws {
+		let settings = HexSettings(refinementProvider: .claudeCLI, claudeCLIModelID: "sonnet")
+		let encoded = try JSONEncoder().encode(settings)
+		var object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+		object.removeValue(forKey: "agentHandoffProvider")
+		object.removeValue(forKey: "agentHandoffModelID")
+		let legacyData = try JSONSerialization.data(withJSONObject: object)
+
+		let decoded = try JSONDecoder().decode(HexSettings.self, from: legacyData)
+
+		XCTAssertEqual(decoded.agentHandoffProvider, .claudeCLI)
+		XCTAssertEqual(decoded.agentHandoffModelID, "sonnet")
+	}
+
 	func testNewSettingsEnableSuperFastModeByDefault() {
 		XCTAssertTrue(HexSettings().superFastModeEnabled)
 		XCTAssertEqual(HexSettings().stopDelayMilliseconds, 0)
+		XCTAssertEqual(HexSettings().longRecordingConfirmationThresholdMinutes, 5)
 	}
 
 	func testLongPressOnDemandIsEnabledByDefault() {

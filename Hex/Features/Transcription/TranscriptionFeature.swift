@@ -253,12 +253,17 @@ struct TranscriptionFeature {
 
 	struct AgentHandoffPresentation: Equatable {
 		var label: String
+		/// Claude creates a coordinator in addition to the task agents. Keep it
+		/// separate so launch progress only counts the handoffs the user can act on.
+		var coordinatorThread: AgentHandoffThread?
 		var threads: [AgentHandoffThread] = []
 		var expectedTaskCount = 0
 		/// The handoff is successful once every child task has been created and its
 		/// turn has started. Its eventual execution state lives in the handoff journal.
 		var hasLaunched = false
 		var isReady = false
+		var isDeparting = false
+		var isFlying = false
 	}
 
   @ObservableState
@@ -314,6 +319,7 @@ struct TranscriptionFeature {
 		var activeSystemAudioStartOffset: TimeInterval = 0
 	var error: String?
 	var recordingStartTime: Date?
+	var isLongRecordingCancellationConfirmationPresented = false
 	var outputGenerationStartTime: Date?
     var meter: Meter = .init(averagePower: 0, peakPower: 0)
     var sourceAppBundleID: String?
@@ -377,6 +383,8 @@ struct TranscriptionFeature {
     case discard  // Silent discard (too short/accidental)
 		case hotKeyCancelled(RecordingSource)
 		case hotKeyDiscarded(RecordingSource)
+		case confirmLongRecordingCancellation
+		case dismissLongRecordingCancellationConfirmation
 
     // Transcription result flow
 	case transcriptionAudioCaptured(URL, TimeInterval)
@@ -394,6 +402,9 @@ struct TranscriptionFeature {
 	case agentHandoffFailed(String)
 	case openAgentHandoff
 	case dismissAgentHandoff
+	case agentHandoffPresentationExpired
+	case agentHandoffCollapseFinished
+	case agentHandoffDepartureFinished
 	case showCompletedTranscript(String)
 	case copyCompletedTranscript
 	case dismissCompletedTranscript
@@ -416,6 +427,7 @@ struct TranscriptionFeature {
     case transcription
 		case postHocRefinement
 	case agentHandoff
+	case agentHandoffPresentation
 		case selectedTextOnlyRefinement
 		case selectedTextRefinement
 		case errorPresentation
@@ -653,6 +665,10 @@ struct TranscriptionFeature {
 					guard state.isRecording, state.activeRecordingSource == .regular else { return .none }
 					state.pendingTerminalRefinementID = nil
 					state.isAgentHandoffRequestedForActiveRecording = true
+					// Keep the existing overlay alive while local transcription finishes.
+					// Without this, its panel briefly receives the hidden state before the
+					// handoff stream starts, making the progress indicator look like a new pill.
+					state.agentHandoffPresentation = .init(label: "Preparing agent handoff")
 					return .merge(
 						.cancel(id: CancelID.terminalRefinementHold),
 						.cancel(id: CancelID.screenAwareActivation),
@@ -1083,7 +1099,9 @@ struct TranscriptionFeature {
 			return .cancel(id: CancelID.errorPresentation)
 
 		case let .launchAgentHandoff(request):
-			state.agentHandoffPresentation = .init(label: "Preparing agent handoff")
+			if state.agentHandoffPresentation == nil {
+				state.agentHandoffPresentation = .init(label: "Preparing agent handoff")
+			}
 			return .run { [agentHandoff] send in
 				do {
 					for try await event in agentHandoff.launch(request) {
@@ -1099,13 +1117,14 @@ struct TranscriptionFeature {
 
 		case let .agentHandoffEvent(event):
 			guard var presentation = state.agentHandoffPresentation else { return .none }
+			var shouldDismissPresentation = false
 			switch event {
 			case .received:
 				presentation.label = "Agent handoff received"
 			case .processing:
 				presentation.label = "Preparing tasks"
 			case let .coordinatorStarted(thread):
-				presentation.threads = [thread]
+				presentation.coordinatorThread = thread
 				presentation.label = "Creating task packages"
 			case let .tasksFound(count):
 				presentation.expectedTaskCount = count
@@ -1116,26 +1135,43 @@ struct TranscriptionFeature {
 				}
 				let launchedCount = presentation.threads.count
 				let expectedCount = max(presentation.expectedTaskCount, launchedCount)
+				let hasJustLaunched = !presentation.hasLaunched && launchedCount == expectedCount
 				presentation.hasLaunched = launchedCount == expectedCount
 				if presentation.hasLaunched {
-					presentation.label = "Launched \(launchedCount) \(launchedCount == 1 ? "task" : "tasks")"
-				} else {
-					presentation.label = "Launching \(launchedCount) of \(expectedCount) tasks"
-				}
+						presentation.label = "Launched \(launchedCount) \(launchedCount == 1 ? "task" : "tasks")"
+						presentation.isReady = true
+						shouldDismissPresentation = hasJustLaunched
+					} else {
+						presentation.label = "Launching \(launchedCount) of \(expectedCount) tasks"
+					}
 			case .completed:
-				presentation.label = presentation.threads.count == 1 ? "Task completed" : "Tasks completed"
+				if !presentation.hasLaunched {
+					presentation.label = "Handoff completed"
+				}
 				presentation.isReady = true
 			}
 			state.agentHandoffPresentation = presentation
-			return .none
+			guard shouldDismissPresentation else { return .none }
+			return .run { [clock] send in
+				do {
+					try await clock.sleep(for: .seconds(2))
+					await send(.agentHandoffPresentationExpired)
+				} catch {
+					return
+				}
+			}
+			.cancellable(id: CancelID.agentHandoffPresentation, cancelInFlight: true)
 
 		case let .agentHandoffFailed(message):
 			state.agentHandoffPresentation = nil
-			return .send(.showError(message))
+			return .merge(
+				.cancel(id: CancelID.agentHandoffPresentation),
+				.send(.showError(message))
+			)
 
 		case .openAgentHandoff:
 			guard let presentation = state.agentHandoffPresentation,
-				let thread = presentation.threads.first
+				let thread = presentation.threads.first ?? presentation.coordinatorThread
 			else { return .none }
 			return .run { [agentHandoff] _ in
 				await agentHandoff.open(thread)
@@ -1143,7 +1179,38 @@ struct TranscriptionFeature {
 
 		case .dismissAgentHandoff:
 			state.agentHandoffPresentation = nil
-			return .none
+			return .cancel(id: CancelID.agentHandoffPresentation)
+
+		case .agentHandoffPresentationExpired:
+			guard state.agentHandoffPresentation?.hasLaunched == true else { return .none }
+			state.agentHandoffPresentation?.isDeparting = true
+			return .run { [clock] send in
+				do {
+					try await clock.sleep(for: .milliseconds(320))
+					await send(.agentHandoffCollapseFinished)
+				} catch {
+					return
+				}
+			}
+			.cancellable(id: CancelID.agentHandoffPresentation, cancelInFlight: true)
+
+		case .agentHandoffCollapseFinished:
+			guard state.agentHandoffPresentation?.isDeparting == true else { return .none }
+			state.agentHandoffPresentation?.isFlying = true
+			return .run { [clock] send in
+				do {
+					try await clock.sleep(for: .milliseconds(820))
+					await send(.agentHandoffDepartureFinished)
+				} catch {
+					return
+				}
+			}
+			.cancellable(id: CancelID.agentHandoffPresentation, cancelInFlight: true)
+
+		case .agentHandoffDepartureFinished:
+			guard state.agentHandoffPresentation?.isFlying == true else { return .none }
+			state.agentHandoffPresentation = nil
+			return .cancel(id: CancelID.agentHandoffPresentation)
 
 		case let .pasteCompletedTranscript(text):
 			return .run { [pasteboard, soundEffect] send in
@@ -1233,7 +1300,23 @@ struct TranscriptionFeature {
 			guard state.activeRecordingSource == source
 				|| (source == .refined && state.isCapturingSelectedTextForRefinement)
 			else { return .none }
+			if state.isRecording,
+				let recordingStartTime = state.recordingStartTime,
+				now.timeIntervalSince(recordingStartTime) >= TimeInterval(state.hexSettings.longRecordingConfirmationThresholdMinutes * 60)
+			{
+				state.isLongRecordingCancellationConfirmationPresented = true
+				return .none
+			}
 			return handleCancel(&state)
+
+		case .confirmLongRecordingCancellation:
+			guard state.isLongRecordingCancellationConfirmationPresented, state.isRecording else { return .none }
+			state.isLongRecordingCancellationConfirmationPresented = false
+			return handleCancel(&state)
+
+		case .dismissLongRecordingCancellationConfirmation:
+			state.isLongRecordingCancellationConfirmationPresented = false
+			return .none
 
 		case let .hotKeyDiscarded(source):
 			guard state.activeRecordingSource == source, state.isRecording else { return .none }
@@ -1524,6 +1607,7 @@ private extension TranscriptionFeature {
       )
     }
 	state.isRecording = true
+	state.isLongRecordingCancellationConfirmationPresented = false
 	state.completedTranscriptPresentation = nil
 	state.agentHandoffPresentation = nil
 	state.isAgentHandoffRequestedForActiveRecording = false
@@ -1560,6 +1644,7 @@ private extension TranscriptionFeature {
     // Prevent system sleep during recording
 	return .merge(
 			.cancel(id: CancelID.completedTranscriptPresentation),
+			.cancel(id: CancelID.agentHandoffPresentation),
 			.cancel(id: CancelID.transcriptPaste),
 			.cancel(id: CancelID.recordingCleanup),
 			.cancel(id: CancelID.terminalRefinementHold),
@@ -1584,9 +1669,9 @@ private extension TranscriptionFeature {
 			case let .started(checkpoint):
 				await send(.recordingCheckpointStarted(checkpoint))
 				if includeSystemAudio {
-					switch await systemAudioCapture.startCapture() {
-					case .started:
-						await send(.systemAudioCaptureStarted(Date()))
+					switch await systemAudioCapture.startCapture(checkpoint.sessionID) {
+					case let .started(startedAt):
+						await send(.systemAudioCaptureStarted(startedAt))
 					case .permissionDenied:
 						await send(.showError("System audio needs Screen Recording permission. Microphone recording will continue."))
 					case .failed:
@@ -1605,6 +1690,7 @@ private extension TranscriptionFeature {
 
 	  func handleStopRecording(_ state: inout State) -> Effect<Action> {
     state.isRecording = false
+	state.isLongRecordingCancellationConfirmationPresented = false
     
     let stopTime = now
     let startTime = state.recordingStartTime
@@ -1741,14 +1827,14 @@ private extension TranscriptionFeature {
 
 		var unownedAudioURL: URL?
 		var capturedAudioURL: URL?
-		var unownedSystemAudioURL: URL?
+		var transientSystemAudioURL: URL?
 		defer {
           if let unownedAudioURL {
             FileManager.default.removeItemIfExists(at: unownedAudioURL)
 				RecordingRecoveryStore.releaseSource(forFinalAudioURL: unownedAudioURL)
 			}
-			if let unownedSystemAudioURL {
-				FileManager.default.removeItemIfExists(at: unownedSystemAudioURL)
+			if let transientSystemAudioURL {
+				FileManager.default.removeItemIfExists(at: transientSystemAudioURL)
 			}
 		}
 		do {
@@ -1789,6 +1875,7 @@ private extension TranscriptionFeature {
 		  // The audio file is the first durable checkpoint. It is stored before
 		  // transcription begins, so a crash, cancellation, or provider failure can
 		  // never discard the voice message that produced the run.
+		  var durableHistoryID = historyCheckpointID
 		  if shouldCreateHistoryCheckpoint, historyCheckpointID == nil {
 			  do {
 				  let checkpoint = try await transcriptPersistence.save(.init(
@@ -1807,6 +1894,7 @@ private extension TranscriptionFeature {
 				  audioURLForTranscription = checkpoint.audioPath
 				  capturedAudioURL = checkpoint.audioPath
 				  unownedAudioURL = nil
+				  durableHistoryID = checkpoint.id
 				  await send(.transcriptionCheckpointPersisted(checkpoint))
 			  } catch {
 				  transcriptionFeatureLogger.error("Failed to persist audio checkpoint: \(error.localizedDescription, privacy: .private)")
@@ -1821,20 +1909,14 @@ private extension TranscriptionFeature {
 		  transcriptionChannels[0].audioURL = audioURLForTranscription
 
 		  if case let .captured(systemAudioURL, systemAudioDuration) = systemAudioStopResult {
-			  var systemAudioURLForTranscription = systemAudioURL
-			  unownedSystemAudioURL = systemAudioURL
-			  if let historyCheckpointID {
-				  do {
-					  systemAudioURLForTranscription = try await transcriptPersistence.saveAudioChannel(
-						  systemAudioURL,
-						  historyCheckpointID,
-						  .systemAudio
-					  )
-					  unownedSystemAudioURL = nil
-					  await send(.systemAudioCaptured(systemAudioURLForTranscription, systemAudioDuration, startOffset: systemAudioStartOffset))
-				  } catch {
-					  transcriptionFeatureLogger.warning("Failed to persist system audio: \(error.localizedDescription, privacy: .private)")
-				  }
+			  let systemAudioURLForTranscription = systemAudioURL
+			  transientSystemAudioURL = shouldCreateHistoryCheckpoint ? nil : systemAudioURL
+			  if durableHistoryID != nil {
+				  // Keep the recovery-named CAF as the one authoritative file. Moving it to a
+				  // second name before History is updated would create a crash window where the
+				  // bytes exist but neither History nor relaunch recovery can find them.
+				  transientSystemAudioURL = nil
+				  await send(.systemAudioCaptured(systemAudioURL, systemAudioDuration, startOffset: systemAudioStartOffset))
 			  }
 			  transcriptionChannels.append((.systemAudio, systemAudioURLForTranscription, systemAudioDuration, systemAudioStartOffset))
 		  } else if case let .failed(message) = systemAudioStopResult {
@@ -2105,7 +2187,7 @@ private extension TranscriptionFeature {
 		settings: HexSettings
 	) -> AgentHandoffRequest? {
 		let provider: AgentHandoffRequest.Provider?
-		switch settings.refinementProvider {
+		switch settings.agentHandoffProvider {
 		case .codexCLI:
 			provider = .codex
 		case .claudeCLI:
@@ -2116,7 +2198,7 @@ private extension TranscriptionFeature {
 		guard let provider else { return nil }
 		return .init(
 			provider: provider,
-			modelID: settings.refinementRequest(for: transcript, mode: .refined).modelID,
+			modelID: settings.agentHandoffModelID,
 			transcript: transcript,
 			selectedText: selectedText,
 			screenContext: screenContext,
@@ -3006,6 +3088,7 @@ private extension TranscriptionFeature {
     let wasRecording = state.isRecording
 	let wasRefining = state.isRefining
 	state.isTranscribing = false
+	state.isLongRecordingCancellationConfirmationPresented = false
 	state.isRefining = false
 	state.pendingPressAndHoldActivationID = nil
 	state.pendingTerminalRefinementID = nil
@@ -3056,6 +3139,10 @@ private extension TranscriptionFeature {
     let sourceAppBundleID = state.sourceAppBundleID
     let sourceAppName = state.sourceAppName
     let transcriptionHistory = state.$transcriptionHistory
+	let includeSystemAudio = state.activeSystemAudioEnabled
+	let systemAudioStartOffset = state.activeSystemAudioStartOffset
+	state.activeSystemAudioEnabled = false
+	state.activeSystemAudioStartOffset = 0
 
     return .merge(
       .cancel(id: CancelID.transcription),
@@ -3066,11 +3153,32 @@ private extension TranscriptionFeature {
 				.cancel(id: CancelID.selectedTextRefinement),
 				.cancel(id: CancelID.screenContextCapture),
       .cancel(id: CancelID.recordingStart),
-      .run { [sleepManagement] _ in
+	  .run { [sleepManagement, systemAudioCapture] _ in
 		await selectedText?.cancel()
         // Allow system to sleep again
         await sleepManagement.allowSleep()
         soundEffect.play(.cancel)
+		let systemAudioStopResult = includeSystemAudio
+			? await systemAudioCapture.stopCapture()
+			: .ignored(.noActiveCapture)
+		if case let .captured(systemAudioURL, systemAudioDuration) = systemAudioStopResult {
+			if let historyCheckpointID {
+				transcriptionHistory.withLock { history in
+					guard let index = history.history.firstIndex(where: { $0.id == historyCheckpointID }) else { return }
+					var channels = history.history[index].audioChannels ?? []
+					channels.removeAll { $0.source == .systemAudio }
+					channels.append(.init(
+						source: .systemAudio,
+						audioPath: systemAudioURL,
+						duration: systemAudioDuration,
+						startOffset: systemAudioStartOffset
+					))
+					history.history[index].audioChannels = channels
+				}
+			} else {
+				FileManager.default.removeItemIfExists(at: systemAudioURL)
+			}
+		}
 
 		if let activeURL {
 			if let historyCheckpointID {
@@ -3126,7 +3234,9 @@ private extension TranscriptionFeature {
   }
 
   func handleDiscard(_ state: inout State) -> Effect<Action> {
+	let includeSystemAudio = state.activeSystemAudioEnabled
 	state.isRecording = false
+	state.isLongRecordingCancellationConfirmationPresented = false
 	deactivateScreenAwareMode(&state)
 	state.pendingPressAndHoldActivationID = nil
 	state.pendingTerminalRefinementID = nil
@@ -3141,6 +3251,8 @@ private extension TranscriptionFeature {
 	state.activeMinimumKeyTime = nil
 	state.activeRecordingSource = nil
 	state.isAgentHandoffRequestedForActiveRecording = false
+	state.activeSystemAudioEnabled = false
+	state.activeSystemAudioStartOffset = 0
 			let selectedText = state.selectedTextForRefinement
 			state.selectedTextForRefinement = nil
 			state.originalTranscriptForRefinement = nil
@@ -3159,10 +3271,13 @@ private extension TranscriptionFeature {
 			.cancel(id: CancelID.postHocRefinement),
 			.cancel(id: CancelID.selectedTextRefinement),
 			.cancel(id: CancelID.screenContextCapture),
-      .run { [sleepManagement] _ in
+	  .run { [sleepManagement, systemAudioCapture] _ in
 		await selectedText?.cancel()
         // Allow system to sleep again
         await sleepManagement.allowSleep()
+		if includeSystemAudio, case let .captured(systemAudioURL, _) = await systemAudioCapture.stopCapture() {
+			FileManager.default.removeItemIfExists(at: systemAudioURL)
+		}
 		let result = await recording.stopRecording()
 		if case let .captured(url) = result {
 		  FileManager.default.removeItemIfExists(at: url)
@@ -3210,8 +3325,21 @@ struct TranscriptionView: View {
     .task {
       await store.send(.task).finish()
     }
-    .enableInjection()
-  }
+		.enableInjection()
+		.alert("Cancel long recording?", isPresented: Binding(
+			get: { store.isLongRecordingCancellationConfirmationPresented },
+			set: { if !$0 { store.send(.dismissLongRecordingCancellationConfirmation) } }
+		)) {
+			Button("Keep Recording", role: .cancel) {
+				store.send(.dismissLongRecordingCancellationConfirmation)
+			}
+			Button("Cancel Recording", role: .destructive) {
+				store.send(.confirmLongRecordingCancellation)
+			}
+		} message: {
+			Text("This recording has been running for a while. Cancelling will stop it without transcribing it.")
+		}
+	}
 }
 
 // MARK: - Force Quit Command

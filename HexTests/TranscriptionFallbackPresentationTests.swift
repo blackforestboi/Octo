@@ -118,6 +118,41 @@ final class TranscriptionFallbackPresentationTests: XCTestCase {
 		}
 		await store.finish()
 	}
+
+	func testHandoffPillDepartsTwoSecondsAfterEveryTaskLaunches() async {
+		let clock = TestClock()
+		var state = TranscriptionFeature.State()
+		state.agentHandoffPresentation = .init(label: "Found 2 tasks", expectedTaskCount: 2)
+		let store = TestStore(initialState: state) {
+			TranscriptionFeature()
+		} withDependencies: {
+			$0.continuousClock = clock
+		}
+
+		await store.send(.agentHandoffEvent(.childStarted(.codex("first"), ordinal: 1))) {
+			$0.agentHandoffPresentation?.threads = [.codex("first")]
+			$0.agentHandoffPresentation?.label = "Launching 1 of 2 tasks"
+		}
+		await store.send(.agentHandoffEvent(.childStarted(.codex("second"), ordinal: 2))) {
+			$0.agentHandoffPresentation?.threads = [.codex("first"), .codex("second")]
+			$0.agentHandoffPresentation?.label = "Launched 2 tasks"
+			$0.agentHandoffPresentation?.hasLaunched = true
+			$0.agentHandoffPresentation?.isReady = true
+		}
+		await clock.advance(by: .seconds(2))
+		await store.receive(\.agentHandoffPresentationExpired) {
+			$0.agentHandoffPresentation?.isDeparting = true
+		}
+		await clock.advance(by: .milliseconds(320))
+		await store.receive(\.agentHandoffCollapseFinished) {
+			$0.agentHandoffPresentation?.isFlying = true
+		}
+		await clock.advance(by: .milliseconds(820))
+		await store.receive(\.agentHandoffDepartureFinished) {
+			$0.agentHandoffPresentation = nil
+		}
+		await store.finish()
+	}
 }
 
 private actor ClipboardProbe {

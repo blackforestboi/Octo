@@ -190,6 +190,19 @@ final class RefinementTests: XCTestCase {
 		XCTAssertEqual(settings.refinementRequest(for: "hello", mode: .refined).modelID, "sonnet")
 	}
 
+	func testAgentHandoffSettingsRemainSeparateFromQuickRefinement() {
+		let settings = HexSettings(
+			refinementProvider: .claudeCLI,
+			claudeCLIModelID: "sonnet",
+			agentHandoffProvider: .codexCLI,
+			agentHandoffModelID: "gpt-5.6-codex"
+		)
+
+		XCTAssertEqual(settings.refinementRequest(for: "hello", mode: .refined).modelID, "sonnet")
+		XCTAssertEqual(settings.agentHandoffProvider, .codexCLI)
+		XCTAssertEqual(settings.agentHandoffModelID, "gpt-5.6-codex")
+	}
+
 	func testUploadedScreenAwareRequestFallsBackToOpenRouterForCLIProviders() {
 		let context = ScreenContext(
 			imagePNGData: Data([0x01]),

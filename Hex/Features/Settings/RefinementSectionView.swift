@@ -7,19 +7,17 @@ import SwiftUI
 struct RefinementSectionView: View {
 	@ObserveInjection var inject
 	@Bindable var store: StoreOf<SettingsFeature>
-	@Dependency(\.agentHandoff) private var agentHandoff
 	@State private var geminiAPIKey = ""
 	@State private var openRouterAPIKey = ""
 	@State private var openAIAPIKey = ""
 	@State private var anthropicAPIKey = ""
 	@State private var isShowingOpenRouterModelPicker = false
 	@State private var isShowingScreenAwareModelPicker = false
+	@State private var isShowingAgentHandoffModelPicker = false
 	@State private var directModelPickerTarget: DirectModelPickerTarget?
 	@State private var subscriptionModelPickerTarget: SubscriptionModelPickerTarget?
 	@State private var selectedRewritePromptID: RewritePrompt.ID?
 	@State private var isShowingRewritePromptDeletionConfirmation = false
-	@State private var codexProjectPath: String?
-	@State private var codexProjectError: String?
 
 	private enum DirectModelPickerTarget: Identifiable {
 		case refinement
@@ -51,7 +49,7 @@ struct RefinementSectionView: View {
 			}
 
 			Label {
-				Picker("Provider", selection: $store.hexSettings.refinementProvider) {
+				Picker("Quick refinement provider", selection: $store.hexSettings.refinementProvider) {
 					Text("Apple Intelligence").tag(RefinementProvider.apple)
 					Text("Gemini Flash API").tag(RefinementProvider.gemini)
 					Text("OpenRouter API").tag(RefinementProvider.openRouter)
@@ -182,33 +180,6 @@ struct RefinementSectionView: View {
 						}
 						.frame(maxWidth: .infinity, alignment: .leading)
 						.contentShape(Rectangle())
-						Button {
-							Task {
-								do {
-									codexProjectPath = try await agentHandoff.chooseCodexProject()
-									codexProjectError = nil
-								} catch is CancellationError {
-									return
-								} catch {
-									codexProjectError = error.localizedDescription
-								}
-							}
-						} label: {
-							LabeledContent("Agent Handoff project (optional)") {
-								Text(codexProjectPath ?? "Octo managed workspace")
-									.foregroundStyle(codexProjectPath == nil ? .secondary : .primary)
-							}
-						}
-						.frame(maxWidth: .infinity, alignment: .leading)
-						.contentShape(Rectangle())
-						Text("By default, Agent Handoff uses Octo’s managed workspace. Choose a project only when you want tasks to use that project’s files, AGENTS.md, .codex configuration, skills, plugins, and MCP servers.")
-							.font(.caption)
-							.foregroundStyle(.secondary)
-						if let codexProjectError {
-							Text(codexProjectError)
-								.font(.caption)
-								.foregroundStyle(.red)
-						}
 						Text("Uses your signed-in OpenAI subscription through the local Codex CLI. Octo sends only the completed refinement prompt; audio is never sent.")
 							.font(.caption)
 							.foregroundStyle(.secondary)
@@ -230,6 +201,27 @@ struct RefinementSectionView: View {
 							.font(.caption)
 							.foregroundStyle(.secondary)
 					}
+				}
+
+				VStack(alignment: .leading, spacing: 8) {
+					Label("Agent Handoff", systemImage: "arrowshape.turn.up.right")
+						.font(.headline)
+					Picker("Handoff provider", selection: $store.hexSettings.agentHandoffProvider) {
+						Text("OpenAI Subscription").tag(RefinementProvider.codexCLI)
+						Text("Claude Subscription").tag(RefinementProvider.claudeCLI)
+					}
+					Button {
+						isShowingAgentHandoffModelPicker = true
+					} label: {
+						LabeledContent("Handoff model") {
+							Text(store.hexSettings.agentHandoffModelID ?? handoffDefaultModelName)
+						}
+					}
+					.frame(maxWidth: .infinity, alignment: .leading)
+					.contentShape(Rectangle())
+					Text("Used only when Shift-finishing a recording creates an Agent Handoff. It does not change quick refinement.")
+						.font(.caption)
+						.foregroundStyle(.secondary)
 				}
 
 			rewritePromptsSection
@@ -311,7 +303,6 @@ struct RefinementSectionView: View {
 			openRouterAPIKey = OpenRouterAPIKeyStore.read() ?? ""
 			openAIAPIKey = OpenAIAPIKeyStore.read() ?? ""
 				anthropicAPIKey = AnthropicAPIKeyStore.read() ?? ""
-				codexProjectPath = agentHandoff.codexProjectPath()
 				selectFirstRewritePromptIfNeeded()
 		}
 		.onChange(of: store.hexSettings.rewritePrompts.map(\.id)) { _, _ in
@@ -366,6 +357,12 @@ struct RefinementSectionView: View {
 				SubscriptionModelPickerView(
 					selectedModelID: subscriptionModelBinding(for: target),
 					provider: target.provider
+				)
+			}
+			.sheet(isPresented: $isShowingAgentHandoffModelPicker) {
+				SubscriptionModelPickerView(
+					selectedModelID: $store.hexSettings.agentHandoffModelID,
+					provider: handoffCLIProvider
 				)
 			}
 		.enableInjection()
@@ -589,6 +586,20 @@ struct RefinementSectionView: View {
 		switch target {
 		case .codex: $store.hexSettings.codexCLIModelID
 		case .claude: $store.hexSettings.claudeCLIModelID
+		}
+	}
+
+	private var handoffCLIProvider: CLIRefinementClient.Provider {
+		switch store.hexSettings.agentHandoffProvider {
+		case .claudeCLI: .claude
+		case .apple, .gemini, .openRouter, .openAI, .anthropic, .codexCLI: .codex
+		}
+	}
+
+	private var handoffDefaultModelName: String {
+		switch handoffCLIProvider {
+		case .codex: "Codex default"
+		case .claude: "Claude default"
 		}
 	}
 

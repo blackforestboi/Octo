@@ -12,7 +12,8 @@
     "changeset:add-ai": "bun run tools/scripts/add-changeset.ts",
     "changeset:status": "changeset status --verbose",
     "changeset:version": "changeset version",
-    "sync-changelog": "bun run tools/scripts/sync-changelog.ts"
+    "sync-changelog": "bun run tools/scripts/sync-changelog.ts",
+    "test": "echo test"
   },
   "devDependencies": {
     "@changesets/cli": "^2.31.0"

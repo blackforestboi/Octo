@@ -10,7 +10,7 @@ import HexCore
 private let systemAudioCaptureLogger = HexLog.recording
 
 enum SystemAudioCaptureStartResult: Equatable, Sendable {
-	case started
+	case started(Date)
 	case permissionDenied
 	case failed
 }
@@ -28,16 +28,20 @@ enum SystemAudioCaptureStopResult: Equatable, Sendable {
 
 @DependencyClient
 struct SystemAudioCaptureClient {
-	var startCapture: @Sendable () async -> SystemAudioCaptureStartResult = { .failed }
+	var startCapture: @Sendable (_ parentRecordingSessionID: UUID) async -> SystemAudioCaptureStartResult = { _ in .failed }
 	var stopCapture: @Sendable () async -> SystemAudioCaptureStopResult = { .ignored(.noActiveCapture) }
+	var recoverInterruptedRecordings: @Sendable () async -> [RecoveredSystemAudioRecording] = { [] }
+	var cleanup: @Sendable () async -> Void = {}
 }
 
 extension SystemAudioCaptureClient: DependencyKey {
 	static let liveValue: Self = {
 		let live = SystemAudioCaptureClientLive()
 		return Self(
-			startCapture: { await live.startCapture() },
-			stopCapture: { await live.stopCapture() }
+			startCapture: { await live.startCapture(parentRecordingSessionID: $0) },
+			stopCapture: { await live.stopCapture() },
+			recoverInterruptedRecordings: { await live.recoverInterruptedRecordings() },
+			cleanup: { await live.cleanup() }
 		)
 	}()
 }
@@ -51,32 +55,11 @@ extension DependencyValues {
 
 private final class SystemAudioCaptureWriter: NSObject, SCStreamOutput, @unchecked Sendable {
 	private let lock = NSLock()
-	private let writer: AVAssetWriter
-	private let input: AVAssetWriterInput
-	private var started = false
-	private var startedAt: CMTime?
-	private var latestSampleTime: CMTime?
+	private let session: SystemAudioRecoverySession
+	private var appendError: Swift.Error?
 
-	init(outputURL: URL) throws {
-		writer = try AVAssetWriter(outputURL: outputURL, fileType: .m4a)
-		input = AVAssetWriterInput(
-			mediaType: .audio,
-			outputSettings: [
-				AVFormatIDKey: kAudioFormatMPEG4AAC,
-				AVSampleRateKey: 48_000,
-				AVNumberOfChannelsKey: 2,
-				AVEncoderBitRateKey: 192_000,
-			]
-		)
-		input.expectsMediaDataInRealTime = true
-		guard writer.canAdd(input) else {
-			throw NSError(
-				domain: "SystemAudioCapture",
-				code: 1,
-				userInfo: [NSLocalizedDescriptionKey: "Unable to prepare the system audio writer."]
-			)
-		}
-		writer.add(input)
+	init(session: SystemAudioRecoverySession) {
+		self.session = session
 	}
 
 	func stream(
@@ -88,87 +71,134 @@ private final class SystemAudioCaptureWriter: NSObject, SCStreamOutput, @uncheck
 
 		lock.lock()
 		defer { lock.unlock() }
-		guard writer.status != .failed, writer.status != .cancelled else { return }
-
-		if !started {
-			guard writer.startWriting() else {
-				systemAudioCaptureLogger.error("Unable to start system audio writer: \(self.writer.error?.localizedDescription ?? "unknown error", privacy: .private)")
-				return
-			}
-			let start = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-			writer.startSession(atSourceTime: start)
-			started = true
-			startedAt = start
-		}
-
-		if input.isReadyForMoreMediaData {
-			if input.append(sampleBuffer) {
-				let presentationTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-				let sampleDuration = CMSampleBufferGetDuration(sampleBuffer)
-				latestSampleTime = sampleDuration.isValid
-					? CMTimeAdd(presentationTime, sampleDuration)
-					: presentationTime
-			}
+		guard appendError == nil else { return }
+		do {
+			let (pcm, frameCount) = try Self.interleavedFloat32PCM(from: sampleBuffer)
+			try session.appendInterleavedPCM(pcm, frameCount: frameCount)
+		} catch {
+			appendError = error
+			systemAudioCaptureLogger.error("Failed to append system audio PCM: \(error.localizedDescription, privacy: .private)")
 		}
 	}
 
-	func finish() async throws -> TimeInterval? {
+	func finish() throws -> RecoveredSystemAudioRecording? {
 		lock.lock()
-		let didStart = started
-		let startTime = startedAt
-		let endTime = latestSampleTime
-		if didStart { input.markAsFinished() }
-		lock.unlock()
+		defer { lock.unlock() }
+		let recovered = try session.finalize()
+		if recovered != nil, let appendError {
+			// A valid synchronized prefix is still valuable. Return it to History and surface
+			// the truncation in diagnostics instead of deleting the entire recording.
+			systemAudioCaptureLogger.warning("System audio was finalized after a PCM append error: \(appendError.localizedDescription, privacy: .private)")
+		}
+		return recovered
+	}
 
-		guard didStart, let startTime else {
-			writer.cancelWriting()
-			return nil
+	func abandonForRecovery() {
+		lock.lock()
+		defer { lock.unlock() }
+		session.abandonForRecovery()
+	}
+
+	private static func interleavedFloat32PCM(from sampleBuffer: CMSampleBuffer) throws -> (Data, Int) {
+		guard let description = sampleBuffer.formatDescription,
+			let streamDescription = description.audioStreamBasicDescription,
+			streamDescription.mFormatID == kAudioFormatLinearPCM,
+			streamDescription.mFormatFlags & kAudioFormatFlagIsFloat != 0,
+			streamDescription.mBitsPerChannel == 32,
+			streamDescription.mChannelsPerFrame == SystemAudioRecoveryStore.channelCount,
+			abs(streamDescription.mSampleRate - SystemAudioRecoveryStore.sampleRate) < 0.5
+		else {
+			throw SystemAudioRecoveryStore.Error.invalidPCMBuffer
 		}
 
-		try await withCheckedThrowingContinuation { continuation in
-			writer.finishWriting {
-				if self.writer.status == .completed {
-					continuation.resume(returning: ())
-				} else {
-					continuation.resume(throwing: self.writer.error ?? NSError(
-						domain: "SystemAudioCapture",
-						code: 2,
-						userInfo: [NSLocalizedDescriptionKey: "System audio export did not finish."]
-					))
+		let frameCount = sampleBuffer.numSamples
+		guard frameCount > 0 else { return (Data(), 0) }
+		return try sampleBuffer.withAudioBufferList { bufferList, _ in
+			if bufferList.count == 1 {
+				let buffer = bufferList[0]
+				let byteCount = frameCount * SystemAudioRecoveryStore.bytesPerFrame
+				guard buffer.mNumberChannels == SystemAudioRecoveryStore.channelCount,
+					Int(buffer.mDataByteSize) >= byteCount,
+					let source = buffer.mData
+				else { throw SystemAudioRecoveryStore.Error.invalidPCMBuffer }
+				return (Data(bytes: source, count: byteCount), frameCount)
+			}
+
+			guard bufferList.count == SystemAudioRecoveryStore.channelCount else {
+				throw SystemAudioRecoveryStore.Error.invalidPCMBuffer
+			}
+			let bytesPerChannel = frameCount * SystemAudioRecoveryStore.bytesPerSample
+			let channels: [UnsafePointer<Float>] = try (0..<SystemAudioRecoveryStore.channelCount).map { index in
+				let buffer = bufferList[index]
+				guard buffer.mNumberChannels == 1,
+					Int(buffer.mDataByteSize) >= bytesPerChannel,
+					let source = buffer.mData
+				else { throw SystemAudioRecoveryStore.Error.invalidPCMBuffer }
+				return UnsafeRawPointer(source).assumingMemoryBound(to: Float.self)
+			}
+			var interleaved = Data(count: frameCount * SystemAudioRecoveryStore.bytesPerFrame)
+			interleaved.withUnsafeMutableBytes { rawDestination in
+				let destination = rawDestination.bindMemory(to: Float.self)
+				for frame in 0..<frameCount {
+					for channel in 0..<SystemAudioRecoveryStore.channelCount {
+						destination[frame * SystemAudioRecoveryStore.channelCount + channel] = channels[channel][frame]
+					}
 				}
 			}
+			return (interleaved, frameCount)
 		}
-
-		guard let endTime else { return 0 }
-		return max(0, CMTimeGetSeconds(CMTimeSubtract(endTime, startTime)))
 	}
 }
 
 private actor SystemAudioCaptureClientLive {
 	private struct ActiveCapture {
+		let id: UUID
+		let parentRecordingSessionID: UUID
 		let stream: SCStream
 		let writer: SystemAudioCaptureWriter
-		let outputURL: URL
+		let startedAt: Date
 	}
 
-	private var activeCapture: ActiveCapture?
+	private enum CapturePhase {
+		case starting(ActiveCapture)
+		case started(ActiveCapture)
+		case stopping(UUID)
+	}
 
-	func startCapture() async -> SystemAudioCaptureStartResult {
-		guard activeCapture == nil else { return .started }
+	private let recoveryStore = SystemAudioRecoveryStore()
+	private var pendingStartID: UUID?
+	private var capturePhase: CapturePhase?
+
+	func startCapture(parentRecordingSessionID: UUID) async -> SystemAudioCaptureStartResult {
+		if case let .started(capture) = capturePhase,
+			capture.parentRecordingSessionID == parentRecordingSessionID
+		{
+			return .started(capture.startedAt)
+		}
+		guard pendingStartID == nil, capturePhase == nil else {
+			systemAudioCaptureLogger.error("Refusing to overlap system audio capture sessions")
+			return .failed
+		}
+
+		let startID = UUID()
+		pendingStartID = startID
 		guard CGPreflightScreenCaptureAccess() || CGRequestScreenCaptureAccess() else {
+			pendingStartID = nil
 			systemAudioCaptureLogger.notice("System audio capture needs Screen Recording permission")
 			return .permissionDenied
 		}
 
-		let outputURL = FileManager.default.temporaryDirectory
-			.appendingPathComponent("octo-system-audio-\(UUID().uuidString)")
-			.appendingPathExtension("m4a")
-
+		var recoverySession: SystemAudioRecoverySession?
+		var pendingCapture: ActiveCapture?
 		do {
 			let content = try await SCShareableContent.excludingDesktopWindows(
 				false,
 				onScreenWindowsOnly: true
 			)
+			guard pendingStartID == startID, !Task.isCancelled else {
+				if pendingStartID == startID { pendingStartID = nil }
+				return .failed
+			}
 			guard let display = content.displays.first(where: { $0.displayID == CGMainDisplayID() })
 				?? content.displays.first
 			else {
@@ -187,45 +217,134 @@ private actor SystemAudioCaptureClientLive {
 			let configuration = SCStreamConfiguration()
 			configuration.capturesAudio = true
 			configuration.excludesCurrentProcessAudio = true
-			configuration.sampleRate = 48_000
-			configuration.channelCount = 2
+			configuration.sampleRate = Int(SystemAudioRecoveryStore.sampleRate)
+			configuration.channelCount = SystemAudioRecoveryStore.channelCount
 			configuration.width = 2
 			configuration.height = 2
 
-			let writer = try SystemAudioCaptureWriter(outputURL: outputURL)
+			let startedAt = Date()
+			let session = try recoveryStore.begin(
+				parentRecordingSessionID: parentRecordingSessionID,
+				createdAt: startedAt
+			)
+			recoverySession = session
+			let writer = SystemAudioCaptureWriter(session: session)
 			let stream = SCStream(filter: filter, configuration: configuration, delegate: nil)
 			try stream.addStreamOutput(
 				writer,
 				type: .audio,
 				sampleHandlerQueue: DispatchQueue(label: "io.github.blackforestboi.Octo.system-audio")
 			)
+			let captureID = UUID()
+			let capture = ActiveCapture(
+				id: captureID,
+				parentRecordingSessionID: parentRecordingSessionID,
+				stream: stream,
+				writer: writer,
+				startedAt: startedAt
+			)
+			pendingCapture = capture
+			pendingStartID = nil
+			capturePhase = .starting(capture)
 			try await stream.startCapture()
-			activeCapture = .init(stream: stream, writer: writer, outputURL: outputURL)
-			systemAudioCaptureLogger.notice("Started system audio capture")
-			return .started
+
+			// stopCapture() can run while ScreenCaptureKit is suspended in startCapture().
+			// In that case it owns finalization; never resurrect the stopped stream here.
+			guard case let .starting(currentCapture) = capturePhase,
+				currentCapture.id == captureID
+			else { return .failed }
+			guard !Task.isCancelled else {
+				capturePhase = .stopping(captureID)
+				try? await stream.stopCapture()
+				finalizeAfterFailedStart(capture)
+				clearStoppingPhase(captureID)
+				return .failed
+			}
+			capturePhase = .started(capture)
+			systemAudioCaptureLogger.notice("Started durable PCM system audio capture")
+			return .started(startedAt)
 		} catch {
-			FileManager.default.removeItemIfExists(at: outputURL)
+			if pendingStartID == startID {
+				pendingStartID = nil
+			}
+			if let pendingCapture,
+				case let .starting(currentCapture) = capturePhase,
+				currentCapture.id == pendingCapture.id
+			{
+				capturePhase = .stopping(pendingCapture.id)
+				try? await pendingCapture.stream.stopCapture()
+				finalizeAfterFailedStart(pendingCapture)
+				clearStoppingPhase(pendingCapture.id)
+			} else if case nil = pendingCapture {
+				do {
+					_ = try recoverySession?.finalize()
+				} catch {
+					recoverySession?.abandonForRecovery()
+				}
+			}
 			systemAudioCaptureLogger.error("Failed to start system audio capture: \(error.localizedDescription, privacy: .private)")
 			return .failed
 		}
 	}
 
 	func stopCapture() async -> SystemAudioCaptureStopResult {
-		guard let capture = activeCapture else { return .ignored(.noActiveCapture) }
-		activeCapture = nil
+		if pendingStartID != nil {
+			// Invalidates a start that is currently awaiting ScreenCaptureKit discovery.
+			pendingStartID = nil
+		}
+		let capture: ActiveCapture
+		switch capturePhase {
+		case let .starting(currentCapture), let .started(currentCapture):
+			capture = currentCapture
+			capturePhase = .stopping(currentCapture.id)
+		case .stopping, .none:
+			return .ignored(.noActiveCapture)
+		}
 
+		var streamStopError: Swift.Error?
 		do {
 			try await capture.stream.stopCapture()
-			guard let duration = try await capture.writer.finish() else {
-				FileManager.default.removeItemIfExists(at: capture.outputURL)
+		} catch {
+			streamStopError = error
+			systemAudioCaptureLogger.warning("System audio stream stop failed; finalizing its durable prefix: \(error.localizedDescription, privacy: .private)")
+		}
+
+		do {
+			guard let recovered = try capture.writer.finish() else {
+				clearStoppingPhase(capture.id)
+				if let streamStopError { return .failed(streamStopError.localizedDescription) }
 				return .ignored(.noCapturedAudio)
 			}
-			systemAudioCaptureLogger.notice("Stopped system audio capture after \(String(format: "%.2f", duration))s")
-			return .captured(capture.outputURL, duration)
+			clearStoppingPhase(capture.id)
+			systemAudioCaptureLogger.notice("Stopped durable system audio capture after \(String(format: "%.2f", recovered.duration))s")
+			return .captured(recovered.audioURL, recovered.duration)
 		} catch {
-			FileManager.default.removeItemIfExists(at: capture.outputURL)
-			systemAudioCaptureLogger.error("Failed to finalize system audio capture: \(error.localizedDescription, privacy: .private)")
+			capture.writer.abandonForRecovery()
+			clearStoppingPhase(capture.id)
+			systemAudioCaptureLogger.error("Failed to finalize system audio capture; keeping it for next-launch recovery: \(error.localizedDescription, privacy: .private)")
 			return .failed(error.localizedDescription)
 		}
+	}
+
+	func recoverInterruptedRecordings() -> [RecoveredSystemAudioRecording] {
+		recoveryStore.recoverInterruptedRecordings()
+	}
+
+	func cleanup() async {
+		_ = await stopCapture()
+	}
+
+	private func finalizeAfterFailedStart(_ capture: ActiveCapture) {
+		do {
+			_ = try capture.writer.finish()
+		} catch {
+			capture.writer.abandonForRecovery()
+			systemAudioCaptureLogger.error("Could not finalize a failed system audio start; keeping it for recovery: \(error.localizedDescription, privacy: .private)")
+		}
+	}
+
+	private func clearStoppingPhase(_ captureID: UUID) {
+		guard case let .stopping(currentID) = capturePhase, currentID == captureID else { return }
+		capturePhase = nil
 	}
 }

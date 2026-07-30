@@ -7,6 +7,7 @@
 
 import AppKit
 import HexCore
+import QuartzCore
 import SwiftUI
 
 private final class FirstMouseHostingView: NSHostingView<AnyView> {
@@ -26,6 +27,7 @@ class InvisibleWindow: NSPanel {
   private var mouseMonitor: Any?
   private var indicatorSize: CGSize?
   private var indicatorLocation: IndicatorLocation = .topCenter
+	private var isAnimatingHandoffDeparture = false
 
   init() {
     let screen = NSScreen.main ?? NSScreen.screens[0]
@@ -77,6 +79,7 @@ class InvisibleWindow: NSPanel {
   }
 
   func update(size: CGSize?, location: IndicatorLocation) {
+	isAnimatingHandoffDeparture = false
     let previousSize = indicatorSize
     indicatorSize = size
     indicatorLocation = location
@@ -87,11 +90,61 @@ class InvisibleWindow: NSPanel {
       return
     }
 
+	alphaValue = 1
     ignoresMouseEvents = false
     updateFrame(size: size, animated: previousSize != nil)
   }
 
+	/// Sends the existing overlay toward the menu-bar region. The pill fades before
+	/// arrival, so the destination only needs to provide a directional cue rather
+	/// than match the SwiftUI-managed status item's private frame exactly.
+	func animateAgentHandoffDeparture() {
+		guard let screen = currentScreen ?? self.screen else {
+			NotificationCenter.default.post(name: .agentHandoffArrivedAtMenuBar, object: nil)
+			return
+		}
+
+		isAnimatingHandoffDeparture = true
+		ignoresMouseEvents = true
+
+		let statusBarHeight = NSStatusBar.system.thickness
+		// Aim at the portion of the menu bar where Octo normally sits without
+		// pretending that we know the private NSStatusItem frame. Thirty percent
+		// in from the right edge gives the cue a plausible landing zone across
+		// screen sizes while leaving enough room for other status items.
+		let destinationCenter = NSPoint(
+			x: screen.frame.maxX - screen.frame.width * 0.3,
+			y: screen.frame.maxY - statusBarHeight / 2
+		)
+		let destinationFrame = NSRect(
+			x: destinationCenter.x - frame.width / 2,
+			y: destinationCenter.y - frame.height / 2,
+			width: frame.width,
+			height: frame.height
+		)
+
+		let flightDuration: TimeInterval = 0.78
+		let fadeStartFraction: TimeInterval = 0.8
+		NSAnimationContext.runAnimationGroup { context in
+			context.duration = flightDuration
+			// A linear path keeps the late fade tied to distance traveled: 80% of
+			// elapsed time is also 80% of the flight path.
+			context.timingFunction = CAMediaTimingFunction(name: .linear)
+			animator().setFrame(destinationFrame, display: true)
+		}
+
+		DispatchQueue.main.asyncAfter(deadline: .now() + flightDuration * fadeStartFraction) { [weak self] in
+			guard self?.isAnimatingHandoffDeparture == true else { return }
+			NotificationCenter.default.post(name: .agentHandoffArrivedAtMenuBar, object: nil)
+			NSAnimationContext.runAnimationGroup { context in
+				context.duration = flightDuration * (1 - fadeStartFraction)
+				self?.animator().alphaValue = 0
+			}
+		}
+	}
+
   private func updateToScreenWithMouse() {
+	guard !isAnimatingHandoffDeparture else { return }
     let mouseLocation = NSEvent.mouseLocation
     guard let screenWithMouse = NSScreen.screens.first(where: { $0.frame.contains(mouseLocation) }) else { return }
     currentScreen = screenWithMouse
@@ -101,6 +154,7 @@ class InvisibleWindow: NSPanel {
   }
 
   private func checkForScreenChange() {
+	guard !isAnimatingHandoffDeparture else { return }
     let mouseLocation = NSEvent.mouseLocation
     guard let newScreen = NSScreen.screens.first(where: { $0.frame.contains(mouseLocation) }) else { return }
     

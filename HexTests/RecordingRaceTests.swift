@@ -10,6 +10,49 @@ import XCTest
 
 @MainActor
 final class RecordingRaceTests: XCTestCase {
+	func testEscapeRequestsConfirmationAtLongRecordingThreshold() async {
+		let now = Date(timeIntervalSince1970: 1_000)
+		var state = Self.makeState()
+		state.isRecording = true
+		state.activeRecordingSource = .regular
+		state.recordingStartTime = now.addingTimeInterval(-5 * 60)
+		state.$hexSettings.withLock { $0.longRecordingConfirmationThresholdMinutes = 5 }
+		let store = TestStore(initialState: state) { TranscriptionFeature() } withDependencies: {
+			$0.date.now = now
+		}
+
+		await store.send(.hotKeyCancelled(.regular)) {
+			$0.isLongRecordingCancellationConfirmationPresented = true
+		}
+		XCTAssertTrue(store.state.isRecording)
+
+		await store.send(.dismissLongRecordingCancellationConfirmation) {
+			$0.isLongRecordingCancellationConfirmationPresented = false
+		}
+	}
+
+	func testConfirmingLongRecordingCancellationStopsRecording() async {
+		var state = Self.makeState()
+		state.isRecording = true
+		state.activeRecordingSource = .regular
+		state.recordingStartTime = Date(timeIntervalSince1970: 700)
+		state.isLongRecordingCancellationConfirmationPresented = true
+		let store = TestStore(initialState: state) { TranscriptionFeature() } withDependencies: {
+			$0.date.now = Date(timeIntervalSince1970: 1_000)
+			$0.recording.stopRecording = { .ignored(.noActiveRecording) }
+			$0.sleepManagement.allowSleep = {}
+			$0.soundEffects.play = { _ in }
+		}
+		store.exhaustivity = .off(showSkippedAssertions: false)
+
+		await store.send(.confirmLongRecordingCancellation) {
+			$0.isLongRecordingCancellationConfirmationPresented = false
+			$0.isRecording = false
+			$0.activeRecordingSource = nil
+		}
+		await store.finish()
+	}
+
   func testMicrophoneUnavailableAtRecordingStartShowsErrorAndPlaysCancelSound() async {
     let now = Date(timeIntervalSince1970: 1_234)
     let clock = TestClock()
