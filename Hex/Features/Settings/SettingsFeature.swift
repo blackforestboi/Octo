@@ -38,7 +38,7 @@ extension SharedReaderKey
 @Reducer
 struct SettingsFeature {
   @ObservableState
-  struct State {
+	struct State: Equatable {
     @Shared(.hexSettings) var hexSettings: HexSettings
     @Shared(.isSettingHotKey) var isSettingHotKey: Bool = false
     @Shared(.isSettingPasteLastTranscriptHotkey) var isSettingPasteLastTranscriptHotkey: Bool = false
@@ -85,6 +85,7 @@ struct SettingsFeature {
 	case setAllowLongPressForOnDemand(Bool)
     case setMinimumKeyTime(Double)
     case setStopDelayMilliseconds(Int)
+	case setLongRecordingConfirmationThresholdMinutes(Int)
     case setOutputLanguage(String?)
     case setSelectedMicrophoneID(String?)
     case setSoundEffectsEnabled(Bool)
@@ -541,6 +542,10 @@ struct SettingsFeature {
       case let .setStopDelayMilliseconds(value):
         state.$hexSettings.withLock { $0.stopDelayMilliseconds = max(0, value) }
         return .none
+
+	  case let .setLongRecordingConfirmationThresholdMinutes(value):
+		state.$hexSettings.withLock { $0.longRecordingConfirmationThresholdMinutes = max(1, value) }
+		return .none
 
       case let .setOutputLanguage(language):
         state.$hexSettings.withLock { $0.outputLanguage = language }

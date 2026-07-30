@@ -1,4 +1,5 @@
 import ComposableArchitecture
+import Foundation
 import HexCore
 import Inject
 import SwiftUI
@@ -101,7 +102,9 @@ private struct HandoffTaskCard: View {
 				VStack(alignment: .leading, spacing: 4) {
 					Text(task.title)
 						.font(.headline)
-					Text("\(providerName) · \(task.createdAt, format: .dateTime.year().month().day().hour().minute())")
+						Text([providerName, projectName, task.createdAt.formatted(.dateTime.year().month().day().hour().minute())]
+						.compactMap { $0 }
+						.joined(separator: " · "))
 						.settingsCaption()
 				}
 
@@ -144,5 +147,9 @@ private struct HandoffTaskCard: View {
 		case .codex: "Codex"
 		case .claude: "Claude"
 		}
+	}
+
+	private var projectName: String? {
+		task.projectPath.map { URL(fileURLWithPath: $0).lastPathComponent }
 	}
 }

@@ -13,6 +13,7 @@ class HexAppDelegate: NSObject, NSApplicationDelegate {
 
 	@Dependency(\.soundEffects) var soundEffect
 	@Dependency(\.recording) var recording
+	@Dependency(\.systemAudioCapture) var systemAudioCapture
 	@Shared(.hexSettings) var hexSettings: HexSettings
 
 	func applicationDidFinishLaunching(_: Notification) {
@@ -55,7 +56,6 @@ class HexAppDelegate: NSObject, NSApplicationDelegate {
 			name: .presentSettingsWindow,
 			object: nil
 		)
-
 		// Start long-running app effects (global hotkeys, permissions, etc.)
 		startLifecycleTasksIfNeeded()
 
@@ -132,6 +132,12 @@ class HexAppDelegate: NSObject, NSApplicationDelegate {
 			},
 			onPillSizeChange: { [weak self] size in
 				self?.updatePillSize(size)
+			},
+			onAgentHandoffDeparture: { [weak self] in
+				// Let SwiftUI finish its status/layout update before the panel begins moving.
+				DispatchQueue.main.async {
+					self?.invisibleWindow?.animateAgentHandoffDeparture()
+				}
 			}
 		)
 		invisibleWindow = InvisibleWindow.fromView(transcriptionView)
@@ -222,15 +228,18 @@ class HexAppDelegate: NSObject, NSApplicationDelegate {
 		// blocking outright - cleanup() hops to the main actor/main queue (media-key
 		// resume, Core Audio listener removal), which a blocked main thread would deadlock.
 		let recording = recording
+		let systemAudioCapture = systemAudioCapture
 		let semaphore = DispatchSemaphore(value: 0)
 		Task.detached {
-			await recording.cleanup()
+			async let microphoneCleanup: Void = recording.cleanup()
+			async let systemAudioCleanup: Void = systemAudioCapture.cleanup()
+			_ = await (microphoneCleanup, systemAudioCleanup)
 			semaphore.signal()
 		}
 		let deadline = Date().addingTimeInterval(3)
 		while semaphore.wait(timeout: .now()) == .timedOut {
 			guard Date() < deadline else {
-				appLogger.error("Recording cleanup timed out during app termination")
+				appLogger.error("Audio cleanup timed out during app termination; durable recovery files will be used on next launch")
 				return
 			}
 			RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))

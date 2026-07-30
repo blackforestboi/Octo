@@ -108,6 +108,7 @@ public struct HexSettings: Codable, Equatable, Sendable {
 	public var recordingAudioBehavior: RecordingAudioBehavior
 	public var minimumKeyTime: Double
 	public var stopDelayMilliseconds: Int
+	public var longRecordingConfirmationThresholdMinutes: Int
 	public var copyToClipboard: Bool
 	public var superFastModeEnabled: Bool
 	public var useDoubleTapOnly: Bool
@@ -137,6 +138,11 @@ public struct HexSettings: Codable, Equatable, Sendable {
 	public var refinementProvider: RefinementProvider
 	/// Controls how much reasoning the refinement provider should use when supported.
 	public var refinementReasoningEffort: RefinementReasoningEffort
+	/// The local subscription CLI that receives Agent Handoff tasks.
+	/// Agent Handoffs can only be launched through Codex or Claude Code.
+	public var agentHandoffProvider: RefinementProvider
+	/// A model selection dedicated to Agent Handoffs, separate from quick refinement.
+	public var agentHandoffModelID: String?
 	/// Prevents a one-time fresh-install check from overriding a user's provider choice later.
 	public var hasCompletedRefinementProviderDetection: Bool
 	/// Model selections are kept per provider so changing providers never reuses an incompatible ID.
@@ -272,6 +278,7 @@ public struct HexSettings: Codable, Equatable, Sendable {
 		recordingAudioBehavior: RecordingAudioBehavior = .doNothing,
 		minimumKeyTime: Double = HexCoreConstants.defaultMinimumKeyTime,
 		stopDelayMilliseconds: Int = 0,
+		longRecordingConfirmationThresholdMinutes: Int = 5,
 		copyToClipboard: Bool = false,
 		superFastModeEnabled: Bool = true,
 		useDoubleTapOnly: Bool = false,
@@ -295,6 +302,8 @@ public struct HexSettings: Codable, Equatable, Sendable {
 		refinementMode: RefinementMode = .raw,
 		refinementProvider: RefinementProvider = .apple,
 		refinementReasoningEffort: RefinementReasoningEffort = .none,
+		agentHandoffProvider: RefinementProvider = .codexCLI,
+		agentHandoffModelID: String? = nil,
 		hasCompletedRefinementProviderDetection: Bool = false,
 		openAIModelID: String? = nil,
 		anthropicModelID: String? = nil,
@@ -321,6 +330,7 @@ public struct HexSettings: Codable, Equatable, Sendable {
 		self.recordingAudioBehavior = recordingAudioBehavior
 		self.minimumKeyTime = minimumKeyTime
 		self.stopDelayMilliseconds = max(0, stopDelayMilliseconds)
+		self.longRecordingConfirmationThresholdMinutes = max(1, longRecordingConfirmationThresholdMinutes)
 		self.copyToClipboard = copyToClipboard
 		self.superFastModeEnabled = superFastModeEnabled
 		self.useDoubleTapOnly = useDoubleTapOnly
@@ -344,6 +354,8 @@ public struct HexSettings: Codable, Equatable, Sendable {
 		self.refinementMode = refinementMode
 		self.refinementProvider = refinementProvider
 		self.refinementReasoningEffort = refinementReasoningEffort
+		self.agentHandoffProvider = agentHandoffProvider.handoffProvider ?? .codexCLI
+		self.agentHandoffModelID = agentHandoffModelID
 		self.hasCompletedRefinementProviderDetection = hasCompletedRefinementProviderDetection
 		self.openAIModelID = openAIModelID
 		self.anthropicModelID = anthropicModelID
@@ -372,10 +384,16 @@ public struct HexSettings: Codable, Equatable, Sendable {
 	public init(from decoder: Decoder) throws {
 		self.init()
 		let container = try decoder.container(keyedBy: HexSettingKey.self)
-		let hasStoredRefinementProviderDetection = container.contains(.hasCompletedRefinementProviderDetection)
-		for field in HexSettingsSchema.fields {
-			try field.decode(into: &self, from: container)
-		}
+	let hasStoredRefinementProviderDetection = container.contains(.hasCompletedRefinementProviderDetection)
+	for field in HexSettingsSchema.fields {
+		try field.decode(into: &self, from: container)
+	}
+	if !container.contains(.agentHandoffProvider) {
+		agentHandoffProvider = refinementProvider.handoffProvider ?? .codexCLI
+	}
+	if !container.contains(.agentHandoffModelID) {
+		agentHandoffModelID = agentHandoffProvider == refinementProvider ? selectedRefinementModelID : nil
+	}
 		// Versions before named rewrite prompts stored one instruction string. Keep that
 		// exact string as the first prompt so existing refinements remain unchanged.
 		if !container.contains(.rewritePrompts) || rewritePrompts.isEmpty {
@@ -430,6 +448,7 @@ private enum HexSettingKey: String, CodingKey, CaseIterable {
 	case pauseMediaOnRecord // Legacy
 	case minimumKeyTime
 	case stopDelayMilliseconds
+	case longRecordingConfirmationThresholdMinutes
 	case copyToClipboard
 	case superFastModeEnabled
 	case useDoubleTapOnly
@@ -453,6 +472,8 @@ private enum HexSettingKey: String, CodingKey, CaseIterable {
 	case refinementMode
 	case refinementProvider
 	case refinementReasoningEffort
+	case agentHandoffProvider
+	case agentHandoffModelID
 	case hasCompletedRefinementProviderDetection
 	case openAIModelID
 	case anthropicModelID
@@ -551,6 +572,11 @@ private enum HexSettingsSchema {
 		).eraseToAny(),
 		SettingsField(.minimumKeyTime, keyPath: \.minimumKeyTime, default: defaults.minimumKeyTime).eraseToAny(),
 		SettingsField(.stopDelayMilliseconds, keyPath: \.stopDelayMilliseconds, default: defaults.stopDelayMilliseconds).eraseToAny(),
+		SettingsField(
+			.longRecordingConfirmationThresholdMinutes,
+			keyPath: \.longRecordingConfirmationThresholdMinutes,
+			default: defaults.longRecordingConfirmationThresholdMinutes
+		).eraseToAny(),
 		SettingsField(.copyToClipboard, keyPath: \.copyToClipboard, default: defaults.copyToClipboard).eraseToAny(),
 		SettingsField(.superFastModeEnabled, keyPath: \.superFastModeEnabled, default: defaults.superFastModeEnabled).eraseToAny(),
 		SettingsField(.useDoubleTapOnly, keyPath: \.useDoubleTapOnly, default: defaults.useDoubleTapOnly).eraseToAny(),
@@ -610,6 +636,13 @@ private enum HexSettingsSchema {
 		SettingsField(.refinementMode, keyPath: \.refinementMode, default: defaults.refinementMode).eraseToAny(),
 		SettingsField(.refinementProvider, keyPath: \.refinementProvider, default: defaults.refinementProvider).eraseToAny(),
 		SettingsField(.refinementReasoningEffort, keyPath: \.refinementReasoningEffort, default: defaults.refinementReasoningEffort).eraseToAny(),
+		SettingsField(.agentHandoffProvider, keyPath: \.agentHandoffProvider, default: defaults.agentHandoffProvider).eraseToAny(),
+		SettingsField(
+			.agentHandoffModelID,
+			keyPath: \.agentHandoffModelID,
+			default: defaults.agentHandoffModelID,
+			encode: { container, key, value in try container.encodeIfPresent(value, forKey: key) }
+		).eraseToAny(),
 		SettingsField(
 			.hasCompletedRefinementProviderDetection,
 			keyPath: \.hasCompletedRefinementProviderDetection,

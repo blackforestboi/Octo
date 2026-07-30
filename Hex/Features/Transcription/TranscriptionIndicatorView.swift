@@ -19,7 +19,7 @@ struct TranscriptionIndicatorView: View {
 		case screenAware
 		case transcribing
 		case refining(String?)
-		case handoff(String, isReady: Bool, hasLaunched: Bool)
+		case handoff(String, isReady: Bool, hasLaunched: Bool, isDeparting: Bool, isFlying: Bool)
 		case prewarming
 		case completedTranscript(String)
 		case copied(String)
@@ -35,9 +35,19 @@ struct TranscriptionIndicatorView: View {
 
 		var showsProcessing: Bool {
 			switch self {
-		case .transcribing, .refining, .handoff(_, isReady: false, hasLaunched: false), .prewarming: true
+			case .transcribing, .refining, .handoff(_, isReady: false, hasLaunched: false, isDeparting: false, isFlying: false), .prewarming: true
 			default: false
 			}
+		}
+
+		var isHandoffDeparting: Bool {
+			guard case let .handoff(_, _, _, isDeparting, _) = self else { return false }
+			return isDeparting
+		}
+
+		var isHandoffFlying: Bool {
+			guard case let .handoff(_, _, _, _, isFlying) = self else { return false }
+			return isFlying
 		}
 	}
 
@@ -94,6 +104,7 @@ struct TranscriptionIndicatorView: View {
 
 	@State private var waveformSamples: [CGFloat] = []
 	@State private var isHoveringCompletedTranscript = false
+	@State private var handoffDepartureProgress: CGFloat = 0
 
 	private var metrics: Metrics { .init(size: size) }
 	private var isHidden: Bool {
@@ -130,11 +141,14 @@ struct TranscriptionIndicatorView: View {
 	private var expandedCardCornerRadius: CGFloat { max(12, pillCornerRadius) }
 	private var cardCornerRadius: CGFloat {
 		if case .completedTranscript = status { return expandedCardCornerRadius }
+		if status.isHandoffDeparting {
+			return pillCornerRadius + (metrics.height / 2 - pillCornerRadius) * handoffDepartureProgress
+		}
 		return pillCornerRadius
 	}
 	private var opensHistoryWhenTapped: Bool {
 		switch status {
-		case .hidden, .handoff(_, _, _), .completedTranscript, .copied, .hidingCopied:
+		case .hidden, .handoff(_, _, _, _, _), .completedTranscript, .copied, .hidingCopied:
 			false
 		default:
 			true
@@ -156,7 +170,7 @@ struct TranscriptionIndicatorView: View {
 			recordingPillSize.width
 		case let .refining(promptName):
 			loadingPillWidth(for: refinementLabel(promptName))
-		case let .handoff(label, _, _):
+		case let .handoff(label, _, _, _, _):
 			loadingPillWidth(for: label)
 		case let .completedTranscript(text):
 			expandedSize(for: text).width
@@ -176,6 +190,13 @@ struct TranscriptionIndicatorView: View {
 
 	private var cardSize: CGSize {
 		.init(width: indicatorWidth, height: indicatorHeight)
+	}
+
+	private var visibleCardSize: CGSize {
+		.init(
+			width: cardSize.width + (metrics.height - cardSize.width) * handoffDepartureProgress,
+			height: cardSize.height
+		)
 	}
 
 	private func expandedSize(for text: String) -> CGSize {
@@ -237,7 +258,7 @@ struct TranscriptionIndicatorView: View {
 		case .screenAware: "Screen aware recording"
 		case .transcribing: "Transcribing"
 		case let .refining(promptName): refinementLabel(promptName)
-		case let .handoff(label, _, _): "Agent handoff: \(label)"
+		case let .handoff(label, _, _, _, _): "Agent handoff: \(label)"
 		case .prewarming: "Model prewarming"
 		case .completedTranscript: "Transcript ready to copy"
 		case .copied: "Transcript copied"
@@ -252,7 +273,7 @@ struct TranscriptionIndicatorView: View {
 	var body: some View {
 	if opensHistoryWhenTapped {
 			indicatorBody.onTapGesture(perform: onOpenHistory)
-		} else if case let .handoff(_, isReady, _) = status, isReady {
+		} else if case let .handoff(_, isReady, _, isDeparting, _) = status, isReady, !isDeparting {
 			indicatorBody.onTapGesture(perform: onOpenAgentHandoff)
 		} else {
 			indicatorBody
@@ -267,6 +288,7 @@ struct TranscriptionIndicatorView: View {
 			.accessibilityHidden(isHidden)
 			.onAppear {
 				appendMeterSample(meter)
+				handoffDepartureProgress = status.isHandoffDeparting ? 1 : 0
 				onCardSizeChange(isHidden ? nil : cardSize)
 			}
 			.onChange(of: meter) { _, meter in
@@ -282,6 +304,7 @@ struct TranscriptionIndicatorView: View {
 					isHoveringCompletedTranscript = false
 					onCardSizeChange(isHidden ? nil : cardSize)
 				}
+				updateHandoffDepartureAnimation(for: newStatus)
 			}
 			.onChange(of: size) { _, _ in
 				onCardSizeChange(isHidden ? nil : cardSize)
@@ -292,12 +315,21 @@ struct TranscriptionIndicatorView: View {
 	private var visualCard: some View {
 		ZStack {
 			cardSurface
-				.frame(width: cardSize.width, height: cardSize.height)
+				.frame(width: visibleCardSize.width, height: visibleCardSize.height)
 
 			content
-				.frame(width: cardSize.width, height: cardSize.height)
+				.frame(width: visibleCardSize.width, height: visibleCardSize.height)
+				.opacity(1 - min(1, handoffDepartureProgress * 4))
 		}
 			.frame(width: cardSize.width, height: cardSize.height)
+	}
+
+	private func updateHandoffDepartureAnimation(for status: Status) {
+		let target: CGFloat = status.isHandoffDeparting ? 1 : 0
+		guard handoffDepartureProgress != target else { return }
+		withAnimation(.easeInOut(duration: 0.28)) {
+			handoffDepartureProgress = target
+		}
 	}
 
 	private var cardSurface: some View {
@@ -353,7 +385,7 @@ struct TranscriptionIndicatorView: View {
 				width: indicatorWidth - 20,
 				height: metrics.height
 			)
-		} else if case let .handoff(label, isReady, hasLaunched) = status {
+		} else if case let .handoff(label, isReady, hasLaunched, _, _) = status {
 			if isReady || hasLaunched {
 				Label(label, systemImage: "checkmark")
 					.font(.system(size: max(10, metrics.height * 0.38), weight: .semibold))
@@ -449,7 +481,7 @@ struct TranscriptionIndicatorView: View {
 
 	private var backgroundStyle: AnyShapeStyle {
 		if case .completedTranscript = status { return AnyShapeStyle(.regularMaterial) }
-		return AnyShapeStyle(isHidden ? .clear : Color(nsColor: mixedNSColor(.systemRed, with: .black, by: 0.42)))
+		return AnyShapeStyle(isHidden ? .clear : Color(nsColor: .octoIndicator))
 	}
 
 	private var usesGlassBackground: Bool {
@@ -474,9 +506,6 @@ struct TranscriptionIndicatorView: View {
 		}
 	}
 
-	private func mixedNSColor(_ color: NSColor, with otherColor: NSColor, by fraction: Double) -> NSColor {
-		color.blended(withFraction: min(max(fraction, 0), 1), of: otherColor) ?? color
-	}
 }
 
 private struct PillWaveform: View {
@@ -554,6 +583,7 @@ struct TranscriptionIndicatorOverlayView: View {
 	@Shared(.hexSettings) var hexSettings: HexSettings
 	let onOpenHistory: () -> Void
 	let onPillSizeChange: (CGSize?) -> Void
+	let onAgentHandoffDeparture: () -> Void
 	@State private var currentPillSize: CGSize?
 
 	var status: TranscriptionIndicatorView.Status {
@@ -569,7 +599,9 @@ struct TranscriptionIndicatorOverlayView: View {
 			return .handoff(
 				handoff.label,
 				isReady: handoff.isReady,
-				hasLaunched: handoff.hasLaunched
+				hasLaunched: handoff.hasLaunched,
+				isDeparting: handoff.isDeparting,
+				isFlying: handoff.isFlying
 			)
 		} else if store.isScreenAwareModeActive {
 			return .screenAware
@@ -609,7 +641,25 @@ struct TranscriptionIndicatorOverlayView: View {
 		.onChange(of: hexSettings.indicatorLocation) { _, _ in
 			onPillSizeChange(currentPillSize)
 		}
+		.onChange(of: indicatorStatus.isHandoffFlying) { _, isFlying in
+			if isFlying {
+				onAgentHandoffDeparture()
+			}
+		}
 		.onDisappear { onPillSizeChange(nil) }
+		.alert("Cancel long recording?", isPresented: Binding(
+			get: { store.isLongRecordingCancellationConfirmationPresented },
+			set: { if !$0 { store.send(.dismissLongRecordingCancellationConfirmation) } }
+		)) {
+			Button("Keep Recording", role: .cancel) {
+				store.send(.dismissLongRecordingCancellationConfirmation)
+			}
+			Button("Cancel Recording", role: .destructive) {
+				store.send(.confirmLongRecordingCancellation)
+			}
+		} message: {
+			Text("This recording has been running for a while. Cancelling will stop it without transcribing it.")
+		}
 		.task {
 			await store.send(.task).finish()
 		}

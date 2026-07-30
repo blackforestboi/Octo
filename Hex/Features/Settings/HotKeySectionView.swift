@@ -124,6 +124,30 @@ struct HotKeySectionView: View {
                 }
             }
 
+			LabeledContent {
+				Stepper(
+					value: Binding(
+						get: { store.hexSettings.longRecordingConfirmationThresholdMinutes },
+						set: { store.send(.setLongRecordingConfirmationThresholdMinutes($0)) }
+					),
+					in: 1 ... 60
+				) {
+					Text("\(store.hexSettings.longRecordingConfirmationThresholdMinutes) min")
+						.monospacedDigit()
+				}
+				.labelsHidden()
+			} label: {
+				Label {
+					VStack(alignment: .leading, spacing: 2) {
+						Text("Confirm cancelling long recordings")
+						Text("Ask before Escape cancels a recording after this many minutes")
+							.settingsCaption()
+					}
+				} icon: {
+					Image(systemName: "exclamationmark.shield")
+				}
+			}
+
 			if hotKey.modifiers.contains(.shift) {
 				Text("Agent Handoff is unavailable because this hotkey already includes Shift.")
 					.settingsCaption()

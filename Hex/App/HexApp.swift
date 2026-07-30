@@ -58,7 +58,7 @@ struct HexApp: App {
 		}
 
 		let ratio = image.size.height / image.size.width
-		image.size = NSSize(width: 18 / ratio, height: 18)
+		image.size = NSSize(width: 20 / ratio, height: 20)
 		return image
 	}
 }

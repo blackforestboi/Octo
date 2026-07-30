@@ -29,7 +29,7 @@ struct AppFeature {
   }
 
 	@ObservableState
-	struct State {
+	struct State: Equatable {
 		var transcription: TranscriptionFeature.State = .init()
 		var settings: SettingsFeature.State = .init()
 		var history: HistoryFeature.State = .init()
@@ -52,7 +52,7 @@ struct AppFeature {
     case setActiveTab(ActiveTab)
     case task
     case pasteLastTranscript
-    case interruptedRecordingsRecovered([RecoveredRecording])
+    case interruptedRecordingsRecovered([RecoveredRecording], [RecoveredSystemAudioRecording])
 
     // Permission actions
     case checkPermissions
@@ -66,6 +66,7 @@ struct AppFeature {
   @Dependency(\.pasteboard) var pasteboard
   @Dependency(\.transcription) var transcription
   @Dependency(\.recording) var recording
+	@Dependency(\.systemAudioCapture) var systemAudioCapture
   @Dependency(\.permissions) var permissions
 
   var body: some ReducerOf<Self> {
@@ -93,8 +94,13 @@ struct AppFeature {
           startPasteLastTranscriptMonitoring(),
           ensureSelectedModelReadiness(),
           startPermissionMonitoring(),
-          .run { [recording] send in
-            await send(.interruptedRecordingsRecovered(await recording.recoverInterruptedRecordings()))
+		  .run { [recording, systemAudioCapture] send in
+			async let microphoneRecordings = recording.recoverInterruptedRecordings()
+			async let systemAudioRecordings = systemAudioCapture.recoverInterruptedRecordings()
+			await send(.interruptedRecordingsRecovered(
+				await microphoneRecordings,
+				await systemAudioRecordings
+			))
           }
         ]
         guard !state.hexSettings.hasCompletedRefinementProviderDetection,
@@ -124,8 +130,8 @@ struct AppFeature {
           await pasteboard.paste(lastTranscript)
         }
 
-      case let .interruptedRecordingsRecovered(recordings):
-        guard !recordings.isEmpty else { return .none }
+      case let .interruptedRecordingsRecovered(recordings, systemAudioRecordings):
+		guard !recordings.isEmpty || !systemAudioRecordings.isEmpty else { return .none }
         state.history.$transcriptionHistory.withLock { history in
           for recovered in recordings {
             let error = TranscriptProcessingError(
@@ -137,6 +143,10 @@ struct AppFeature {
               history.history[index].duration = recovered.duration
               history.history[index].status = .failed
               history.history[index].processingErrors = [error]
+			  var channels = history.history[index].audioChannels ?? []
+			  channels.removeAll { $0.source == .microphone }
+			  channels.insert(.init(source: .microphone, audioPath: recovered.audioURL, duration: recovered.duration), at: 0)
+			  history.history[index].audioChannels = channels
             } else if history.history.contains(where: { $0.audioPath == recovered.audioURL }) {
               // The final WAV may have been checkpointed just before a crash but its raw
               // source had not been released yet. It is already represented in History.
@@ -149,6 +159,9 @@ struct AppFeature {
                   audioPath: recovered.audioURL,
                   duration: recovered.duration,
                   status: .failed,
+				  audioChannels: [
+					.init(source: .microphone, audioPath: recovered.audioURL, duration: recovered.duration)
+				  ],
                   processingErrors: [error],
                   recoverySessionID: recovered.sessionID
                 ),
@@ -156,6 +169,68 @@ struct AppFeature {
               )
             }
           }
+
+		  for recovered in systemAudioRecordings {
+			let interruptionMessage = "Octo restarted before this system audio was attached to its recording. The recovered audio is available here."
+			if history.history.contains(where: { transcript in
+				transcript.audioChannels?.contains(where: {
+					$0.source == .systemAudio && $0.audioPath == recovered.audioURL
+				}) == true
+			}) {
+				continue
+			}
+
+			let matchingIndex = history.history.firstIndex { transcript in
+				if transcript.recoverySessionID == recovered.parentRecordingSessionID { return true }
+				if RecordingRecoveryStore.sessionID(forFinalAudioURL: transcript.audioPath) == recovered.parentRecordingSessionID {
+					return true
+				}
+				return transcript.audioChannels?.contains(where: {
+					$0.source == .microphone
+						&& RecordingRecoveryStore.sessionID(forFinalAudioURL: $0.audioPath) == recovered.parentRecordingSessionID
+				}) == true
+			}
+			if let index = matchingIndex {
+				var channels = history.history[index].audioChannels ?? [
+					.init(
+						source: .microphone,
+						audioPath: history.history[index].audioPath,
+						duration: history.history[index].duration
+					)
+				]
+				channels.removeAll { $0.source == .systemAudio }
+				channels.append(.init(
+					source: .systemAudio,
+					audioPath: recovered.audioURL,
+					duration: recovered.duration,
+					startOffset: max(0, recovered.createdAt.timeIntervalSince(history.history[index].timestamp))
+				))
+				history.history[index].audioChannels = channels
+				history.history[index].status = .failed
+				var errors = history.history[index].processingErrors ?? []
+				if !errors.contains(where: { $0.stage == .audio && $0.message == interruptionMessage }) {
+					errors.append(.init(stage: .audio, message: interruptionMessage))
+				}
+				history.history[index].processingErrors = errors
+			} else {
+				let error = TranscriptProcessingError(stage: .audio, message: interruptionMessage)
+				history.history.insert(
+					Transcript(
+						timestamp: recovered.createdAt,
+						text: "Recovered system audio from an interrupted recording.",
+						audioPath: recovered.audioURL,
+						duration: recovered.duration,
+						status: .failed,
+						audioChannels: [
+							.init(source: .systemAudio, audioPath: recovered.audioURL, duration: recovered.duration)
+						],
+						processingErrors: [error],
+						recoverySessionID: recovered.parentRecordingSessionID
+					),
+					at: 0
+				)
+			}
+		  }
         }
         return .run { [recording] _ in
           for recovered in recordings {
@@ -391,20 +466,20 @@ struct AppView: View {
 		.tag(AppFeature.ActiveTab.speakers)
 
         Button {
-          store.send(.setActiveTab(.settings))
-        } label: {
-          Label("Settings", systemImage: "gearshape")
-        }
-        .buttonStyle(.plain)
-        .tag(AppFeature.ActiveTab.settings)
-
-        Button {
           store.send(.setActiveTab(.handoffs))
         } label: {
           Label("Handoffs", systemImage: "arrowshape.turn.up.right")
         }
         .buttonStyle(.plain)
         .tag(AppFeature.ActiveTab.handoffs)
+
+        Button {
+          store.send(.setActiveTab(.settings))
+        } label: {
+          Label("Settings", systemImage: "gearshape")
+        }
+        .buttonStyle(.plain)
+        .tag(AppFeature.ActiveTab.settings)
 
         Button {
           store.send(.setActiveTab(.remappings))
