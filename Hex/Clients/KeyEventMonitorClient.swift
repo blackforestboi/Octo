@@ -54,7 +54,8 @@ public extension KeyEvent {
       key: phase == .keyDown ? physicalKey : nil,
       modifiers: modifiers,
       physicalKey: physicalKey,
-      phase: phase
+      phase: phase,
+      virtualKeyCode: keyCode
     )
   }
 }
@@ -66,8 +67,8 @@ struct KeyEventMonitorClient {
   }
   var handleKeyEvent: @Sendable (@Sendable @escaping (KeyEvent) -> Bool) -> KeyEventMonitorToken = { _ in .noop }
   var handleInputEvent: @Sendable (@Sendable @escaping (InputEvent) -> Bool) -> KeyEventMonitorToken = { _ in .noop }
-  /// Replays a deliberately delayed key press to the focused app.
-  var replayKeyPress: @Sendable (Key) -> Void = { _ in }
+  /// Replays a held-back key-down immediately before its physical key-up is allowed through.
+  var replayKeyDown: @Sendable (Key) -> Void = { _ in }
   var startMonitoring: @Sendable () async -> Void = {}
   var stopMonitoring: @Sendable () -> Void = {}
 }
@@ -85,8 +86,8 @@ extension KeyEventMonitorClient: DependencyKey {
       handleInputEvent: { handler in
         live.handleInputEvent(handler)
       },
-      replayKeyPress: { key in
-        live.replayKeyPress(key)
+      replayKeyDown: { key in
+        live.replayKeyDown(key)
       },
       startMonitoring: {
         live.startMonitoring()
@@ -256,19 +257,22 @@ class KeyEventMonitorClientLive {
     }
   }
 
-  func replayKeyPress(_ key: Key) {
-    // A short number tap is held back while we determine whether it becomes a
-    // rewrite shortcut. Re-inject it after key-up so the foreground app sees
-    // the same ordinary tap, without our event tap handling it a second time.
-    DispatchQueue.main.async {
-      let source = CGEventSource(stateID: .combinedSessionState)
-      let keyCode = Sauce.shared.keyCode(for: key)
-      for isDown in [true, false] {
-        guard let event = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: isDown) else { continue }
-        event.setIntegerValueField(.eventSourceUserData, value: Self.replayEventUserData)
-        event.post(tap: .cghidEventTap)
+  func replayKeyDown(_ key: Key) {
+    // A short number tap is held back until we know it did not become a rewrite
+    // shortcut. Recreate only its key-down synchronously; the caller then allows
+    // the physical key-up through. Long-held rewrite shortcuts never call this.
+    let keyCode: CGKeyCode
+    if Thread.isMainThread {
+      keyCode = Sauce.shared.keyCode(for: key)
+    } else {
+      keyCode = DispatchQueue.main.sync {
+        Sauce.shared.keyCode(for: key)
       }
     }
+    let source = CGEventSource(stateID: .combinedSessionState)
+    guard let event = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: true) else { return }
+    event.setIntegerValueField(.eventSourceUserData, value: Self.replayEventUserData)
+    event.post(tap: .cghidEventTap)
   }
 
   func stopMonitoring() {

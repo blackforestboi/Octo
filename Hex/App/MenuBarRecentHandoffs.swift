@@ -17,7 +17,17 @@ struct MenuBarRecentHandoffs: View {
 							guard let thread = task.thread else { return }
 							Task { await agentHandoff.open(thread) }
 						} label: {
-							Label(task.title, systemImage: providerSymbol(for: task.provider))
+							HStack(spacing: 6) {
+								if task.isCompleted {
+									Circle()
+										.fill(.blue)
+										.frame(width: 7, height: 7)
+								} else {
+									Image(systemName: providerSymbol(for: task.provider))
+								}
+
+								Text(task.title)
+							}
 						}
 					}
 				}

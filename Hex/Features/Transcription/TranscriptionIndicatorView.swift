@@ -19,7 +19,7 @@ struct TranscriptionIndicatorView: View {
 		case screenAware
 		case transcribing
 		case refining(String?)
-		case handoff(String, isReady: Bool)
+		case handoff(String, isReady: Bool, hasLaunched: Bool)
 		case prewarming
 		case completedTranscript(String)
 		case copied(String)
@@ -35,7 +35,7 @@ struct TranscriptionIndicatorView: View {
 
 		var showsProcessing: Bool {
 			switch self {
-		case .transcribing, .refining, .handoff(_, isReady: false), .prewarming: true
+		case .transcribing, .refining, .handoff(_, isReady: false, hasLaunched: false), .prewarming: true
 			default: false
 			}
 		}
@@ -134,7 +134,7 @@ struct TranscriptionIndicatorView: View {
 	}
 	private var opensHistoryWhenTapped: Bool {
 		switch status {
-		case .hidden, .handoff(_, _), .completedTranscript, .copied, .hidingCopied:
+		case .hidden, .handoff(_, _, _), .completedTranscript, .copied, .hidingCopied:
 			false
 		default:
 			true
@@ -156,7 +156,7 @@ struct TranscriptionIndicatorView: View {
 			recordingPillSize.width
 		case let .refining(promptName):
 			loadingPillWidth(for: refinementLabel(promptName))
-		case let .handoff(label, _):
+		case let .handoff(label, _, _):
 			loadingPillWidth(for: label)
 		case let .completedTranscript(text):
 			expandedSize(for: text).width
@@ -237,7 +237,7 @@ struct TranscriptionIndicatorView: View {
 		case .screenAware: "Screen aware recording"
 		case .transcribing: "Transcribing"
 		case let .refining(promptName): refinementLabel(promptName)
-		case let .handoff(label, _): "Agent handoff: \(label)"
+		case let .handoff(label, _, _): "Agent handoff: \(label)"
 		case .prewarming: "Model prewarming"
 		case .completedTranscript: "Transcript ready to copy"
 		case .copied: "Transcript copied"
@@ -252,7 +252,7 @@ struct TranscriptionIndicatorView: View {
 	var body: some View {
 	if opensHistoryWhenTapped {
 			indicatorBody.onTapGesture(perform: onOpenHistory)
-		} else if case let .handoff(_, isReady) = status, isReady {
+		} else if case let .handoff(_, isReady, _) = status, isReady {
 			indicatorBody.onTapGesture(perform: onOpenAgentHandoff)
 		} else {
 			indicatorBody
@@ -353,8 +353,8 @@ struct TranscriptionIndicatorView: View {
 				width: indicatorWidth - 20,
 				height: metrics.height
 			)
-		} else if case let .handoff(label, isReady) = status {
-			if isReady {
+		} else if case let .handoff(label, isReady, hasLaunched) = status {
+			if isReady || hasLaunched {
 				Label(label, systemImage: "checkmark")
 					.font(.system(size: max(10, metrics.height * 0.38), weight: .semibold))
 					.foregroundStyle(.white)
@@ -566,7 +566,11 @@ struct TranscriptionIndicatorOverlayView: View {
 		} else if let error = store.error {
 			return .error(error)
 		} else if let handoff = store.agentHandoffPresentation {
-			return .handoff(handoff.label, isReady: handoff.isReady)
+			return .handoff(
+				handoff.label,
+				isReady: handoff.isReady,
+				hasLaunched: handoff.hasLaunched
+			)
 		} else if store.isScreenAwareModeActive {
 			return .screenAware
 		} else if store.isRefining || (store.isTranscribing && store.forcedRefinementMode != nil) {

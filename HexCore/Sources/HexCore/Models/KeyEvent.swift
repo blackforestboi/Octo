@@ -26,6 +26,11 @@ public struct KeyEvent {
     /// The physical key for both down and up events, when the event represents a key.
     public let physicalKey: Key?
     public let phase: KeyEventPhase
+    /// The macOS virtual key code, including modifier-only transitions.
+    ///
+    /// Sauce does not model modifier keys as `Key` values, so this preserves the
+    /// source key for callers that need to distinguish Shift from another modifier.
+    public let virtualKeyCode: Int?
 
     public var isKeyDown: Bool { phase == .keyDown }
     public var isKeyUp: Bool { phase == .keyUp }
@@ -34,11 +39,13 @@ public struct KeyEvent {
         key: Key?,
         modifiers: Modifiers,
         physicalKey: Key? = nil,
-        phase: KeyEventPhase? = nil
+        phase: KeyEventPhase? = nil,
+        virtualKeyCode: Int? = nil
     ) {
         self.key = key
         self.modifiers = modifiers
         self.physicalKey = physicalKey ?? key
         self.phase = phase ?? (key == nil ? .other : .keyDown)
+        self.virtualKeyCode = virtualKeyCode
     }
 }

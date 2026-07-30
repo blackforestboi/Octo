@@ -22,6 +22,7 @@ final class AgentHandoffClientTests: XCTestCase {
 			createdAt: .now,
 			provider: .codex,
 			title: "Update menu bar",
+			state: .pending,
 			thread: .codex("528b9ff2-d685-4c1a-b2d8-76d6a1661de3"),
 			handoff: ""
 		)
@@ -30,11 +31,38 @@ final class AgentHandoffClientTests: XCTestCase {
 			createdAt: .now,
 			provider: .codex,
 			title: "Legacy handoff",
+			state: .pending,
 			thread: nil,
 			handoff: ""
 		)
 
 		XCTAssertTrue(task.isOpenable)
 		XCTAssertFalse(legacyTask.isOpenable)
+	}
+
+	func testHandoffTaskExposesLifecycleStateForMenuBarStatus() {
+		let runningTask = AgentHandoffTask(
+			id: UUID(),
+			createdAt: .now,
+			provider: .codex,
+			title: "Update menu bar",
+			state: .running,
+			thread: .codex("528b9ff2-d685-4c1a-b2d8-76d6a1661de3"),
+			handoff: ""
+		)
+		let completedTask = AgentHandoffTask(
+			id: UUID(),
+			createdAt: .now,
+			provider: .codex,
+			title: "Finish menu bar",
+			state: .completed,
+			thread: .codex("528b9ff2-d685-4c1a-b2d8-76d6a1661de3"),
+			handoff: ""
+		)
+
+		XCTAssertTrue(runningTask.isRunning)
+		XCTAssertFalse(runningTask.isCompleted)
+		XCTAssertTrue(completedTask.isCompleted)
+		XCTAssertFalse(completedTask.isRunning)
 	}
 }

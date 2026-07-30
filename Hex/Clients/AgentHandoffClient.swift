@@ -15,6 +15,7 @@ struct AgentHandoffClient {
 	}
 	var open: @Sendable (AgentHandoffThread) async -> Void = { _ in }
 	var tasks: @Sendable () throws -> [AgentHandoffTask] = { [] }
+	var deleteTask: @Sendable (UUID) throws -> Void = { _ in }
 	/// The user-selected local Codex project in which new handoff threads run.
 	var codexProjectPath: @Sendable () -> String? = { nil }
 	/// Presents the native folder picker and saves the selected project for future handoffs.
@@ -52,10 +53,21 @@ enum AgentHandoffThread: Equatable, Sendable {
 
 /// A durable, user-readable task created from an Agent Handoff.
 struct AgentHandoffTask: Equatable, Identifiable, Sendable {
+	enum Status: Equatable, Sendable {
+		case pending
+		case threadCreated
+		case registered
+		case running
+		case completed
+		case failed
+	}
+
 	let id: UUID
 	let createdAt: Date
 	let provider: AgentHandoffRequest.Provider
 	let title: String
+	/// The last lifecycle state reported by the native handoff runner.
+	let state: Status
 	/// The native task to open, when this journal entry completed provider registration.
 	let thread: AgentHandoffThread?
 	/// The complete text delivered to the child task.
@@ -63,6 +75,14 @@ struct AgentHandoffTask: Equatable, Identifiable, Sendable {
 
 	var isOpenable: Bool {
 		thread != nil
+	}
+
+	var isRunning: Bool {
+		state == .running
+	}
+
+	var isCompleted: Bool {
+		state == .completed
 	}
 }
 
@@ -143,6 +163,9 @@ extension AgentHandoffClient: DependencyKey {
 		},
 		tasks: {
 			try AgentHandoffJournal.shared.tasks()
+		},
+		deleteTask: { taskID in
+			try AgentHandoffJournal.shared.deleteTask(id: taskID)
 		},
 		codexProjectPath: {
 			AgentHandoffWorkspace.codexProjectPath()
@@ -270,7 +293,11 @@ private enum AgentHandoffWorkspace {
 			return SecurityScopedDirectory(root: selected, accessURL: selected)
 		}
 
-		return .init(root: try defaultCodexProjectRoot())
+		// Codex runs as Octo's child process, so a handoff must be rooted in a
+		// folder the user explicitly granted to Octo. Do not silently fall back to
+		// an internal workspace: that would make the task unable to reach the
+		// user's project while hiding the missing permission.
+		return try await chooseCodexProject()
 	}
 
 	/// Lets the user replace the project used by future Codex handoff threads.
@@ -320,20 +347,6 @@ private enum AgentHandoffWorkspace {
 			!bookmarkIsStale
 		else { return nil }
 		return project
-	}
-
-	/// Codex needs a stable working directory even when the user has not opted into
-	/// a particular project. Application Support is available to the sandbox without
-	/// a folder picker and keeps routine handoffs out of arbitrary user projects.
-	private static func defaultCodexProjectRoot() throws -> URL {
-		let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-			?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")
-		let workspace = base.appendingPathComponent(
-			"io.github.blackforestboi.Octo/AgentHandoffs/Codex Workspace",
-			isDirectory: true
-		)
-		try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
-		return workspace
 	}
 
 	private static func saveCodexProjectBookmark(for project: URL) throws {
@@ -472,6 +485,19 @@ private enum AgentHandoffPackageState: String, Codable, Sendable {
 	case failed
 }
 
+private extension AgentHandoffTask.Status {
+	init(_ state: AgentHandoffPackageState) {
+		switch state {
+		case .pending: self = .pending
+		case .threadCreated: self = .threadCreated
+		case .registered: self = .registered
+		case .running: self = .running
+		case .completed: self = .completed
+		case .failed: self = .failed
+		}
+	}
+}
+
 private struct StoredAgentHandoffPackage: Codable, Identifiable, Sendable {
 	let id: UUID
 	let title: String
@@ -606,7 +632,11 @@ private final class AgentHandoffJournal: @unchecked Sendable {
 
 	func tasks() throws -> [AgentHandoffTask] {
 		try withLock {
-			try load()
+			var handoffs = try load()
+			if reconcileTerminalCodexTasks(&handoffs) {
+				try save(handoffs)
+			}
+			return handoffs
 				.sorted { $0.createdAt > $1.createdAt }
 				.flatMap { handoff in
 					let input = handoff.input ?? .init(legacyTranscript: handoff.transcript)
@@ -616,11 +646,29 @@ private final class AgentHandoffJournal: @unchecked Sendable {
 							createdAt: handoff.createdAt,
 							provider: handoff.provider,
 							title: package.title,
+							state: .init(package.state),
 							thread: thread(for: handoff.provider, id: package.threadID),
 							handoff: HandoffPrompt.childRequest(package.package, input: input)
 						)
 					}
 				}
+		}
+	}
+
+	func deleteTask(id taskID: UUID) throws {
+		try withLock {
+			var handoffs = try load()
+			guard let handoffIndex = handoffs.firstIndex(where: { handoff in
+				handoff.packages.contains(where: { $0.id == taskID })
+			}),
+			let packageIndex = handoffs[handoffIndex].packages.firstIndex(where: { $0.id == taskID })
+			else { throw AgentHandoffError.launchFailed("Agent Handoff journal") }
+
+			handoffs[handoffIndex].packages.remove(at: packageIndex)
+			if handoffs[handoffIndex].packages.isEmpty {
+				handoffs.remove(at: handoffIndex)
+			}
+			try save(handoffs)
 		}
 	}
 
@@ -677,6 +725,66 @@ private final class AgentHandoffJournal: @unchecked Sendable {
 			$0.state = .failed
 			$0.failure = error.localizedDescription
 		}
+	}
+
+	/// A process can exit after its task was stopped in Codex Desktop, before Octo
+	/// receives a terminal notification. Repair only journal entries whose own
+	/// persisted Codex session is already terminal; never infer an active task's state.
+	private func reconcileTerminalCodexTasks(_ handoffs: inout [StoredAgentHandoff]) -> Bool {
+		var didChange = false
+		for handoffIndex in handoffs.indices where handoffs[handoffIndex].provider == .codex {
+			for packageIndex in handoffs[handoffIndex].packages.indices {
+				let package = handoffs[handoffIndex].packages[packageIndex]
+				guard package.state == .running || package.state == .registered || package.state == .threadCreated,
+					let threadID = package.threadID,
+					let terminalState = terminalState(forCodexThread: threadID, createdAt: handoffs[handoffIndex].createdAt)
+				else { continue }
+
+				handoffs[handoffIndex].packages[packageIndex].state = terminalState.state
+				handoffs[handoffIndex].packages[packageIndex].failure = terminalState.failure
+				didChange = true
+			}
+		}
+		return didChange
+	}
+
+	private func terminalState(forCodexThread threadID: String, createdAt: Date) -> (state: AgentHandoffPackageState, failure: String?)? {
+		let sessionsRoot = fileManager.homeDirectoryForCurrentUser
+			.appendingPathComponent(".codex/sessions", isDirectory: true)
+		let calendar = Calendar(identifier: .gregorian)
+		let candidateDays = [-1, 0, 1].compactMap {
+			calendar.date(byAdding: .day, value: $0, to: createdAt)
+		}
+
+		for day in candidateDays {
+			let components = calendar.dateComponents([.year, .month, .day], from: day)
+			guard let year = components.year, let month = components.month, let day = components.day else { continue }
+			let directory = sessionsRoot
+				.appendingPathComponent(String(format: "%04d", year), isDirectory: true)
+				.appendingPathComponent(String(format: "%02d", month), isDirectory: true)
+				.appendingPathComponent(String(format: "%02d", day), isDirectory: true)
+			guard let files = try? fileManager.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) else { continue }
+			guard let sessionURL = files.first(where: {
+				$0.pathExtension == "jsonl" && $0.lastPathComponent.localizedCaseInsensitiveContains(threadID)
+			}) else { continue }
+			guard let contents = try? String(contentsOf: sessionURL, encoding: .utf8),
+				let lastLine = contents.split(separator: "\n").last,
+				let data = lastLine.data(using: .utf8),
+				let event = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+				let payload = event["payload"] as? [String: Any],
+				let type = payload["type"] as? String
+			else { continue }
+
+			switch type {
+			case "task_complete":
+				return (.completed, nil)
+			case "turn_aborted":
+				return (.failed, "Codex task was interrupted before completing.")
+			default:
+				continue
+			}
+		}
+		return nil
 	}
 
 	func writePlannerSchema() throws -> URL {
@@ -1021,7 +1129,9 @@ private enum CodexChildRunner {
 								catch { finish(.failure(error)); return }
 								finish(.success(()))
 							} else {
-								finish(.failure(AgentHandoffError.launchFailed("Codex child")))
+								let error = AgentHandoffError.launchFailed("Codex child")
+								journal.markFailed(handoffID: handoffID, packageID: package.id, error: error)
+								finish(.failure(error))
 							}
 						}
 						return
@@ -1073,7 +1183,9 @@ private enum CodexChildRunner {
 					}
 				}
 				process.terminationHandler = { _ in
-					finish(.failure(AgentHandoffError.launchFailed("Codex child")))
+					let error = AgentHandoffError.launchFailed("Codex child")
+					journal.markFailed(handoffID: handoffID, packageID: package.id, error: error)
+					finish(.failure(error))
 				}
 				do {
 					try process.run()

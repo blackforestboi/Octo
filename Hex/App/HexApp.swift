@@ -37,13 +37,7 @@ struct HexApp: App {
 				NSApplication.shared.terminate(nil)
 			}.keyboardShortcut("q")
 		} label: {
-			if let image = menuBarIconImage() {
-				Image(nsImage: image)
-					.renderingMode(.template)
-			} else {
-				Image(systemName: "hexagon")
-					.imageScale(.small)
-			}
+			MenuBarHandoffStatusIcon(image: menuBarIconImage())
 		}
 		.commands {
 			CommandGroup(after: .appInfo) {

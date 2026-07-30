@@ -11,6 +11,7 @@ struct HandoffsView: View {
 	@State private var tasks: [AgentHandoffTask] = []
 	@State private var isLoading = true
 	@State private var loadError: String?
+	@State private var deletionError: String?
 
 	var body: some View {
 		Group {
@@ -32,7 +33,7 @@ struct HandoffsView: View {
 				ScrollView(.vertical, showsIndicators: true) {
 					LazyVStack(alignment: .leading, spacing: 14) {
 						ForEach(tasks) { task in
-							HandoffTaskCard(task: task)
+							HandoffTaskCard(task: task, onDelete: delete)
 						}
 					}
 					.frame(width: 760, alignment: .leading)
@@ -51,6 +52,17 @@ struct HandoffsView: View {
 			}
 			.help("Refresh handoffs")
 		}
+		.alert(
+			"Couldn't Delete Handoff",
+			isPresented: Binding(
+				get: { deletionError != nil },
+				set: { if !$0 { deletionError = nil } }
+			)
+		) {
+			Button("OK") { deletionError = nil }
+		} message: {
+			Text(deletionError ?? "")
+		}
 		.enableInjection()
 	}
 
@@ -66,18 +78,40 @@ struct HandoffsView: View {
 			HexLog.settings.error("Could not load agent handoffs: \(error.localizedDescription, privacy: .private)")
 		}
 	}
+
+	private func delete(_ task: AgentHandoffTask) {
+		do {
+			try agentHandoff.deleteTask(task.id)
+			tasks.removeAll { $0.id == task.id }
+		} catch {
+			deletionError = "The saved handoff could not be deleted."
+			HexLog.settings.error("Could not delete agent handoff: \(error.localizedDescription, privacy: .private)")
+		}
+	}
 }
 
 private struct HandoffTaskCard: View {
 	let task: AgentHandoffTask
+	let onDelete: (AgentHandoffTask) -> Void
+	@State private var isShowingDeletionConfirmation = false
 
 	var body: some View {
 		VStack(alignment: .leading, spacing: 14) {
-			VStack(alignment: .leading, spacing: 4) {
-				Text(task.title)
-					.font(.headline)
-				Text("\(providerName) · \(task.createdAt, format: .dateTime.year().month().day().hour().minute())")
-					.settingsCaption()
+			HStack(alignment: .top, spacing: 12) {
+				VStack(alignment: .leading, spacing: 4) {
+					Text(task.title)
+						.font(.headline)
+					Text("\(providerName) · \(task.createdAt, format: .dateTime.year().month().day().hour().minute())")
+						.settingsCaption()
+				}
+
+				Spacer()
+
+				Button(role: .destructive, action: { isShowingDeletionConfirmation = true }) {
+					Label("Delete handoff", systemImage: "trash")
+				}
+				.buttonStyle(.borderless)
+				.help("Delete handoff")
 			}
 
 			Divider()
@@ -91,6 +125,18 @@ private struct HandoffTaskCard: View {
 		}
 		.padding(18)
 		.background(Color.octoCardBackground, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+		.confirmationDialog(
+			"Delete \(task.title)?",
+			isPresented: $isShowingDeletionConfirmation,
+			titleVisibility: .visible
+		) {
+			Button("Delete Handoff", role: .destructive) {
+				onDelete(task)
+			}
+			Button("Cancel", role: .cancel) {}
+		} message: {
+			Text("This removes the saved handoff from Octo. It does not delete the child task.")
+		}
 	}
 
 	private var providerName: String {

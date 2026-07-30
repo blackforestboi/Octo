@@ -250,10 +250,10 @@ public struct HotKeyProcessor {
             return handleMatchingChord()
         } else {
             // Potentially become dirty if chord has extra mods or different key
-            if chordIsDirty(keyEvent) {
-                isDirty = true
-                if isDoubleTapOnlyEnabledForCurrentHotkey {
-                    clearDoubleTapTracking()
+        if shouldMarkChordDirty(keyEvent) {
+            isDirty = true
+            if isDoubleTapOnlyEnabledForCurrentHotkey {
+                clearDoubleTapTracking()
                 }
             }
             return handleNonmatchingChord(keyEvent)
@@ -668,6 +668,27 @@ extension HotKeyProcessor {
         let isSubset = e.modifiers.isSubset(of: hotkey.modifiers)
         let isWrongKey = (e.key != nil && e.key != hotkey.key)
         return !isSubset || isWrongKey
+    }
+
+    /// Locked recordings deliberately ignore ordinary input until their hotkey is
+    /// used again. A held modifier-only recording does the same after its safety
+    /// threshold. Marking those events dirty made normal UI modifiers—especially
+    /// Shift—disable the active hotkey state even though the event itself passed
+    /// through to the foreground app.
+    private func shouldMarkChordDirty(_ e: KeyEvent) -> Bool {
+        guard chordIsDirty(e) else { return false }
+
+        switch state {
+        case .doubleTapLock, .endingHold:
+            return false
+
+        case let .pressAndHold(startTime) where hotkey.key == nil:
+            let effectiveMinimum = max(minimumKeyTime, RecordingDecisionEngine.modifierOnlyMinimumDuration)
+            return now.timeIntervalSince(startTime) < effectiveMinimum
+
+        case .idle, .pendingPressAndHold, .pressAndHold:
+            return true
+        }
     }
 
     /// Checks if all keys and modifiers have been released.

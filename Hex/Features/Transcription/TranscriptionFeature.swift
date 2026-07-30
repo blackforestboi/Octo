@@ -6,6 +6,7 @@
 //
 
 import ComposableArchitecture
+import Carbon
 import CoreGraphics
 import Foundation
 import HexCore
@@ -154,17 +155,38 @@ private enum AgentHandoffEndingGesture {
 	case finish
 }
 
+private extension KeyEvent {
+	var isShiftModifierTransition: Bool {
+		phase == .other
+			&& (virtualKeyCode == kVK_Shift || virtualKeyCode == kVK_RightShift)
+	}
+}
+
 private func agentHandoffEndingGesture(
 	for event: KeyEvent,
 	hotkey: HotKey,
 	processorState: HotKeyProcessor.State
 ) -> AgentHandoffEndingGesture {
 	guard !hotkey.modifiers.contains(.shift) else { return .none }
+	// Shift itself must remain an ordinary modifier for the focused app while a
+	// recording is active. In particular, it cannot finish Agent Handoff just by
+	// going down. The ending hotkey selects Agent Handoff when it is released or
+	// pressed with Shift already held.
+	guard !event.isShiftModifierTransition else { return .none }
 
 	let shiftedModifiers = hotkey.modifiers.union([.shift])
 	switch processorState {
 	case .pressAndHold:
-		return event.modifiers.matchesExactly(shiftedModifiers) ? .finish : .none
+		if hotkey.key != nil {
+			return event.isKeyUp && event.modifiers.matchesExactly(shiftedModifiers)
+				? .finish
+				: .none
+		}
+		// For a modifier-only hotkey, choosing Agent Handoff happens when the
+		// final configured modifier is released while Shift remains held.
+		return event.phase == .other && event.modifiers.matchesExactly([.shift])
+			? .finish
+			: .none
 
 	case .doubleTapLock, .endingHold:
 		// A locked recording may receive Shift before the configured hotkey. Keep
@@ -174,7 +196,9 @@ private func agentHandoffEndingGesture(
 			return .none
 		}
 		guard event.modifiers.matchesExactly(shiftedModifiers) else { return .consume }
-		return hotkey.key == nil || event.key == hotkey.key ? .finish : .consume
+		return hotkey.key == nil || (event.isKeyDown && event.key == hotkey.key)
+			? .finish
+			: .consume
 
 	case .idle, .pendingPressAndHold:
 		return .none
@@ -230,6 +254,10 @@ struct TranscriptionFeature {
 	struct AgentHandoffPresentation: Equatable {
 		var label: String
 		var threads: [AgentHandoffThread] = []
+		var expectedTaskCount = 0
+		/// The handoff is successful once every child task has been created and its
+		/// turn has started. Its eventual execution state lives in the handoff journal.
+		var hasLaunched = false
 		var isReady = false
 	}
 
@@ -1080,12 +1108,20 @@ struct TranscriptionFeature {
 				presentation.threads = [thread]
 				presentation.label = "Creating task packages"
 			case let .tasksFound(count):
+				presentation.expectedTaskCount = count
 				presentation.label = "Found \(count) \(count == 1 ? "task" : "tasks")"
-			case let .childStarted(thread, ordinal):
+			case let .childStarted(thread, _):
 				if !presentation.threads.contains(thread) {
 					presentation.threads.append(thread)
 				}
-				presentation.label = "Running \(ordinal) \(ordinal == 1 ? "task" : "tasks")"
+				let launchedCount = presentation.threads.count
+				let expectedCount = max(presentation.expectedTaskCount, launchedCount)
+				presentation.hasLaunched = launchedCount == expectedCount
+				if presentation.hasLaunched {
+					presentation.label = "Launched \(launchedCount) \(launchedCount == 1 ? "task" : "tasks")"
+				} else {
+					presentation.label = "Launching \(launchedCount) of \(expectedCount) tasks"
+				}
 			case .completed:
 				presentation.label = presentation.threads.count == 1 ? "Task completed" : "Tasks completed"
 				presentation.isReady = true
@@ -1176,8 +1212,9 @@ struct TranscriptionFeature {
 			if state.completedTranscriptPresentation != nil {
 				return .send(.dismissCompletedTranscript)
 			}
-			if state.agentHandoffPresentation?.isReady == true {
-				return .send(.dismissAgentHandoff)
+			if state.agentHandoffPresentation != nil {
+				state.agentHandoffPresentation = nil
+				return .cancel(id: CancelID.agentHandoff)
 			}
         // Only cancel if we're in the middle of recording, transcribing, or post-processing
         guard state.isRecording || state.isTranscribing || state.isRefining || state.isCapturingSelectedTextForRefinement else {
@@ -1292,10 +1329,13 @@ private extension TranscriptionFeature {
 				  activeHold.task.cancel()
 				  if activeHold.hold.hasTriggered() {
 					  hotKeyProcessor.reset()
-				  } else {
-					  keyEventMonitor.replayKeyPress(activeHold.hold.key)
+					  return true
 				  }
-				  return true
+				  // Only a short tap gets a replacement key-down. Returning `false`
+				  // lets the physical key-up reach the focused app; long holds above
+				  // suppress both events and finish with their rewrite prompt instead.
+				  keyEventMonitor.replayKeyDown(activeHold.hold.key)
+				  return false
 			  }
 		  }
 
@@ -1323,9 +1363,9 @@ private extension TranscriptionFeature {
 		  case .finish:
 			hotKeyProcessor.reset()
 			Task { await send(.finishRecordingWithAgentHandoff) }
-			return keyEvent.phase != .other
+			return false
 		  case .consume:
-			return keyEvent.phase != .other
+			return false
 		  case .none:
 			break
 		  }
