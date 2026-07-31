@@ -37,6 +37,8 @@
 - bfe141e: Separate quick refinement and Agent Handoff provider and model settings
 - 91f2cfa: Restore the Octo menu-bar icon after relaunching the native status item
 - b6e6499: Allow individual agent handoff records to be deleted from the Handoffs sidebar.
+- ff79fae: Prevent the Screen Aware recording pill from reappearing after an agent handoff departs.
+- ff79fae: Show actionable Codex agent-handoff planner errors.
 
 ## 2026.7.31
 
