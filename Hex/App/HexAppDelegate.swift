@@ -227,6 +227,9 @@ class HexAppDelegate: NSObject, NSApplicationDelegate {
 	}
 
 	func applicationShouldHandleReopen(_: NSApplication, hasVisibleWindows _: Bool) -> Bool {
+		// Screen-aware region selection activates the app so its overlay can receive
+		// input. Do not interpret that transient activation as a user reopening Octo.
+		guard !ScreenCaptureSelectionOverlay.isSelectingRegion else { return true }
 		presentSettingsView()
 		return true
 	}
