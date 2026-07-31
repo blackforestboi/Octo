@@ -1,5 +1,43 @@
 # Changelog
 
+## 2026.8.0
+
+### Minor Changes
+
+- cfa1ff3: Add optional dual-channel system audio transcription with unified speaker-aware timeline
+- cfa1ff3: Add durable native agent handoffs for Shift-ended recordings, confirming once
+  their tasks launch while keeping each task's execution status durable.
+- cfa1ff3: Add numbered rewrite prompts for long-held finish shortcuts
+- bfe141e: Let the Agent Handoff coordinator discover and route each Codex task to the relevant project workspace.
+
+### Patch Changes
+
+- 249621f: Send agent handoffs directly from Processing into a curved comet flight to Octo's exact AppKit menu-bar icon position across multiple displays, and keep the reorganized handoff menu live with rotating progress icons, a pending-job count that transitions into handoff rows, and a compact unread-action header
+- bfe141e: Make system audio recordings crash-recoverable with durable PCM storage
+- cfa1ff3: Open recent Codex handoffs directly from Octo's menu bar.
+- bfe141e: Keep agent handoff progress in the recording pill, then guide users to ongoing tasks in the menu bar
+- cfa1ff3: Add a Handoffs sidebar for generated agent tasks
+- cfa1ff3: Ask for a Codex project folder whenever Agent Handoff cannot reopen one the user previously authorized.
+- cfa1ff3: Place Handoffs immediately after Settings in the sidebar.
+- cfa1ff3: Show completed agent handoffs as tasks created
+- bfe141e: Protect long recordings with an Escape confirmation
+- cfa1ff3: Capture timestamped transcript sections
+- bfe141e: Place Handoffs above Settings in the sidebar
+- cfa1ff3: Keep Shift usable in apps during Agent Handoff hotkeys
+- cfa1ff3: Show active speaker ID and system audio in the recording pill
+- 249621f: Add OpenRouter model shortlists
+- bfe141e: Keep agent handoff work packages cohesive by default
+- 249621f: Move active agent handoff progress into the menu bar, send the pill there when the coordinator starts, and replace the temporary waiting state with launched tasks
+- cfa1ff3: Improve History cards and transcript display modes
+- b6e6499: Show Agent Handoff status in the menu bar
+- cfa1ff3: Add local speaker identification with manageable, reusable voice profiles
+- bfe141e: Show launched and previously saved Agent Handoff tasks immediately, preserve their completed status, render only unseen completed work as visible blue menu-bar updates that clear when opened or marked read in bulk across all saved handoffs, make the menu-bar icon easier to see, and improve the Recent Handoffs menu layout with recognizable provider icons.
+- 249621f: Separate rewrite and handoff model, thinking, and enablement settings
+- 249621f: Prevent delayed hotkey releases from triggering Screen Aware
+- bfe141e: Separate quick refinement and Agent Handoff provider and model settings
+- 91f2cfa: Restore the Octo menu-bar icon after relaunching the native status item
+- b6e6499: Allow individual agent handoff records to be deleted from the Handoffs sidebar.
+
 ## 2026.7.31
 
 ### Patch Changes
