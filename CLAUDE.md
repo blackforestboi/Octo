@@ -189,12 +189,24 @@ Releases are automated via a local CLI tool that handles building, signing, nota
 
 1. **Ensure all changes are committed** - the release tool requires a clean working tree
 
-2. **Ensure changesets exist** - any user-facing change should have a `.changeset/*.md` file:
+2. **Run a Release compile preflight before pushing a release tag** - this catches
+   macOS deployment-target availability errors and Swift type-checking failures
+   before the signed CI archive begins:
+   ```bash
+   xcodebuild -scheme Octo -configuration Release \
+     -skipMacroValidation -skipPackagePluginValidation \
+     CODE_SIGNING_ALLOWED=NO build
+   ```
+   Fix all compiler errors first. In particular, guard APIs introduced after the
+   macOS 14 deployment target with `#available` and keep numeric animation
+   expressions explicit when Swift cannot infer a single numeric type.
+
+3. **Ensure changesets exist** - any user-facing change should have a `.changeset/*.md` file:
    ```bash
    bun run changeset:add-ai patch "Fix microphone selection"
    ```
 
-3. **Run the release command** from project root:
+4. **Run the release command** from project root:
    ```bash
    bun run tools/src/cli.ts release
    ```
