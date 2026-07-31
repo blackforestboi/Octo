@@ -339,7 +339,7 @@ struct TranscriptionIndicatorView: View {
 
 			content
 				.frame(width: visibleCardSize.width, height: visibleCardSize.height)
-				.opacity(1 - min(1, handoffDepartureProgress * 4))
+				.opacity(Double(1 - min(CGFloat(1), handoffDepartureProgress * 4)))
 		}
 			.frame(width: panelSize.width, height: panelSize.height)
 	}

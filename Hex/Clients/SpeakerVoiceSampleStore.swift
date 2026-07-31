@@ -34,7 +34,7 @@ enum SpeakerVoiceSampleStore {
 			start: CMTime(seconds: start, preferredTimescale: 600),
 			duration: CMTime(seconds: duration, preferredTimescale: 600)
 		)
-		try await exporter.export(to: destinationURL, as: .m4a)
+		try await export(exporter, to: destinationURL, as: .m4a)
 
 		return .init(audioURL: destinationURL, duration: duration)
 	}
@@ -102,7 +102,7 @@ enum SpeakerVoiceSampleStore {
 		}
 		let destinationURL = FileManager.default.temporaryDirectory
 			.appendingPathComponent("speaker-comparison-\(UUID().uuidString).m4a")
-		try await exporter.export(to: destinationURL, as: .m4a)
+		try await export(exporter, to: destinationURL, as: .m4a)
 		return .init(
 			audioURL: destinationURL,
 			referenceRanges: ranges,
@@ -116,6 +116,30 @@ enum SpeakerVoiceSampleStore {
 			.appendingPathComponent("SpeakerSamples", isDirectory: true)
 		try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
 		return directory
+	}
+
+	private static func export(
+		_ exporter: AVAssetExportSession,
+		to destinationURL: URL,
+		as fileType: AVFileType
+	) async throws {
+		if #available(macOS 15.0, *) {
+			try await exporter.export(to: destinationURL, as: fileType)
+		} else {
+			exporter.outputURL = destinationURL
+			exporter.outputFileType = fileType
+			try await withCheckedThrowingContinuation { continuation in
+				exporter.exportAsynchronously {
+					if exporter.status == .completed {
+						continuation.resume()
+					} else {
+						continuation.resume(
+							throwing: exporter.error ?? SpeakerVoiceSampleStoreError.unsupportedAudio
+						)
+					}
+				}
+			}
+		}
 	}
 }
 

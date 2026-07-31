@@ -1483,16 +1483,18 @@ private extension TranscriptionFeature {
 
 		switch inputEvent {
 		case .keyboard(let keyEvent):
-		  #if DEBUG
-		  if keyEvent.physicalKey == .one,
-			 keyEvent.modifiers.matchesExactly([.command])
-		  {
-			  if keyEvent.isKeyDown {
-				  Task { await send(.debugAgentHandoffAnimation) }
-			  }
-			  return true
-		  }
-		  #endif
+		  // Keep this development shortcut nearby for future animation work, but
+		  // leave it disabled so Command-1 continues through to the active app.
+		  // #if DEBUG
+		  // if keyEvent.physicalKey == .one,
+		  // 	keyEvent.modifiers.matchesExactly([.command])
+		  // {
+		  // 	if keyEvent.isKeyDown {
+		  // 		Task { await send(.debugAgentHandoffAnimation) }
+		  // 	}
+		  // 	return true
+		  // }
+		  // #endif
 
 		  if rewritePromptHoldTracker.hasTriggered() {
 			  hotKeyProcessor.reset()
