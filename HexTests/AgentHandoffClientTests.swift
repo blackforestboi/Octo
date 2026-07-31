@@ -179,11 +179,111 @@ final class AgentHandoffClientTests: XCTestCase {
 		XCTAssertTrue(guidance.contains("Create one separate work package for each marked block"))
 		XCTAssertTrue(guidance.contains("default to the fewest cohesive master work packages necessary"))
 		XCTAssertTrue(guidance.contains("lists, conjunctions, and several requested actions are not themselves split signals"))
-		let plannerRequest = HandoffPrompt.codexPlannerRequest(request, workspaceRoot: workspace)
+		let projectCatalog = [
+			CodexProjectCatalog.Project(
+				id: "research",
+				name: "Research Tasks",
+				path: "/Users/example/GitHub/research-tasks"
+			)
+		]
+		let plannerRequest = HandoffPrompt.codexPlannerRequest(
+			request,
+			workspaceRoot: workspace,
+			projectCatalog: projectCatalog
+		)
 		XCTAssertTrue(plannerRequest.contains(guidance))
 		XCTAssertTrue(plannerRequest.contains(workspace.path))
 		XCTAssertTrue(plannerRequest.contains("projectPath"))
+		XCTAssertTrue(plannerRequest.contains("Research Tasks"))
+		XCTAssertTrue(plannerRequest.contains("/Users/example/GitHub/research-tasks"))
 		XCTAssertTrue(HandoffPrompt.claudeCoordinatorInstruction(token: "test").contains(guidance))
+	}
+
+	func testCodexProjectCatalogUsesSidebarProjectsInCodexOrder() throws {
+		let state = """
+		{
+		  "project-order": ["research", "system"],
+		  "local-projects": {
+		    "research": {
+		      "id": "research",
+		      "name": "Research Tasks",
+		      "rootPaths": ["/tmp"]
+		    },
+		    "system": {
+		      "id": "system",
+		      "name": "System Files",
+		      "rootPaths": ["/usr"]
+		    }
+		  }
+		}
+		"""
+
+		let catalog = try CodexProjectCatalog(data: Data(state.utf8))
+
+		XCTAssertEqual(
+			catalog.projects,
+			[
+				.init(id: "research", name: "Research Tasks", path: "/tmp"),
+				.init(id: "system", name: "System Files", path: "/usr"),
+			]
+		)
+	}
+
+	func testCodexProjectCatalogUsesCodexSidebarProjectsAndTheirNames() throws {
+		let state = """
+		{
+		  "project-order": ["research"],
+		  "local-projects": {
+		    "research": {
+		      "id": "research",
+		      "name": "Research Tasks",
+		      "rootPaths": ["/tmp"]
+		    }
+		  }
+		}
+		"""
+
+		let catalog = try CodexProjectCatalog(data: Data(state.utf8))
+
+		XCTAssertEqual(
+			catalog.projects,
+			[.init(id: "research", name: "Research Tasks", path: "/tmp")]
+		)
+	}
+
+	func testCodexProjectCatalogFiltersPathsOutsideDiscoveryWorkspace() {
+		let catalog = CodexProjectCatalog(projects: [
+			.init(id: "research", name: "Research Tasks", path: "/tmp/GitHub/research"),
+			.init(id: "documents", name: "Documents", path: "/tmp/Documents/project"),
+		])
+
+		XCTAssertEqual(
+			catalog.projects(inside: URL(fileURLWithPath: "/tmp/GitHub", isDirectory: true)),
+			[.init(id: "research", name: "Research Tasks", path: "/tmp/GitHub/research")]
+		)
+	}
+
+	func testCodexProjectCatalogDoesNotTreatSavedRootsOrThreadAssignmentsAsProjects() throws {
+		let state = """
+		{
+		  "project-order": ["research"],
+		  "local-projects": {
+		    "research": {
+		      "id": "research",
+		      "name": "Research Tasks",
+		      "rootPaths": ["/tmp"]
+		    }
+		  },
+		  "electron-saved-workspace-roots": ["/usr"],
+		  "thread-project-assignments": {
+		    "old-thread": { "projectId": "stale", "cwd": "/usr" }
+		  }
+		}
+		"""
+
+		let catalog = try CodexProjectCatalog(data: Data(state.utf8))
+
+		XCTAssertEqual(catalog.projects, [.init(id: "research", name: "Research Tasks", path: "/tmp")])
 	}
 
 	func testAgentHandoffWorkspaceCreatesTheDedicatedFolder() throws {

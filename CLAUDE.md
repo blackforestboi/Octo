@@ -12,6 +12,8 @@ Changes to existing user experience must be explicitly confirmed by the user. Ne
 
 ## Build & Development Commands
 
+Local Debug builds may only be run when the user explicitly requests them.
+
 ```bash
 # Local development build (the default for feature work): builds an unsigned Debug .app.
 # Do not run tests, archives, signing, DMGs, or release builds unless explicitly requested.

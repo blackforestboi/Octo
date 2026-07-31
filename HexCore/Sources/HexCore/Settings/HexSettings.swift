@@ -312,7 +312,7 @@ public struct HexSettings: Codable, Equatable, Sendable {
 		refinementProvider: RefinementProvider = .apple,
 		refinementReasoningEffort: RefinementReasoningEffort = .none,
 		agentHandoffProvider: RefinementProvider = .codexCLI,
-		agentHandoffEnabled: Bool = true,
+		agentHandoffEnabled: Bool = false,
 		agentHandoffModelID: String? = nil,
 		agentHandoffReasoningEffort: RefinementReasoningEffort = .medium,
 		hasCompletedRefinementProviderDetection: Bool = false,

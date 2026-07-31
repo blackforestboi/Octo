@@ -36,7 +36,7 @@ final class HexSettingsMigrationTests: XCTestCase {
 		XCTAssertTrue(decoded.refinementEnabled)
 		XCTAssertEqual(decoded.refinementProvider, .apple)
 		XCTAssertEqual(decoded.agentHandoffProvider, .codexCLI)
-		XCTAssertTrue(decoded.agentHandoffEnabled)
+		XCTAssertFalse(decoded.agentHandoffEnabled)
 		XCTAssertNil(decoded.agentHandoffModelID)
 		XCTAssertEqual(decoded.agentHandoffReasoningEffort, .medium)
 		XCTAssertTrue(decoded.hasCompletedRefinementProviderDetection)

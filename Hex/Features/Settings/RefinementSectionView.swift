@@ -18,6 +18,8 @@ struct RefinementSectionView: View {
 	@State private var subscriptionModelPickerTarget: SubscriptionModelPickerTarget?
 	@State private var selectedRewritePromptID: RewritePrompt.ID?
 	@State private var isShowingRewritePromptDeletionConfirmation = false
+	@State private var isRequestingCodexProjectCatalogAccess = false
+	@State private var codexProjectCatalogAccessError: String?
 
 	private enum DirectModelPickerTarget: Identifiable {
 		case refinement
@@ -181,8 +183,9 @@ struct RefinementSectionView: View {
 						Label("Agent Handoff", systemImage: "arrowshape.turn.up.right")
 							.font(.headline)
 						Spacer()
-						Toggle("Enable Agent Handoff", isOn: $store.hexSettings.agentHandoffEnabled)
+						Toggle("Enable Agent Handoff", isOn: agentHandoffEnabled)
 							.labelsHidden()
+							.disabled(isRequestingCodexProjectCatalogAccess)
 					}
 					if store.hexSettings.agentHandoffEnabled {
 					Picker("Provider", selection: $store.hexSettings.agentHandoffProvider) {
@@ -356,8 +359,40 @@ struct RefinementSectionView: View {
 					selectedModelID: $store.hexSettings.agentHandoffModelID,
 					provider: handoffCLIProvider
 				)
-			}
+		}
+		.alert("Couldn’t Enable Agent Handoff", isPresented: Binding(
+			get: { codexProjectCatalogAccessError != nil },
+			set: { if !$0 { codexProjectCatalogAccessError = nil } }
+		)) {
+			Button("OK", role: .cancel) { codexProjectCatalogAccessError = nil }
+		} message: {
+			Text(codexProjectCatalogAccessError ?? "")
+		}
 		.enableInjection()
+	}
+
+	private var agentHandoffEnabled: Binding<Bool> {
+		Binding(
+			get: { store.hexSettings.agentHandoffEnabled },
+			set: { enabled in
+				guard enabled else {
+					store.hexSettings.agentHandoffEnabled = false
+					return
+				}
+				guard !store.hexSettings.agentHandoffEnabled else { return }
+				isRequestingCodexProjectCatalogAccess = true
+				Task { @MainActor in
+					defer { isRequestingCodexProjectCatalogAccess = false }
+					do {
+						try CodexProjectCatalogAccess.authorize()
+						store.hexSettings.agentHandoffEnabled = true
+					} catch {
+						store.hexSettings.agentHandoffEnabled = false
+						codexProjectCatalogAccessError = error.localizedDescription
+					}
+				}
+			}
+		)
 	}
 
 	private var rewritePromptsSection: some View {
