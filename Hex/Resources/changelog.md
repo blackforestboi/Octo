@@ -39,6 +39,7 @@
 - b6e6499: Allow individual agent handoff records to be deleted from the Handoffs sidebar.
 - ff79fae: Prevent the Screen Aware recording pill from reappearing after an agent handoff departs.
 - ff79fae: Show actionable Codex agent-handoff planner errors.
+- 01f5b69: Route Codex agent handoffs through the current user-authorized project catalogue.
 
 ## 2026.7.31
 
