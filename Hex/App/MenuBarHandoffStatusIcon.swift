@@ -95,7 +95,9 @@ final class MenuBarStatusItemController: NSObject, NSMenuDelegate {
 
 	init(appDelegate: HexAppDelegate) {
 		self.appDelegate = appDelegate
-		statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+		// An icon-only item needs a stable slot from its first layout pass. With a
+		// variable length, AppKit can allocate no space until a later image update.
+		statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
 		baseImage = Self.loadBaseImage()
 		super.init()
 
@@ -103,9 +105,14 @@ final class MenuBarStatusItemController: NSObject, NSMenuDelegate {
 		menu.delegate = self
 		statusItem.menu = menu
 		configureButton()
-		loadStatus()
 		observeHandoffChanges()
 		startHandoffActivityTimer()
+		// NSStatusBar attaches its button to the live menu bar after this
+		// initializer returns. Set the initial image on the next main-loop turn so
+		// AppKit renders it just like subsequent handoff-driven updates.
+		DispatchQueue.main.async { [weak self] in
+			self?.loadStatus(forceImageRefresh: true)
+		}
 	}
 
 	deinit {
@@ -622,6 +629,7 @@ final class MenuBarStatusItemController: NSObject, NSMenuDelegate {
 	}
 
 	private func refreshCombinedHandoffActivity(
+		forceImageRefresh: Bool = false,
 		processingStatuses: [TranscriptionFeature.AgentHandoffProcessingStatus]? = nil,
 		activeThreadsByRun: [UUID: Set<AgentHandoffThread>]? = nil
 	) {
@@ -635,7 +643,8 @@ final class MenuBarStatusItemController: NSObject, NSMenuDelegate {
 		let nextStatus: MenuBarHandoffStatus = journalStatus == .completed
 			? .completed
 			: (rotates ? .running : .idle)
-		let appearanceChanged = status != nextStatus
+		let appearanceChanged = forceImageRefresh
+			|| status != nextStatus
 			|| shouldRotateStatusItem != rotates
 			|| statusItem.button?.image == nil
 		shouldRotateStatusItem = rotates
@@ -708,9 +717,9 @@ final class MenuBarStatusItemController: NSObject, NSMenuDelegate {
 		}
 	}
 
-	private func loadStatus() {
+	private func loadStatus(forceImageRefresh: Bool = false) {
 		updateJournalActivity(from: (try? agentHandoff.tasks()) ?? [])
-		refreshCombinedHandoffActivity()
+		refreshCombinedHandoffActivity(forceImageRefresh: forceImageRefresh)
 		// A journal notification can arrive while a custom menu control is still
 		// handling its click. Refresh on the next run-loop turn so we never remove
 		// that control from the menu in the middle of its own action.
@@ -855,12 +864,11 @@ enum AgentHandoffStatusImages {
 	}
 
 	static func templateIcon(from source: NSImage) -> NSImage {
-		let image = NSImage(size: source.size, flipped: false) { rect in
-			source.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 1)
-			return true
-		}
-		image.isTemplate = true
-		return image
+		// The asset catalog already supplies a concrete bitmap representation.
+		// Hand that image directly to NSStatusBarButton; wrapping or copying it can
+		// leave the native button with an empty image at startup.
+		source.isTemplate = true
+		return source
 	}
 
 	static func rotatedIcon(from source: NSImage, degrees: CGFloat) -> NSImage {

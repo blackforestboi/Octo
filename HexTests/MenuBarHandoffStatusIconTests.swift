@@ -70,7 +70,11 @@ final class MenuBarHandoffStatusIconTests: XCTestCase {
 	}
 
 	func testDefaultMenuBarIconUsesTemplateRendering() {
-		XCTAssertTrue(AgentHandoffStatusImages.templateIcon(from: NSImage(size: .init(width: 18, height: 18))).isTemplate)
+		let source = NSImage(size: .init(width: 18, height: 18))
+		let icon = AgentHandoffStatusImages.templateIcon(from: source)
+
+		XCTAssertTrue(icon === source)
+		XCTAssertTrue(icon.isTemplate)
 	}
 
 	func testWaitingHandoffSummaryUsesSingularTaskLabel() {
