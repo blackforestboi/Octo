@@ -153,7 +153,7 @@ enum AgentHandoffError: LocalizedError, Equatable {
 	case noUserRequest
 	case executableNotFound(String)
 	case workspaceUnavailable
-	case launchFailed(String)
+	case launchFailed(String, diagnostic: String? = nil)
 
 	var errorDescription: String? {
 		switch self {
@@ -169,8 +169,10 @@ enum AgentHandoffError: LocalizedError, Equatable {
 			"\(provider) CLI was not found."
 	case .workspaceUnavailable:
 			"Choose an Agent Handoff workspace or Agent Handoffs folder before starting an agent handoff."
-		case let .launchFailed(provider):
-			"\(provider) could not start the agent handoff."
+		case let .launchFailed(provider, diagnostic):
+			["\(provider) could not start the agent handoff.", diagnostic]
+				.compactMap { $0 }
+				.joined(separator: " ")
 		}
 	}
 }
@@ -553,10 +555,25 @@ private enum CodexHandoffCoordinator {
 			arguments: arguments,
 			currentDirectoryURL: workspaceRoot
 		)
-		guard result.status == 0,
-			let output = try? String(contentsOf: resultURL, encoding: .utf8)
-		else { throw AgentHandoffError.launchFailed("Codex planner") }
+		guard result.status == 0 else {
+			throw AgentHandoffError.launchFailed(
+				"Codex planner",
+				diagnostic: plannerFailureDescription(for: result)
+			)
+		}
+		guard let output = try? String(contentsOf: resultURL, encoding: .utf8) else {
+			throw AgentHandoffError.launchFailed(
+				"Codex planner",
+				diagnostic: "Codex completed without returning a task plan."
+			)
+		}
 		return try AgentHandoffManifest.decode(output, workspaceRoot: workspaceRoot).packages
+	}
+
+	private static func plannerFailureDescription(for result: ProcessResult) -> String {
+		let diagnostic = conciseProcessDiagnostic(result.error)
+		let prefix = "Codex exited with status \(result.status)."
+		return [prefix, diagnostic].compactMap { $0 }.joined(separator: " ")
 	}
 
 	fileprivate static func validatedProjectRoot(at path: String?, inside workspaceRoot: URL) -> URL? {
@@ -584,13 +601,26 @@ private struct AgentHandoffManifest: Codable, Sendable {
 			.replacingOccurrences(of: "```json", with: "")
 			.replacingOccurrences(of: "```", with: "")
 			.trimmingCharacters(in: .whitespacesAndNewlines)
-		let manifest = try JSONDecoder().decode(Self.self, from: Data(json.utf8))
+		let manifest: Self
+		do {
+			manifest = try JSONDecoder().decode(Self.self, from: Data(json.utf8))
+		} catch {
+			throw AgentHandoffError.launchFailed(
+				"Codex planner",
+				diagnostic: "Codex returned a task plan Octo could not read: \(error.localizedDescription)"
+			)
+		}
 		guard !manifest.packages.isEmpty,
 			manifest.packages.allSatisfy({
 				!$0.title.isEmpty && !$0.objective.isEmpty
 				&& CodexHandoffCoordinator.validatedProjectRoot(at: $0.projectPath, inside: workspaceRoot) != nil
 			})
-		else { throw AgentHandoffError.launchFailed("Codex planner") }
+		else {
+			throw AgentHandoffError.launchFailed(
+				"Codex planner",
+				diagnostic: "Codex returned no usable tasks for a project inside the selected workspace."
+			)
+		}
 		return manifest
 	}
 }
@@ -1766,6 +1796,17 @@ enum HandoffPrompt {
 private struct ProcessResult {
 	let status: Int32
 	let output: String
+	let error: String
+}
+
+private func conciseProcessDiagnostic(_ error: String) -> String? {
+	let lines = error
+		.split(whereSeparator: \.isNewline)
+		.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+		.filter { !$0.isEmpty }
+	guard let first = lines.first else { return nil }
+	let limit = 300
+	return first.count > limit ? String(first.prefix(limit)) + "…" : first
 }
 
 private func executable(named name: String, fallback: String? = nil) throws -> URL {
@@ -1797,12 +1838,20 @@ private func runProcess(executable: URL, arguments: [String], currentDirectoryUR
 		try await withCheckedThrowingContinuation { continuation in
 			process.terminationHandler = { completed in
 				let standardOutput = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-				continuation.resume(returning: .init(status: completed.terminationStatus, output: standardOutput))
+				let standardError = String(decoding: error.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+				continuation.resume(returning: .init(
+					status: completed.terminationStatus,
+					output: standardOutput,
+					error: standardError
+				))
 			}
 			do {
 				try process.run()
 			} catch {
-				continuation.resume(throwing: AgentHandoffError.launchFailed(executable.lastPathComponent.capitalized))
+				continuation.resume(throwing: AgentHandoffError.launchFailed(
+					executable.lastPathComponent.capitalized,
+					diagnostic: "macOS could not start the executable: \(error.localizedDescription)"
+				))
 			}
 		}
 	}, onCancel: {

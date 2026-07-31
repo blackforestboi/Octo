@@ -936,7 +936,7 @@ func pressAndHold_quickSecondTapRefinesCompletedTranscript() {
 }
 
 @Test
-func pressAndHold_heldSecondTapCapturesScreenContext() {
+func pressAndHold_secondTapReleaseDoesNotClassifyScreenAware() {
 	runScenario(
 		hotkey: HotKey(key: nil, modifiers: [.option]),
 		doubleTapLockEnabled: false,
@@ -946,39 +946,7 @@ func pressAndHold_heldSecondTapCapturesScreenContext() {
 			ScenarioStep(time: 0.0, modifiers: [.option], expectedOutput: .startRecording),
 			ScenarioStep(time: 0.1, modifiers: [], expectedOutput: .stopRecording),
 			ScenarioStep(time: 0.2, modifiers: [.option], expectedOutput: .startRecordingAndArmScreenAware),
-			ScenarioStep(time: 1.0, modifiers: [], expectedOutput: .stopRecordingWithScreenContext)
-		]
-	)
-}
-
-@Test
-func screenAwareSecondTapUsesPhysicalEventDurationWhenDeliveryIsLate() {
-	runScenario(
-		hotkey: HotKey(key: nil, modifiers: [.option]),
-		doubleTapLockEnabled: false,
-		lockingHoldDuration: 0.75,
-		screenAwareSecondTapEnabled: true,
-		steps: [
-			ScenarioStep(time: 0.0, modifiers: [.option], eventTimestamp: 0, expectedOutput: .startRecording),
-			ScenarioStep(time: 0.1, modifiers: [], eventTimestamp: 100_000_000, expectedOutput: .stopRecording),
-			ScenarioStep(time: 0.2, modifiers: [.option], eventTimestamp: 200_000_000, expectedOutput: .startRecordingAndArmScreenAware),
-			ScenarioStep(time: 5.0, modifiers: [], eventTimestamp: 940_000_000, expectedOutput: .stopRecording)
-		]
-	)
-}
-
-@Test
-func screenAwareSecondTapQualifiesAtPhysicalEventThreshold() {
-	runScenario(
-		hotkey: HotKey(key: nil, modifiers: [.option]),
-		doubleTapLockEnabled: false,
-		lockingHoldDuration: 0.75,
-		screenAwareSecondTapEnabled: true,
-		steps: [
-			ScenarioStep(time: 0.0, modifiers: [.option], eventTimestamp: 0, expectedOutput: .startRecording),
-			ScenarioStep(time: 0.1, modifiers: [], eventTimestamp: 100_000_000, expectedOutput: .stopRecording),
-			ScenarioStep(time: 0.2, modifiers: [.option], eventTimestamp: 200_000_000, expectedOutput: .startRecordingAndArmScreenAware),
-			ScenarioStep(time: 0.3, modifiers: [], eventTimestamp: 950_000_000, expectedOutput: .stopRecordingWithScreenContext)
+			ScenarioStep(time: 1.0, modifiers: [], expectedOutput: .stopRecording)
 		]
 	)
 }

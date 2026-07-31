@@ -922,6 +922,35 @@ final class RecordingRaceTests: XCTestCase {
 		await store.finish()
 	}
 
+	func testScreenAwareActivatesAtHoldThresholdBeforeRelease() async {
+		let clock = TestClock()
+		var state = Self.makeState()
+		state.isRecording = true
+		state.activeRecordingSource = .regular
+		let context = Self.makeScreenContext()
+		let store = TestStore(initialState: state) {
+			TranscriptionFeature()
+		} withDependencies: {
+			$0.continuousClock = clock
+			$0.uuid = .constant(UUID(1))
+			$0.screenCapture.captureDisplayUnderCursor = { _ in context }
+		}
+		store.exhaustivity = .off(showSkippedAssertions: false)
+
+		await store.send(.armScreenAwareActivation)
+		await clock.advance(by: .seconds(0.74))
+		XCTAssertFalse(store.state.isScreenAwareModeActive)
+
+		await clock.advance(by: .seconds(0.01))
+		await store.receive(\.screenAwareActivationThresholdReached)
+		await store.receive(\.screenAwareModeActivated) {
+			$0.isScreenAwareModeActive = true
+			$0.forcedRefinementMode = .refined
+		}
+		await store.receive(\.screenContextCaptured)
+		await store.finish()
+	}
+
 	func testScreenAwareIndicatorDoesNotActivateOutsideActiveRecording() async {
 		let store = TestStore(initialState: Self.makeState()) {
 			TranscriptionFeature()
@@ -1310,6 +1339,29 @@ final class RecordingRaceTests: XCTestCase {
 		await store.send(.hotKeyReleased(.regular))
 		await store.receive(\.finishScreenAwareRecording) {
 			$0.isScreenAwareModeActive = false
+		}
+		await store.receive(\.stopRecording)
+		await store.finish()
+	}
+
+	func testAgentHandoffFinishClearsScreenAwareModeBeforePresentationDeparts() async {
+		var state = Self.makeState()
+		state.$hexSettings.withLock { $0.agentHandoffEnabled = true }
+		state.isRecording = true
+		state.activeRecordingSource = .regular
+		state.isScreenAwareModeActive = true
+		let store = TestStore(initialState: state) {
+			TranscriptionFeature()
+		} withDependencies: {
+			$0.recording.stopRecording = { .ignored(.noActiveRecording) }
+			$0.sleepManagement.allowSleep = {}
+		}
+		store.exhaustivity = .off(showSkippedAssertions: false)
+
+		await store.send(.finishRecordingWithAgentHandoff) {
+			$0.isAgentHandoffRequestedForActiveRecording = true
+			$0.isScreenAwareModeActive = false
+			$0.agentHandoffPresentation = .init(label: "Processing")
 		}
 		await store.receive(\.stopRecording)
 		await store.finish()

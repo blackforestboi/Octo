@@ -6,6 +6,10 @@ This file provides guidance for coding agents working in this repo.
 
 Octo is a macOS menu bar application for on‑device voice‑to‑text. It supports Whisper (Core ML via WhisperKit) and Parakeet TDT v3 (Core ML via FluidAudio). Users activate transcription with hotkeys; text can be auto‑pasted into the active app.
 
+## UX Changes
+
+Changes to existing user experience must be explicitly confirmed by the user. Never change existing UX autonomously.
+
 ## Build & Development Commands
 
 ```bash

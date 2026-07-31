@@ -384,6 +384,9 @@ struct TranscriptionFeature {
 		case cancelPendingPressAndHold
 		case armTerminalRefinement
 		case terminalRefinementActivated(UUID)
+		case armScreenAwareActivation
+		case screenAwareActivationThresholdReached
+		case cancelScreenAwareActivation
     case hotKeyPressed
     case hotKeyReleased(RecordingSource)
 			case refinedHotKeyPressed
@@ -558,6 +561,25 @@ struct TranscriptionFeature {
 			state.pendingTerminalRefinementID = nil
 			return .send(.finishRecordingWithRefinement)
 
+		case .armScreenAwareActivation:
+			guard state.isRecording, state.activeRecordingSource == .regular else { return .none }
+			let holdDuration = ScreenAwareActivation.holdDuration(for: state.hexSettings)
+			return .run { [clock] send in
+				try await clock.sleep(for: .seconds(holdDuration))
+				await send(.screenAwareActivationThresholdReached)
+			}
+			.cancellable(id: CancelID.screenAwareActivation, cancelInFlight: true)
+
+		case .screenAwareActivationThresholdReached:
+			guard state.isRecording,
+				state.activeRecordingSource == .regular,
+				!state.isScreenAwareModeActive
+			else { return .none }
+			return .send(.screenAwareModeActivated)
+
+		case .cancelScreenAwareActivation:
+			return .cancel(id: CancelID.screenAwareActivation)
+
       case .hotKeyPressed:
 		state.pendingPressAndHoldActivationID = nil
 		// Start recording immediately. Selection detection is deliberately parallel:
@@ -690,6 +712,7 @@ struct TranscriptionFeature {
 					else { return .none }
 					state.pendingTerminalRefinementID = nil
 					state.isAgentHandoffRequestedForActiveRecording = true
+					deactivateScreenAwareMode(&state)
 					// Keep the existing overlay alive while local transcription finishes.
 					// Without this, its panel briefly receives the hidden state before the
 					// handoff stream starts, making the progress indicator look like a new pill.
@@ -1601,7 +1624,10 @@ private extension TranscriptionFeature {
 			return useDoubleTapOnly || keyEvent.key != nil
 
 		  case .startRecordingAndArmScreenAware:
-			Task { await send(.hotKeyPressed) }
+			Task {
+				await send(.hotKeyPressed)
+				await send(.armScreenAwareActivation)
+			}
 			return useDoubleTapOnly || keyEvent.key != nil
 
 		  case .stopRecording:
@@ -1609,9 +1635,8 @@ private extension TranscriptionFeature {
             return false // or `true` if you want to intercept
 
 		  case .locked:
-			if hotKeyProcessor.isLongPressLocked, supportsScreenAwareGesture {
-				Task { await send(.screenAwareModeActivated) }
-			}
+			// Screen Aware is decided by the hold timer, never by the key-up event.
+			Task { await send(.cancelScreenAwareActivation) }
 			return false
 
 		  case .stopRecordingWithRefinement:

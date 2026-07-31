@@ -141,12 +141,11 @@ public struct HotKeyProcessor {
     /// Timestamp of the most recent hotkey release (for double-tap detection)
     private var lastTapAt: Date?
 
-    /// The second tap has started recording and is being measured for either a
-    /// screen-aware hold or a double-tap lock.
+    /// The second tap has started recording and awaits release to establish a lock.
     private var secondTapHoldPendingRelease = false
 
-    /// The physical timestamp of the second tap's key-down. This keeps Screen Aware
-    /// classification independent from delays in delivering the corresponding key-up.
+    /// The physical timestamp of the second tap's key-down for non-screen-aware
+    /// held-second-tap classification.
     private var secondTapHoldTimestamp: UInt64?
 
     /// Whether the most recently completed press-and-hold gesture was long
@@ -358,7 +357,7 @@ public extension HotKeyProcessor {
         /// Begin a new recording session
         case startRecording
 
-        /// Begin recording for a second tap that may qualify for Screen Aware on release.
+        /// Begin recording and arm the Screen Aware hold threshold.
         case startRecordingAndArmScreenAware
 
         /// Schedule a press-and-hold recording if the first press remains held.
@@ -558,6 +557,18 @@ extension HotKeyProcessor {
             // If user truly "released" the chord => either normal stop or doubleTapLock
             if isReleaseForActiveHotkey(e) {
                 if secondTapHoldPendingRelease {
+                    if screenAwareSecondTapEnabled {
+                        clearDoubleTapTracking()
+                        if doubleTapLockEnabled {
+                            state = .doubleTapLock
+                            isLongPressLocked = false
+                            return .locked
+                        }
+
+                        state = .idle
+                        return .stopRecording
+                    }
+
                     let wasLongSecondTap = lockingHoldDuration.map {
                         secondTapReached($0, releasedBy: e, startedAt: startTime)
                     } ?? false

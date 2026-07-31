@@ -4,6 +4,18 @@ import XCTest
 @testable import Octo
 
 final class AgentHandoffClientTests: XCTestCase {
+	func testLaunchFailureIncludesDiagnostic() {
+		let error = AgentHandoffError.launchFailed(
+			"Codex planner",
+			diagnostic: "Codex exited with status 1. Sign in required."
+		)
+
+		XCTAssertEqual(
+			error.errorDescription,
+			"Codex planner could not start the agent handoff. Codex exited with status 1. Sign in required."
+		)
+	}
+
 	func testCodexThreadDestinationUsesTheDesktopThreadRoute() {
 		let id = "528b9ff2-d685-4c1a-b2d8-76d6a1661de3"
 
