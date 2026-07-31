@@ -135,14 +135,20 @@ public struct HexSettings: Codable, Equatable, Sendable {
 	public var speakerDiarizationProvider: SpeakerDiarizationProvider
 	/// Optional post-processing is deliberately separate from the transcription pipeline.
 	public var refinementMode: RefinementMode
+	/// Enables all optional transcript-refinement workflows and controls.
+	public var refinementEnabled: Bool
 	public var refinementProvider: RefinementProvider
 	/// Controls how much reasoning the refinement provider should use when supported.
 	public var refinementReasoningEffort: RefinementReasoningEffort
 	/// The local subscription CLI that receives Agent Handoff tasks.
 	/// Agent Handoffs can only be launched through Codex or Claude Code.
 	public var agentHandoffProvider: RefinementProvider
+	/// Enables Agent Handoff workflows and controls independently of refinement.
+	public var agentHandoffEnabled: Bool
 	/// A model selection dedicated to Agent Handoffs, separate from quick refinement.
 	public var agentHandoffModelID: String?
+	/// Controls how much reasoning Agent Handoff workflows request when supported.
+	public var agentHandoffReasoningEffort: RefinementReasoningEffort
 	/// Prevents a one-time fresh-install check from overriding a user's provider choice later.
 	public var hasCompletedRefinementProviderDetection: Bool
 	/// Model selections are kept per provider so changing providers never reuses an incompatible ID.
@@ -155,6 +161,8 @@ public struct HexSettings: Codable, Equatable, Sendable {
 	/// Named rewrite instructions. Their one-based positions map to long-held number keys.
 	public var rewritePrompts: [RewritePrompt]
 	public var openRouterModelID: String?
+	/// OpenRouter models promoted to the short list shown in the model picker and menu bar.
+	public var openRouterShortlistedModelIDs: [String]
 	/// Vision-capable OpenRouter model used only when the selected refinement model
 	/// cannot accept an uploaded screenshot.
 	public var screenAwareOpenRouterModelID: String?
@@ -300,19 +308,23 @@ public struct HexSettings: Codable, Equatable, Sendable {
 		includeSystemAudio: Bool = false,
 		speakerDiarizationProvider: SpeakerDiarizationProvider = .fluidAudio,
 		refinementMode: RefinementMode = .raw,
+		refinementEnabled: Bool = true,
 		refinementProvider: RefinementProvider = .apple,
 		refinementReasoningEffort: RefinementReasoningEffort = .none,
 		agentHandoffProvider: RefinementProvider = .codexCLI,
+		agentHandoffEnabled: Bool = true,
 		agentHandoffModelID: String? = nil,
+		agentHandoffReasoningEffort: RefinementReasoningEffort = .medium,
 		hasCompletedRefinementProviderDetection: Bool = false,
 		openAIModelID: String? = nil,
 		anthropicModelID: String? = nil,
 		codexCLIModelID: String? = nil,
 		claudeCLIModelID: String? = nil,
 			refinementInstructions: String = HexSettings.defaultRefinementInstructions,
-			rewritePrompts: [RewritePrompt]? = nil,
-			openRouterModelID: String? = nil,
-			screenAwareOpenRouterModelID: String? = nil,
+		rewritePrompts: [RewritePrompt]? = nil,
+		openRouterModelID: String? = nil,
+		openRouterShortlistedModelIDs: [String] = [],
+		screenAwareOpenRouterModelID: String? = nil,
 			screenAwareDictationEnabled: Bool = false,
 			screenAwareInputSource: ScreenAwareInputSource = .localOCR,
 		includeSelectedTextInRefinement: Bool = true
@@ -352,10 +364,13 @@ public struct HexSettings: Codable, Equatable, Sendable {
 		self.includeSystemAudio = includeSystemAudio
 		self.speakerDiarizationProvider = speakerDiarizationProvider
 		self.refinementMode = refinementMode
+		self.refinementEnabled = refinementEnabled
 		self.refinementProvider = refinementProvider
 		self.refinementReasoningEffort = refinementReasoningEffort
 		self.agentHandoffProvider = agentHandoffProvider.handoffProvider ?? .codexCLI
+		self.agentHandoffEnabled = agentHandoffEnabled
 		self.agentHandoffModelID = agentHandoffModelID
+		self.agentHandoffReasoningEffort = agentHandoffReasoningEffort
 		self.hasCompletedRefinementProviderDetection = hasCompletedRefinementProviderDetection
 		self.openAIModelID = openAIModelID
 		self.anthropicModelID = anthropicModelID
@@ -372,9 +387,14 @@ public struct HexSettings: Codable, Equatable, Sendable {
 					name: Self.defaultRewritePromptName,
 					instructions: refinementInstructions
 				)]
+		}
+		self.openRouterModelID = openRouterModelID
+		self.openRouterShortlistedModelIDs = openRouterShortlistedModelIDs.reduce(into: []) { ids, modelID in
+			if !ids.contains(modelID) {
+				ids.append(modelID)
 			}
-			self.openRouterModelID = openRouterModelID
-			self.screenAwareOpenRouterModelID = screenAwareOpenRouterModelID
+		}
+		self.screenAwareOpenRouterModelID = screenAwareOpenRouterModelID
 			self.screenAwareDictationEnabled = screenAwareDictationEnabled
 			self.screenAwareInputSource = screenAwareInputSource
 		self.includeSelectedTextInRefinement = includeSelectedTextInRefinement
@@ -393,6 +413,9 @@ public struct HexSettings: Codable, Equatable, Sendable {
 	}
 	if !container.contains(.agentHandoffModelID) {
 		agentHandoffModelID = agentHandoffProvider == refinementProvider ? selectedRefinementModelID : nil
+	}
+	if !container.contains(.agentHandoffReasoningEffort) {
+		agentHandoffReasoningEffort = .medium
 	}
 		// Versions before named rewrite prompts stored one instruction string. Keep that
 		// exact string as the first prompt so existing refinements remain unchanged.
@@ -470,10 +493,13 @@ private enum HexSettingKey: String, CodingKey, CaseIterable {
 	case includeSystemAudio
 	case speakerDiarizationProvider
 	case refinementMode
+	case refinementEnabled
 	case refinementProvider
 	case refinementReasoningEffort
 	case agentHandoffProvider
+	case agentHandoffEnabled
 	case agentHandoffModelID
+	case agentHandoffReasoningEffort
 	case hasCompletedRefinementProviderDetection
 	case openAIModelID
 	case anthropicModelID
@@ -482,6 +508,7 @@ private enum HexSettingKey: String, CodingKey, CaseIterable {
 	case refinementInstructions
 	case rewritePrompts
 		case openRouterModelID
+		case openRouterShortlistedModelIDs
 		case screenAwareOpenRouterModelID
 		case screenAwareDictationEnabled
 		case screenAwareInputSource
@@ -634,14 +661,21 @@ private enum HexSettingsSchema {
 		SettingsField(.includeSystemAudio, keyPath: \.includeSystemAudio, default: defaults.includeSystemAudio).eraseToAny(),
 		SettingsField(.speakerDiarizationProvider, keyPath: \.speakerDiarizationProvider, default: defaults.speakerDiarizationProvider).eraseToAny(),
 		SettingsField(.refinementMode, keyPath: \.refinementMode, default: defaults.refinementMode).eraseToAny(),
+		SettingsField(.refinementEnabled, keyPath: \.refinementEnabled, default: defaults.refinementEnabled).eraseToAny(),
 		SettingsField(.refinementProvider, keyPath: \.refinementProvider, default: defaults.refinementProvider).eraseToAny(),
 		SettingsField(.refinementReasoningEffort, keyPath: \.refinementReasoningEffort, default: defaults.refinementReasoningEffort).eraseToAny(),
 		SettingsField(.agentHandoffProvider, keyPath: \.agentHandoffProvider, default: defaults.agentHandoffProvider).eraseToAny(),
+		SettingsField(.agentHandoffEnabled, keyPath: \.agentHandoffEnabled, default: defaults.agentHandoffEnabled).eraseToAny(),
 		SettingsField(
 			.agentHandoffModelID,
 			keyPath: \.agentHandoffModelID,
 			default: defaults.agentHandoffModelID,
 			encode: { container, key, value in try container.encodeIfPresent(value, forKey: key) }
+		).eraseToAny(),
+		SettingsField(
+			.agentHandoffReasoningEffort,
+			keyPath: \.agentHandoffReasoningEffort,
+			default: defaults.agentHandoffReasoningEffort
 		).eraseToAny(),
 		SettingsField(
 			.hasCompletedRefinementProviderDetection,
@@ -680,6 +714,11 @@ private enum HexSettingsSchema {
 				default: defaults.openRouterModelID,
 				encode: { container, key, value in try container.encodeIfPresent(value, forKey: key) }
 			).eraseToAny(),
+		SettingsField(
+			.openRouterShortlistedModelIDs,
+			keyPath: \.openRouterShortlistedModelIDs,
+			default: defaults.openRouterShortlistedModelIDs
+		).eraseToAny(),
 		SettingsField(
 			.screenAwareOpenRouterModelID,
 			keyPath: \.screenAwareOpenRouterModelID,

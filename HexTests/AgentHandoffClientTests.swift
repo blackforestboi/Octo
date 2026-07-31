@@ -71,11 +71,13 @@ final class AgentHandoffClientTests: XCTestCase {
 		let arguments = ClaudeHandoffCommand.coordinatorLaunchArguments(
 			name: "Octo handoff token",
 			modelID: "  claude-opus-4-6  ",
+			reasoningEffort: .medium,
 			coordinatorInstruction: "coordinate only",
 			userRequest: "launch the bounded task"
 		)
 
 		XCTAssertEqual(arguments, [
+			"--effort", "medium",
 			"--model", "claude-opus-4-6",
 			"--bg",
 			"--name", "Octo handoff token",

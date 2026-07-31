@@ -4,6 +4,7 @@
 //
 
 import AppKit
+import Combine
 import ComposableArchitecture
 import HexCore
 import Inject
@@ -100,7 +101,7 @@ struct TranscriptionIndicatorView: View {
 	var onDismissAgentHandoff: () -> Void = {}
 	var onCopyCompletedTranscript: () -> Void = {}
 	var onDismissCompletedTranscript: () -> Void = {}
-	var onCardSizeChange: (CGSize?) -> Void = { _ in }
+	var onCardSizeChange: (CGSize?, Bool) -> Void = { _, _ in }
 
 	@State private var waveformSamples: [CGFloat] = []
 	@State private var isHoveringCompletedTranscript = false
@@ -190,6 +191,17 @@ struct TranscriptionIndicatorView: View {
 
 	private var cardSize: CGSize {
 		.init(width: indicatorWidth, height: indicatorHeight)
+	}
+
+	/// The AppKit hosting panel clips anything outside its bounds. During the
+	/// flight, reserve a transparent canvas around the collapsed dot so its
+	/// trailing glow remains visible instead of being cut off at the dot's edge.
+	private var panelSize: CGSize {
+		guard status.isHandoffFlying else { return cardSize }
+		return .init(
+			width: max(cardSize.width, metrics.height * 14),
+			height: max(cardSize.height, metrics.height * 14)
+		)
 	}
 
 	private var visibleCardSize: CGSize {
@@ -289,7 +301,7 @@ struct TranscriptionIndicatorView: View {
 			.onAppear {
 				appendMeterSample(meter)
 				handoffDepartureProgress = status.isHandoffDeparting ? 1 : 0
-				onCardSizeChange(isHidden ? nil : cardSize)
+				onCardSizeChange(isHidden ? nil : panelSize, status.isHandoffFlying)
 			}
 			.onChange(of: meter) { _, meter in
 				appendMeterSample(meter)
@@ -299,15 +311,15 @@ struct TranscriptionIndicatorView: View {
 					waveformSamples.removeAll(keepingCapacity: true)
 				}
 				if case .completedTranscript = newStatus {
-					onCardSizeChange(cardSize)
+					onCardSizeChange(panelSize, newStatus.isHandoffFlying)
 				} else {
 					isHoveringCompletedTranscript = false
-					onCardSizeChange(isHidden ? nil : cardSize)
+					onCardSizeChange(isHidden ? nil : panelSize, newStatus.isHandoffFlying)
 				}
 				updateHandoffDepartureAnimation(for: newStatus)
 			}
 			.onChange(of: size) { _, _ in
-				onCardSizeChange(isHidden ? nil : cardSize)
+				onCardSizeChange(isHidden ? nil : panelSize, status.isHandoffFlying)
 			}
 			.enableInjection()
 	}
@@ -316,12 +328,20 @@ struct TranscriptionIndicatorView: View {
 		ZStack {
 			cardSurface
 				.frame(width: visibleCardSize.width, height: visibleCardSize.height)
+				.blur(radius: status.isHandoffFlying ? metrics.height * 0.08 : 0)
+				.opacity(status.isHandoffFlying ? 0.72 : 1)
+				.overlay {
+					// The halo and plume are attached to the existing collapsed card.
+					// They never own an independent screen position.
+					HandoffCometOrb(diameter: metrics.height, isActive: status.isHandoffFlying)
+						.opacity(status.isHandoffFlying ? 1 : 0)
+				}
 
 			content
 				.frame(width: visibleCardSize.width, height: visibleCardSize.height)
 				.opacity(1 - min(1, handoffDepartureProgress * 4))
 		}
-			.frame(width: cardSize.width, height: cardSize.height)
+			.frame(width: panelSize.width, height: panelSize.height)
 	}
 
 	private func updateHandoffDepartureAnimation(for status: Status) {
@@ -508,6 +528,154 @@ struct TranscriptionIndicatorView: View {
 
 }
 
+/// Turns the collapsed handoff dot into an edgeless luminous cloud with a
+/// curved tracer while its AppKit-hosted window travels toward the menu bar.
+private struct HandoffCometOrb: View {
+	private struct CloudPuff: Identifiable {
+		let id: Int
+		let x: CGFloat
+		let y: CGFloat
+		let size: CGFloat
+		let opacity: Double
+		let stretch: CGFloat
+	}
+
+	let diameter: CGFloat
+	let isActive: Bool
+	@State private var motion = AgentHandoffMotion.stationary
+
+	private let headPuffs = [
+		CloudPuff(id: 10, x: -0.12, y: 0.04, size: 1.18, opacity: 0.88, stretch: 1.02),
+		CloudPuff(id: 11, x: 0.18, y: -0.10, size: 0.88, opacity: 0.76, stretch: 0.94),
+		CloudPuff(id: 12, x: -0.22, y: -0.17, size: 0.78, opacity: 0.7, stretch: 1.04),
+		CloudPuff(id: 13, x: 0.12, y: 0.18, size: 0.76, opacity: 0.62, stretch: 1.08),
+		CloudPuff(id: 14, x: -0.14, y: 0.22, size: 0.67, opacity: 0.54, stretch: 0.92)
+	]
+
+	var body: some View {
+		TimelineView(.animation(minimumInterval: 1.0 / 60.0, paused: !isActive)) { timeline in
+			let phase = timeline.date.timeIntervalSinceReferenceDate * 7
+			let pulse = CGFloat(1 + sin(phase) * 0.035)
+
+			ZStack {
+				ForEach(0 ..< 14, id: \.self) { index in
+					motionTrailPuff(index: index, pulse: pulse)
+				}
+
+				Circle()
+					.fill(
+						RadialGradient(
+							colors: [
+								Color(nsColor: .octoIndicator).opacity(0.54),
+								Color(nsColor: .octoIndicator).opacity(0.22),
+								Color(nsColor: .octoIndicator).opacity(0)
+							],
+							center: .center,
+							startRadius: diameter * 0.12,
+							endRadius: diameter * 0.88
+						)
+					)
+					.frame(width: diameter * 2.1 * pulse, height: diameter * 2.1 * pulse)
+					.blur(radius: diameter * 0.12)
+
+				ForEach(headPuffs) { puff in
+					cloudPuff(puff, pulse: pulse, centerLight: 0.3)
+				}
+
+				Circle()
+					.fill(
+						RadialGradient(
+							colors: [
+								Color.white.opacity(0.58),
+								Color(nsColor: .octoIndicator).opacity(0.52),
+								Color(nsColor: .octoIndicator).opacity(0)
+							],
+							center: UnitPoint(x: 0.38, y: 0.32),
+							startRadius: 0,
+							endRadius: diameter * 0.42
+						)
+					)
+					.frame(width: diameter * 0.82, height: diameter * 0.82)
+					.offset(x: -diameter * 0.04, y: -diameter * 0.04)
+					.blur(radius: diameter * 0.04)
+			}
+		}
+		.frame(width: diameter * 14, height: diameter * 14)
+		.onReceive(NotificationCenter.default.publisher(for: .agentHandoffMotionUpdated)) { notification in
+			guard isActive else { return }
+			motion = notification.object as? AgentHandoffMotion ?? .stationary
+		}
+		.onChange(of: isActive) { _, isActive in
+			if !isActive {
+				motion = .stationary
+			}
+		}
+		.onDisappear {
+			motion = .stationary
+		}
+		.allowsHitTesting(false)
+	}
+
+	private func motionTrailPuff(index: Int, pulse: CGFloat) -> some View {
+		let speedStrength = min(1, max(0, motion.speed / 2_400))
+		let fraction = CGFloat(index + 1) / 14
+		let strength = speedStrength * pow(1 - fraction, 1.15)
+		let length = diameter * (0.45 + speedStrength * 4.75)
+		let direction = motion.backwardDirection
+		let perpendicular = CGSize(width: -direction.height, height: direction.width)
+		let lateralDrift = sin(CGFloat(index) * 2.17) * diameter * 0.07 * fraction
+		let size = 0.3 + strength * 0.72
+		let variation = 1 + CGFloat(index % 4) * 0.045
+		return Ellipse()
+			.fill(
+				RadialGradient(
+					colors: [
+						Color.white.opacity(Double(strength) * 0.18),
+						Color(nsColor: .octoIndicator).opacity(Double(strength) * 0.82),
+						Color(nsColor: .octoIndicator).opacity(Double(strength) * 0.3),
+						Color(nsColor: .octoIndicator).opacity(0)
+					],
+					center: .center,
+					startRadius: 0,
+					endRadius: diameter * size * 0.62
+				)
+			)
+			.frame(
+				width: diameter * size * variation * pulse,
+				height: diameter * size * 0.8 * pulse
+			)
+			.offset(
+				x: direction.width * length * fraction + perpendicular.width * lateralDrift,
+				y: direction.height * length * fraction + perpendicular.height * lateralDrift
+			)
+			.blur(radius: diameter * (0.08 + (1 - strength) * 0.08))
+			.opacity(motion.speed > 1 ? 1 : 0)
+	}
+
+	private func cloudPuff(_ puff: CloudPuff, pulse: CGFloat, centerLight: Double) -> some View {
+		Ellipse()
+			.fill(
+				RadialGradient(
+					colors: [
+						Color.white.opacity(centerLight * puff.opacity),
+						Color(nsColor: .octoIndicator).opacity(puff.opacity),
+						Color(nsColor: .octoIndicator).opacity(puff.opacity * 0.34),
+						Color(nsColor: .octoIndicator).opacity(0)
+					],
+					center: UnitPoint(x: 0.58, y: 0.42),
+					startRadius: 0,
+					endRadius: diameter * puff.size * 0.58
+				)
+			)
+			.frame(
+				width: diameter * puff.size * puff.stretch * pulse,
+				height: diameter * puff.size * 0.82 * pulse
+			)
+			.offset(x: diameter * puff.x, y: diameter * puff.y)
+			.blur(radius: diameter * 0.12)
+	}
+}
+
 private struct PillWaveform: View {
 	let samples: [CGFloat]
 
@@ -536,6 +704,35 @@ private struct PillWaveform: View {
 	}
 }
 
+struct LoadingSineWave: View {
+	let color: Color
+
+	var body: some View {
+		TimelineView(.animation(minimumInterval: 1 / 30)) { timeline in
+			Canvas { context, size in
+				// The absolute timeline phase prevents a loader restart when the
+				// underlying work moves between lifecycle states.
+				let phase = timeline.date.timeIntervalSinceReferenceDate * 6
+				let amplitude = max(2, size.height * 0.22)
+				let angularFrequency = (CGFloat.pi * 2 * 1.4) / max(size.width, 1)
+				var path = Path()
+
+				for x in stride(from: CGFloat.zero, through: size.width, by: 1) {
+					let y = size.height / 2 - sin(x * angularFrequency + phase) * amplitude
+					if x == 0 {
+						path.move(to: .init(x: x, y: y))
+					} else {
+						path.addLine(to: .init(x: x, y: y))
+					}
+				}
+
+				context.stroke(path, with: .color(color), lineWidth: 1.5)
+			}
+		}
+		.accessibilityHidden(true)
+	}
+}
+
 private struct LoadingWave: View {
 	let label: String
 	let width: CGFloat
@@ -543,27 +740,7 @@ private struct LoadingWave: View {
 
 	var body: some View {
 		HStack(spacing: 8) {
-			TimelineView(.animation(minimumInterval: 1 / 30)) { timeline in
-				Canvas { context, size in
-					// The absolute timeline phase prevents a loader restart when the
-					// underlying work transitions from transcription to refinement.
-					let phase = timeline.date.timeIntervalSinceReferenceDate * 6
-					let amplitude = max(2, size.height * 0.22)
-					let angularFrequency = (CGFloat.pi * 2 * 1.4) / max(size.width, 1)
-					var path = Path()
-
-					for x in stride(from: CGFloat.zero, through: size.width, by: 1) {
-						let y = size.height / 2 - sin(x * angularFrequency + phase) * amplitude
-						if x == 0 {
-							path.move(to: .init(x: x, y: y))
-						} else {
-							path.addLine(to: .init(x: x, y: y))
-						}
-					}
-
-					context.stroke(path, with: .color(.white.opacity(0.92)), lineWidth: 1.5)
-				}
-			}
+			LoadingSineWave(color: .white.opacity(0.92))
 			.frame(width: min(width * 0.35, 44), height: height)
 
 			Text(label)
@@ -582,7 +759,7 @@ struct TranscriptionIndicatorOverlayView: View {
 	@ObserveInjection var inject
 	@Shared(.hexSettings) var hexSettings: HexSettings
 	let onOpenHistory: () -> Void
-	let onPillSizeChange: (CGSize?) -> Void
+	let onPillSizeChange: (CGSize?, Bool) -> Void
 	let onAgentHandoffDeparture: () -> Void
 	@State private var currentPillSize: CGSize?
 
@@ -631,22 +808,22 @@ struct TranscriptionIndicatorOverlayView: View {
 			onDismissAgentHandoff: { store.send(.dismissAgentHandoff) },
 			onCopyCompletedTranscript: { store.send(.copyCompletedTranscript) },
 			onDismissCompletedTranscript: { store.send(.dismissCompletedTranscript) },
-			onCardSizeChange: { size in
+			onCardSizeChange: { size, preservingCenter in
 				currentPillSize = size
-				onPillSizeChange(size)
+				onPillSizeChange(size, preservingCenter)
 			}
 		)
 		.animation(.snappy(duration: 0.22), value: indicatorStatus)
 		.animation(.snappy(duration: 0.22), value: hexSettings.indicatorSize)
 		.onChange(of: hexSettings.indicatorLocation) { _, _ in
-			onPillSizeChange(currentPillSize)
+			onPillSizeChange(currentPillSize, false)
 		}
 		.onChange(of: indicatorStatus.isHandoffFlying) { _, isFlying in
 			if isFlying {
 				onAgentHandoffDeparture()
 			}
 		}
-		.onDisappear { onPillSizeChange(nil) }
+		.onDisappear { onPillSizeChange(nil, false) }
 		.alert("Cancel long recording?", isPresented: Binding(
 			get: { store.isLongRecordingCancellationConfirmationPresented },
 			set: { if !$0 { store.send(.dismissLongRecordingCancellationConfirmation) } }

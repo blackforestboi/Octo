@@ -119,29 +119,39 @@ final class TranscriptionFallbackPresentationTests: XCTestCase {
 		await store.finish()
 	}
 
-	func testHandoffPillDepartsTwoSecondsAfterEveryTaskLaunches() async {
+	func testHandoffPillDepartsWhenCoordinatorIsSubmittedAndWaitingRowEndsAtFirstTask() async {
 		let clock = TestClock()
+		let handoffID = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
 		var state = TranscriptionFeature.State()
-		state.agentHandoffPresentation = .init(label: "Found 2 tasks", expectedTaskCount: 2)
+		state.agentHandoffPresentation = .init(
+			handoffID: handoffID,
+			label: "Processing"
+		)
+		state.agentHandoffProcessingStatuses.append(.init(
+			id: handoffID,
+			provider: .codex,
+			label: "Starting coordinator"
+		))
+		state.agentHandoffActiveThreads[handoffID] = []
 		let store = TestStore(initialState: state) {
 			TranscriptionFeature()
 		} withDependencies: {
 			$0.continuousClock = clock
 		}
 
-		await store.send(.agentHandoffEvent(.childStarted(.codex("first"), ordinal: 1))) {
-			$0.agentHandoffPresentation?.threads = [.codex("first")]
-			$0.agentHandoffPresentation?.label = "Launching 1 of 2 tasks"
-		}
-		await store.send(.agentHandoffEvent(.childStarted(.codex("second"), ordinal: 2))) {
-			$0.agentHandoffPresentation?.threads = [.codex("first"), .codex("second")]
-			$0.agentHandoffPresentation?.label = "Launched 2 tasks"
+		await store.send(.agentHandoffEvent(handoffID, .coordinatorSubmitted)) {
+			$0.agentHandoffProcessingStatuses[id: handoffID]?.label = "Waiting for tasks"
 			$0.agentHandoffPresentation?.hasLaunched = true
 			$0.agentHandoffPresentation?.isReady = true
-		}
-		await clock.advance(by: .seconds(2))
-		await store.receive(\.agentHandoffPresentationExpired) {
 			$0.agentHandoffPresentation?.isDeparting = true
+		}
+		await store.receive(\.agentHandoffPresentationExpired)
+		await store.send(.agentHandoffEvent(handoffID, .tasksFound(2))) {
+			$0.agentHandoffProcessingStatuses[id: handoffID]?.expectedTaskCount = 2
+		}
+		await store.send(.agentHandoffEvent(handoffID, .childStarted(.codex("first"), ordinal: 1))) {
+			$0.agentHandoffActiveThreads[handoffID] = [.codex("first")]
+			$0.agentHandoffProcessingStatuses.remove(id: handoffID)
 		}
 		await clock.advance(by: .milliseconds(320))
 		await store.receive(\.agentHandoffCollapseFinished) {
@@ -151,8 +161,81 @@ final class TranscriptionFallbackPresentationTests: XCTestCase {
 		await store.receive(\.agentHandoffDepartureFinished) {
 			$0.agentHandoffPresentation = nil
 		}
+		await store.send(.agentHandoffEvent(handoffID, .completed)) {
+			$0.agentHandoffActiveThreads.removeValue(forKey: handoffID)
+		}
 		await store.finish()
 	}
+
+	func testConcurrentHandoffProgressIsTrackedIndependently() async {
+		let firstID = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
+		let secondID = UUID(uuidString: "00000000-0000-0000-0000-000000000002")!
+		var state = TranscriptionFeature.State()
+		state.agentHandoffProcessingStatuses = [
+			.init(id: firstID, provider: .codex, label: "Preparing agent handoff"),
+			.init(id: secondID, provider: .claude, label: "Preparing agent handoff"),
+		]
+		let store = TestStore(initialState: state) {
+			TranscriptionFeature()
+		}
+
+		await store.send(.agentHandoffEvent(firstID, .processing)) {
+			$0.agentHandoffProcessingStatuses[id: firstID]?.label = "Starting coordinator"
+		}
+		await store.send(.agentHandoffEvent(firstID, .completed)) {
+			$0.agentHandoffProcessingStatuses.remove(id: firstID)
+		}
+		await store.finish()
+	}
+
+	#if DEBUG
+	func testDebugHandoffAnimationRunsTheProductionDepartureSequence() async {
+		let clock = TestClock()
+		let handoffID = UUID(uuidString: "00000000-0000-0000-0000-0000000000D1")!
+		let store = TestStore(initialState: TranscriptionFeature.State()) {
+			TranscriptionFeature()
+		} withDependencies: {
+			$0.continuousClock = clock
+		}
+
+		await store.send(.debugAgentHandoffAnimation) {
+			$0.agentHandoffProcessingStatuses.append(.init(
+				id: handoffID,
+				provider: .codex,
+				label: "Starting coordinator"
+			))
+			$0.agentHandoffPresentation = .init(
+				handoffID: handoffID,
+				label: "Processing"
+			)
+		}
+		await clock.advance(by: .milliseconds(300))
+		await store.receive(\.agentHandoffEvent) {
+			$0.agentHandoffProcessingStatuses[id: handoffID]?.label = "Waiting for tasks"
+			$0.agentHandoffPresentation?.hasLaunched = true
+			$0.agentHandoffPresentation?.isReady = true
+			$0.agentHandoffPresentation?.isDeparting = true
+		}
+		await store.receive(\.agentHandoffPresentationExpired)
+		await clock.advance(by: .milliseconds(320))
+		await store.receive(\.agentHandoffCollapseFinished) {
+			$0.agentHandoffPresentation?.isFlying = true
+		}
+		await clock.advance(by: .milliseconds(380))
+		await store.receive(\.agentHandoffEvent) {
+			$0.agentHandoffProcessingStatuses[id: handoffID]?.expectedTaskCount = 2
+		}
+		await clock.advance(by: .milliseconds(440))
+		await store.receive(\.agentHandoffDepartureFinished) {
+			$0.agentHandoffPresentation = nil
+		}
+		await clock.advance(by: .milliseconds(210))
+		await store.receive(\.agentHandoffEvent) {
+			$0.agentHandoffProcessingStatuses.remove(id: handoffID)
+		}
+		await store.finish()
+	}
+	#endif
 }
 
 private actor ClipboardProbe {

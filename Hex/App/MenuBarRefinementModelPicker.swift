@@ -81,9 +81,29 @@ struct RefinementModelMenuState: Equatable {
 	}
 }
 
+enum RefinementModelMenuTarget: Hashable {
+	case rewrite
+	case handoff
+
+	var label: String {
+		switch self {
+		case .rewrite: "Rewrite"
+		case .handoff: "Handoff"
+		}
+	}
+
+	func provider(in settings: HexSettings) -> RefinementProvider {
+		switch self {
+		case .rewrite: settings.refinementProvider
+		case .handoff: settings.agentHandoffProvider
+		}
+	}
+}
+
 enum RefinementModelMenuSelection {
-	static func selectedModelID(in settings: HexSettings) -> String? {
-		switch settings.refinementProvider {
+	static func selectedModelID(in settings: HexSettings, target: RefinementModelMenuTarget = .rewrite) -> String? {
+		if target == .handoff { return settings.agentHandoffModelID }
+		return switch settings.refinementProvider {
 		case .openRouter:
 			settings.openRouterModelID
 		case .openAI:
@@ -101,19 +121,21 @@ enum RefinementModelMenuSelection {
 
 	static func title(
 		for settings: HexSettings,
+		target: RefinementModelMenuTarget = .rewrite,
 		options: [RefinementModelMenuOption]
 	) -> String {
-		switch settings.refinementProvider {
+		let provider = target.provider(in: settings)
+		switch provider {
 		case .apple:
 			return "Apple Intelligence default"
 		case .gemini:
 			return "Gemini 3.1 Flash Lite"
-		case .codexCLI where settings.codexCLIModelID == nil:
+		case .codexCLI where selectedModelID(in: settings, target: target) == nil:
 			return "Codex default"
-		case .claudeCLI where settings.claudeCLIModelID == nil:
+		case .claudeCLI where selectedModelID(in: settings, target: target) == nil:
 			return "Claude default"
 		case .openRouter, .openAI, .anthropic, .codexCLI, .claudeCLI:
-			guard let modelID = selectedModelID(in: settings) else {
+			guard let modelID = selectedModelID(in: settings, target: target) else {
 				return "Select a model"
 			}
 			return options.first(where: { $0.modelID == modelID })?.name ?? modelID
@@ -122,14 +144,15 @@ enum RefinementModelMenuSelection {
 
 	static func displayedOptions(
 		for settings: HexSettings,
+		target: RefinementModelMenuTarget = .rewrite,
 		options: [RefinementModelMenuOption]
 	) -> [RefinementModelMenuOption] {
-		guard let selectedModelID = selectedModelID(in: settings),
+		guard let selectedModelID = selectedModelID(in: settings, target: target),
 			  !options.contains(where: { $0.modelID == selectedModelID })
 		else { return options }
 
 		let unavailable = RefinementModelMenuOption(
-			provider: settings.refinementProvider,
+			provider: target.provider(in: settings),
 			modelID: selectedModelID,
 			name: "\(selectedModelID) (Unavailable)",
 			isEnabled: false
@@ -137,13 +160,31 @@ enum RefinementModelMenuSelection {
 		return [unavailable] + options
 	}
 
+	static func shortlistedOptions(
+		for settings: HexSettings,
+		target: RefinementModelMenuTarget = .rewrite,
+		options: [RefinementModelMenuOption]
+	) -> [RefinementModelMenuOption] {
+		guard target.provider(in: settings) == .openRouter else { return options }
+		let shortlistedModelIDs = Set(settings.openRouterShortlistedModelIDs)
+		return options.filter { option in
+			guard let modelID = option.modelID else { return false }
+			return shortlistedModelIDs.contains(modelID)
+		}
+	}
+
 	@discardableResult
 	static func apply(
 		_ option: RefinementModelMenuOption,
-		to settings: inout HexSettings
+		to settings: inout HexSettings,
+		target: RefinementModelMenuTarget = .rewrite
 	) -> Bool {
-		guard option.isEnabled, option.provider == settings.refinementProvider else {
+		guard option.isEnabled, option.provider == target.provider(in: settings) else {
 			return false
+		}
+		if target == .handoff {
+			settings.agentHandoffModelID = option.modelID
+			return true
 		}
 
 		switch option.provider {
@@ -316,8 +357,10 @@ struct MenuBarRefinementModelPicker: View {
 	@State private var state = RefinementModelMenuState(provider: .apple)
 
 	private let loader: RefinementModelMenuLoader
+	private let target: RefinementModelMenuTarget
 
-	init(loader: RefinementModelMenuLoader = .live) {
+	init(target: RefinementModelMenuTarget = .rewrite, loader: RefinementModelMenuLoader = .live) {
+		self.target = target
 		self.loader = loader
 	}
 
@@ -325,47 +368,71 @@ struct MenuBarRefinementModelPicker: View {
 		Menu {
 			let options = RefinementModelMenuSelection.displayedOptions(
 				for: hexSettings,
-				options: state.provider == hexSettings.refinementProvider ? state.options : []
+				target: target,
+				options: state.provider == provider ? state.options : []
 			)
+			let shortlistedOptions = RefinementModelMenuSelection.shortlistedOptions(
+				for: hexSettings,
+				target: target,
+				options: options
+			)
+			let showsShortlist = provider == .openRouter && !shortlistedOptions.isEmpty
 
-			ForEach(options) { option in
-				Toggle(
-					option.name,
-					isOn: Binding(
-						get: {
-							RefinementModelMenuSelection.selectedModelID(in: hexSettings) == option.modelID
-						},
-						set: { isSelected in
-							guard isSelected else { return }
-							$hexSettings.withLock {
-								_ = RefinementModelMenuSelection.apply(option, to: &$0)
-							}
-						}
-					)
-				)
-				.disabled(!option.isEnabled)
-			}
+			modelOptions(showsShortlist ? shortlistedOptions : options)
 
 			if let status = state.status {
-				if !options.isEmpty {
+				if !(showsShortlist ? shortlistedOptions : options).isEmpty {
 					Divider()
 				}
 				Text(status.text)
 					.foregroundStyle(.secondary)
 			}
+
+			if showsShortlist {
+				Divider()
+				Menu("All Models…") {
+					modelOptions(options)
+				}
+			}
 		} label: {
-			Text("Model: \(currentModelTitle)")
+			Text("\(target.label): \(currentModelTitle)")
 		}
-		.task(id: hexSettings.refinementProvider) {
-			await loadModels(for: hexSettings.refinementProvider)
+		.task(id: provider) {
+			await loadModels(for: provider)
 		}
 	}
 
 	private var currentModelTitle: String {
 		RefinementModelMenuSelection.title(
 			for: hexSettings,
-			options: state.provider == hexSettings.refinementProvider ? state.options : []
+			target: target,
+			options: state.provider == provider ? state.options : []
 		)
+	}
+
+	private var provider: RefinementProvider {
+		target.provider(in: hexSettings)
+	}
+
+	@ViewBuilder
+	private func modelOptions(_ options: [RefinementModelMenuOption]) -> some View {
+		ForEach(options) { option in
+			Toggle(
+				option.name,
+				isOn: Binding(
+					get: {
+						RefinementModelMenuSelection.selectedModelID(in: hexSettings, target: target) == option.modelID
+					},
+					set: { isSelected in
+						guard isSelected else { return }
+						$hexSettings.withLock {
+							_ = RefinementModelMenuSelection.apply(option, to: &$0, target: target)
+						}
+					}
+				)
+			)
+			.disabled(!option.isEnabled)
+		}
 	}
 
 	private func loadModels(for provider: RefinementProvider) async {
@@ -374,19 +441,19 @@ struct MenuBarRefinementModelPicker: View {
 
 		do {
 			let options = try await loader.loadOptions(provider)
-			guard !Task.isCancelled, hexSettings.refinementProvider == provider else { return }
+			guard !Task.isCancelled, self.provider == provider else { return }
 			state.finishLoading(provider: provider, options: options)
 		} catch is CancellationError {
 			return
 		} catch let error as RefinementModelMenuLoadError {
-			guard !Task.isCancelled, hexSettings.refinementProvider == provider else { return }
+			guard !Task.isCancelled, self.provider == provider else { return }
 			state.failLoading(
 				provider: provider,
 				message: error.menuMessage,
 				disablesRetainedOptions: !cachedOptions.isEmpty
 			)
 		} catch {
-			guard !Task.isCancelled, hexSettings.refinementProvider == provider else { return }
+			guard !Task.isCancelled, self.provider == provider else { return }
 			state.failLoading(
 				provider: provider,
 				message: cachedOptions.isEmpty

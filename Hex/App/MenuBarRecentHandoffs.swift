@@ -5,24 +5,38 @@ import SwiftUI
 @MainActor
 struct MenuBarRecentHandoffs: View {
 	@Dependency(\.agentHandoff) private var agentHandoff
+	@Bindable var store: StoreOf<TranscriptionFeature>
 	@State private var allTasks: [AgentHandoffTask]
 
-	init() {
-		// `MenuBarExtra` constructs its native menu before this view's `onAppear`
-		// callback. Seed the state from the journal here so existing handoffs are
-		// present in the first menu opened after Octo launches.
+	init(store: StoreOf<TranscriptionFeature>) {
+		self.store = store
+		// Seed from the journal before `onAppear` so existing handoffs are present
+		// the first time this SwiftUI menu content is rendered.
 		_allTasks = State(initialValue: Self.loadTasks(using: DependencyValues._current.agentHandoff))
 	}
 
 	var body: some View {
 		Group {
-			if !visibleTasks.isEmpty {
+			if !visibleTasks.isEmpty || !store.agentHandoffProcessingStatuses.isEmpty {
 				Divider()
+			}
+
+			if !visibleTasks.isEmpty {
 				Button(action: markAllTasksAsRead) {
 					Label("Mark All as Read", systemImage: "checkmark")
 				}
 				.disabled(!allTasks.contains(where: \.hasUnacknowledgedCompletion))
+			}
 
+			if !store.agentHandoffProcessingStatuses.isEmpty {
+				Section {
+					MenuBarHandoffProcessingRow(
+						statuses: Array(store.agentHandoffProcessingStatuses)
+					)
+				}
+			}
+
+			if !visibleTasks.isEmpty {
 				Section("Recent Handoffs") {
 					ForEach(visibleTasks) { task in
 						Button {
@@ -39,9 +53,10 @@ struct MenuBarRecentHandoffs: View {
 										.renderingMode(.original)
 										.accessibilityLabel("Completed")
 								} else {
-									providerIcon(for: task.provider)
-										.resizable()
-										.scaledToFit()
+									MenuBarHandoffProviderIcon(
+										provider: task.provider,
+										isSpinning: task.thread.map(activeThreads.contains) == true
+									)
 										.frame(width: 13, height: 13)
 										.accessibilityLabel(providerName(for: task.provider))
 								}
@@ -86,11 +101,8 @@ struct MenuBarRecentHandoffs: View {
 			.map { $0 }
 	}
 
-	private func providerIcon(for provider: AgentHandoffRequest.Provider) -> Image {
-		switch provider {
-		case .codex: Image("HandoffOpenAI")
-		case .claude: Image("HandoffClaude")
-		}
+	private var activeThreads: Set<AgentHandoffThread> {
+		Set(store.agentHandoffActiveThreads.values.flatMap { $0 })
 	}
 
 	private func providerName(for provider: AgentHandoffRequest.Provider) -> String {
@@ -107,5 +119,77 @@ struct MenuBarRecentHandoffs: View {
 		case .claude:
 			"Open in Claude Code: \(task.title)"
 		}
+	}
+}
+
+struct MenuBarHandoffProcessingRow: View {
+	let statuses: [TranscriptionFeature.AgentHandoffProcessingStatus]
+
+	var body: some View {
+		HStack(spacing: 8) {
+			MenuBarHandoffProviderIcon(provider: iconProvider, isSpinning: true)
+				.frame(width: 13, height: 13)
+
+			Text("\(providerName) · \(waitingLabel)")
+				.lineLimit(1)
+		}
+		.frame(maxWidth: .infinity, alignment: .leading)
+		.font(.system(size: 13))
+		.padding(.vertical, 2)
+		.allowsHitTesting(false)
+		.accessibilityElement(children: .ignore)
+		.accessibilityLabel("\(providerName) handoff: \(waitingLabel)")
+	}
+
+	private var providerName: String {
+		guard statuses.allSatisfy({ $0.provider == iconProvider }) else {
+			return "Agents"
+		}
+
+		switch iconProvider {
+		case .codex: return "Codex"
+		case .claude: return "Claude"
+		}
+	}
+
+	private var iconProvider: AgentHandoffRequest.Provider {
+		statuses.first?.provider ?? .codex
+	}
+
+	private var waitingLabel: String {
+		Self.waitingLabel(forPendingJobCount: statuses.count)
+	}
+
+	static func waitingLabel(forPendingJobCount count: Int) -> String {
+		return "Waiting for \(count) \(count == 1 ? "task" : "tasks")"
+	}
+}
+
+private struct MenuBarHandoffProviderIcon: View {
+	let provider: AgentHandoffRequest.Provider
+	let isSpinning: Bool
+
+	var body: some View {
+		TimelineView(.animation(minimumInterval: 1 / 30, paused: !isSpinning)) { context in
+			providerIcon
+				.resizable()
+				.scaledToFit()
+				.rotationEffect(rotation(at: context.date))
+		}
+	}
+
+	private var providerIcon: Image {
+		switch provider {
+		case .codex: Image("HandoffOpenAI")
+		case .claude: Image("HandoffClaude")
+		}
+	}
+
+	private func rotation(at date: Date) -> Angle {
+		guard isSpinning else { return .zero }
+		let duration = 2.3
+		let progress = date.timeIntervalSinceReferenceDate
+			.truncatingRemainder(dividingBy: duration) / duration
+		return .degrees(progress * 360)
 	}
 }

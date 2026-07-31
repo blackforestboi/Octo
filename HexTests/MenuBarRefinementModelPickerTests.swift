@@ -40,6 +40,25 @@ final class MenuBarRefinementModelPickerTests: XCTestCase {
 		XCTAssertEqual(settings.anthropicModelID, "keep-claude")
 	}
 
+	func testHandoffSelectionDoesNotChangeTheRewriteModel() {
+		var settings = HexSettings(
+			refinementProvider: .openAI,
+			agentHandoffProvider: .claudeCLI,
+			openAIModelID: "rewrite-model",
+			agentHandoffModelID: "old-handoff-model"
+		)
+		let option = RefinementModelMenuOption(
+			provider: .claudeCLI,
+			modelID: "new-handoff-model",
+			name: "New Handoff Model",
+			isEnabled: true
+		)
+
+		XCTAssertTrue(RefinementModelMenuSelection.apply(option, to: &settings, target: .handoff))
+		XCTAssertEqual(settings.openAIModelID, "rewrite-model")
+		XCTAssertEqual(settings.agentHandoffModelID, "new-handoff-model")
+	}
+
 	func testLegacyFallbackRemainsVisibleWhenMissingFromCatalog() {
 		let settings = HexSettings(
 			refinementProvider: .openAI,
@@ -59,6 +78,29 @@ final class MenuBarRefinementModelPickerTests: XCTestCase {
 		XCTAssertEqual(displayed[0].name, "legacy-model (Unavailable)")
 		XCTAssertEqual(displayed[0].modelID, "legacy-model")
 		XCTAssertFalse(displayed[0].isEnabled)
+	}
+
+	func testOpenRouterShortlistFiltersOnlyTheMenuDefault() {
+		let settings = HexSettings(
+			refinementProvider: .openRouter,
+			openRouterShortlistedModelIDs: ["fast"]
+		)
+		let options = [
+			RefinementModelMenuOption(provider: .openRouter, modelID: "fast", name: "Fast", isEnabled: true),
+			RefinementModelMenuOption(provider: .openRouter, modelID: "thorough", name: "Thorough", isEnabled: true),
+		]
+
+		XCTAssertEqual(
+			RefinementModelMenuSelection.shortlistedOptions(for: settings, options: options).map(\.modelID),
+			["fast"]
+		)
+		XCTAssertEqual(
+			RefinementModelMenuSelection.shortlistedOptions(
+				for: HexSettings(refinementProvider: .openAI, openRouterShortlistedModelIDs: ["fast"]),
+				options: options
+			).map(\.modelID),
+			["fast", "thorough"]
+		)
 	}
 
 	func testLoadedDisplayNameReplacesRawModelIDInTitle() {

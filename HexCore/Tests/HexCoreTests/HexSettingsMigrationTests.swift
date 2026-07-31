@@ -33,9 +33,12 @@ final class HexSettingsMigrationTests: XCTestCase {
 		XCTAssertFalse(decoded.lowercaseTranscripts)
 		XCTAssertFalse(decoded.removePunctuation)
 		XCTAssertEqual(decoded.refinementMode, .raw)
+		XCTAssertTrue(decoded.refinementEnabled)
 		XCTAssertEqual(decoded.refinementProvider, .apple)
 		XCTAssertEqual(decoded.agentHandoffProvider, .codexCLI)
+		XCTAssertTrue(decoded.agentHandoffEnabled)
 		XCTAssertNil(decoded.agentHandoffModelID)
+		XCTAssertEqual(decoded.agentHandoffReasoningEffort, .medium)
 		XCTAssertTrue(decoded.hasCompletedRefinementProviderDetection)
 		XCTAssertEqual(decoded.refinementInstructions, HexSettings.defaultRefinementInstructions)
 		XCTAssertEqual(decoded.rewritePrompts.count, 1)
@@ -130,6 +133,20 @@ final class HexSettingsMigrationTests: XCTestCase {
 		XCTAssertEqual(decoded.screenAwareOpenRouterModelID, "anthropic/claude-sonnet-4")
 		XCTAssertEqual(decoded.screenAwareInputSource, .image)
 		XCTAssertFalse(decoded.includeSelectedTextInRefinement)
+	}
+
+	func testOpenRouterShortlistRoundTripsAndDeduplicatesModelIDs() throws {
+		let settings = HexSettings(
+			openRouterShortlistedModelIDs: ["fast", "thorough", "fast"]
+		)
+		let decoded = try JSONDecoder().decode(HexSettings.self, from: JSONEncoder().encode(settings))
+
+		XCTAssertEqual(settings.openRouterShortlistedModelIDs, ["fast", "thorough"])
+		XCTAssertEqual(decoded.openRouterShortlistedModelIDs, ["fast", "thorough"])
+		XCTAssertEqual(
+			try JSONDecoder().decode(HexSettings.self, from: Data("{}".utf8)).openRouterShortlistedModelIDs,
+			[]
+		)
 	}
 
 	func testLegacyInstructionsMigrateToTheDefaultRewritePrompt() throws {

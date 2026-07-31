@@ -55,7 +55,8 @@ public extension KeyEvent {
       modifiers: modifiers,
       physicalKey: physicalKey,
       phase: phase,
-      virtualKeyCode: keyCode
+      virtualKeyCode: keyCode,
+      timestamp: cgEvent.timestamp
     )
   }
 }

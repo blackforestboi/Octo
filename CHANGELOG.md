@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026.7.31
+
+### Patch Changes
+
+- Move active Agent Handoff progress into the menu bar with live task status, pending counts, unread completion indicators, and a curved transition from the recording pill.
+- Add OpenRouter model shortlists and separate rewrite and handoff model, thinking, and enablement settings.
+- Prevent delayed hotkey releases from accidentally triggering Screen Aware.
+
 ## 2026.7.30
 
 ### Minor Changes

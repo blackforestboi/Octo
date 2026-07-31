@@ -252,18 +252,50 @@ struct TranscriptionFeature {
 	}
 
 	struct AgentHandoffPresentation: Equatable {
+		var handoffID: UUID?
 		var label: String
 		/// Claude creates a coordinator in addition to the task agents. Keep it
 		/// separate so launch progress only counts the handoffs the user can act on.
 		var coordinatorThread: AgentHandoffThread?
 		var threads: [AgentHandoffThread] = []
 		var expectedTaskCount = 0
-		/// The handoff is successful once every child task has been created and its
-		/// turn has started. Its eventual execution state lives in the handoff journal.
+		/// The pill can depart once the coordinator request has been submitted. Task
+		/// preparation then continues in the menu-bar handoff status list.
 		var hasLaunched = false
 		var isReady = false
 		var isDeparting = false
 		var isFlying = false
+
+		init(
+			handoffID: UUID? = nil,
+			label: String,
+			coordinatorThread: AgentHandoffThread? = nil,
+			threads: [AgentHandoffThread] = [],
+			expectedTaskCount: Int = 0,
+			hasLaunched: Bool = false,
+			isReady: Bool = false,
+			isDeparting: Bool = false,
+			isFlying: Bool = false
+		) {
+			self.handoffID = handoffID
+			self.label = label
+			self.coordinatorThread = coordinatorThread
+			self.threads = threads
+			self.expectedTaskCount = expectedTaskCount
+			self.hasLaunched = hasLaunched
+			self.isReady = isReady
+			self.isDeparting = isDeparting
+			self.isFlying = isFlying
+		}
+	}
+
+	struct AgentHandoffProcessingStatus: Equatable, Identifiable {
+		let id: UUID
+		let provider: AgentHandoffRequest.Provider
+		var label: String
+		var coordinatorThread: AgentHandoffThread?
+		var threads: [AgentHandoffThread] = []
+		var expectedTaskCount = 0
 	}
 
   @ObservableState
@@ -303,6 +335,11 @@ struct TranscriptionFeature {
 		/// post-hold refinement gesture even after it has been pasted.
 		var recentCompletedTranscript: RecentCompletedTranscript?
 		var agentHandoffPresentation: AgentHandoffPresentation?
+		var agentHandoffProcessingStatuses: IdentifiedArrayOf<AgentHandoffProcessingStatus> = []
+		/// Process-local handoff runs and the child threads Octo is actively observing.
+		/// Unlike the durable journal, this cannot retain stale `.running` entries
+		/// from an earlier app process.
+		var agentHandoffActiveThreads: [UUID: Set<AgentHandoffThread>] = [:]
 		/// Set only by the Shift-modified ending gesture for the active ordinary recording.
 		var isAgentHandoffRequestedForActiveRecording = false
 		var postHocRefinement: RecentCompletedTranscript?
@@ -347,9 +384,6 @@ struct TranscriptionFeature {
 		case cancelPendingPressAndHold
 		case armTerminalRefinement
 		case terminalRefinementActivated(UUID)
-		case armScreenAwareActivation
-		case screenAwareActivationThresholdReached
-		case cancelScreenAwareActivation
     case hotKeyPressed
     case hotKeyReleased(RecordingSource)
 			case refinedHotKeyPressed
@@ -398,13 +432,16 @@ struct TranscriptionFeature {
 	case dismissError
 	case pasteCompletedTranscript(String)
 	case launchAgentHandoff(AgentHandoffRequest)
-	case agentHandoffEvent(AgentHandoffEvent)
-	case agentHandoffFailed(String)
+	case agentHandoffEvent(UUID, AgentHandoffEvent)
+	case agentHandoffFailed(UUID?, String)
 	case openAgentHandoff
 	case dismissAgentHandoff
 	case agentHandoffPresentationExpired
 	case agentHandoffCollapseFinished
 	case agentHandoffDepartureFinished
+	#if DEBUG
+	case debugAgentHandoffAnimation
+	#endif
 	case showCompletedTranscript(String)
 	case copyCompletedTranscript
 	case dismissCompletedTranscript
@@ -415,7 +452,7 @@ struct TranscriptionFeature {
     case modelMissing
   }
 
-  enum CancelID {
+  enum CancelID: Hashable {
     case metering
     case recordingStart
     /// Trivial cleanup work that owns no temp WAV (the discard path's removeItem call).
@@ -426,8 +463,11 @@ struct TranscriptionFeature {
     case recordingFinalize
     case transcription
 		case postHocRefinement
-	case agentHandoff
+	case agentHandoff(UUID)
 	case agentHandoffPresentation
+	#if DEBUG
+	case debugAgentHandoff
+	#endif
 		case selectedTextOnlyRefinement
 		case selectedTextRefinement
 		case errorPresentation
@@ -518,25 +558,6 @@ struct TranscriptionFeature {
 			state.pendingTerminalRefinementID = nil
 			return .send(.finishRecordingWithRefinement)
 
-		case .armScreenAwareActivation:
-			guard state.isRecording, state.activeRecordingSource == .regular else { return .none }
-			let holdDuration = ScreenAwareActivation.holdDuration(for: state.hexSettings)
-			return .run { [clock] send in
-				try await clock.sleep(for: .seconds(holdDuration))
-				await send(.screenAwareActivationThresholdReached)
-			}
-			.cancellable(id: CancelID.screenAwareActivation, cancelInFlight: true)
-
-		case .screenAwareActivationThresholdReached:
-			guard state.isRecording,
-				state.activeRecordingSource == .regular,
-				!state.isScreenAwareModeActive
-			else { return .none }
-			return .send(.screenAwareModeActivated)
-
-		case .cancelScreenAwareActivation:
-			return .cancel(id: CancelID.screenAwareActivation)
-
       case .hotKeyPressed:
 		state.pendingPressAndHoldActivationID = nil
 		// Start recording immediately. Selection detection is deliberately parallel:
@@ -545,6 +566,7 @@ struct TranscriptionFeature {
 		if !state.isRecording,
 			!state.isTranscribing,
 			!state.isRefining,
+			state.hexSettings.refinementEnabled,
 			state.hexSettings.includeSelectedTextInRefinement
 		{
 			let startRecording = handleStartRecording(&state, source: .regular)
@@ -662,13 +684,16 @@ struct TranscriptionFeature {
 					)
 
 				case .finishRecordingWithAgentHandoff:
-					guard state.isRecording, state.activeRecordingSource == .regular else { return .none }
+					guard state.hexSettings.agentHandoffEnabled,
+						state.isRecording,
+						state.activeRecordingSource == .regular
+					else { return .none }
 					state.pendingTerminalRefinementID = nil
 					state.isAgentHandoffRequestedForActiveRecording = true
 					// Keep the existing overlay alive while local transcription finishes.
 					// Without this, its panel briefly receives the hidden state before the
 					// handoff stream starts, making the progress indicator look like a new pill.
-					state.agentHandoffPresentation = .init(label: "Preparing agent handoff")
+					state.agentHandoffPresentation = .init(label: "Processing")
 					return .merge(
 						.cancel(id: CancelID.terminalRefinementHold),
 						.cancel(id: CancelID.screenAwareActivation),
@@ -1099,75 +1124,128 @@ struct TranscriptionFeature {
 			return .cancel(id: CancelID.errorPresentation)
 
 		case let .launchAgentHandoff(request):
+			let handoffID = uuid()
+			state.agentHandoffActiveThreads[handoffID] = []
+			state.agentHandoffProcessingStatuses.append(.init(
+				id: handoffID,
+				provider: request.provider,
+				label: "Starting coordinator"
+			))
 			if state.agentHandoffPresentation == nil {
-				state.agentHandoffPresentation = .init(label: "Preparing agent handoff")
+				state.agentHandoffPresentation = .init(
+					handoffID: handoffID,
+					label: "Processing"
+				)
+			} else if state.agentHandoffPresentation?.handoffID == nil {
+				state.agentHandoffPresentation?.handoffID = handoffID
+				state.agentHandoffPresentation?.label = "Processing"
 			}
 			return .run { [agentHandoff] send in
 				do {
 					for try await event in agentHandoff.launch(request) {
-						await send(.agentHandoffEvent(event))
+						await send(.agentHandoffEvent(handoffID, event))
 					}
 				} catch is CancellationError {
 					return
 				} catch {
-					await send(.agentHandoffFailed(error.localizedDescription))
+					await send(.agentHandoffFailed(handoffID, error.localizedDescription))
 				}
 			}
-			.cancellable(id: CancelID.agentHandoff, cancelInFlight: true)
+			.cancellable(id: CancelID.agentHandoff(handoffID))
 
-		case let .agentHandoffEvent(event):
-			guard var presentation = state.agentHandoffPresentation else { return .none }
-			var shouldDismissPresentation = false
+		case let .agentHandoffEvent(handoffID, event):
+			if case let .childStarted(thread, _) = event,
+				state.agentHandoffActiveThreads[handoffID] != nil
+			{
+				state.agentHandoffActiveThreads[handoffID, default: []].insert(thread)
+			} else if case .completed = event {
+				state.agentHandoffActiveThreads.removeValue(forKey: handoffID)
+			}
+			guard var processingStatus = state.agentHandoffProcessingStatuses[id: handoffID] else {
+				return .none
+			}
+			var presentation = state.agentHandoffPresentation?.handoffID == handoffID
+				? state.agentHandoffPresentation
+				: nil
+			var shouldBeginDeparture = false
+			var shouldRemoveProcessingStatus = false
 			switch event {
 			case .received:
-				presentation.label = "Agent handoff received"
+				processingStatus.label = "Starting coordinator"
 			case .processing:
-				presentation.label = "Preparing tasks"
+				processingStatus.label = "Starting coordinator"
+			case .coordinatorSubmitted:
+				processingStatus.label = "Waiting for tasks"
+				if presentation?.hasLaunched == false {
+					presentation?.hasLaunched = true
+					presentation?.isReady = true
+					presentation?.isDeparting = true
+					shouldBeginDeparture = true
+				}
 			case let .coordinatorStarted(thread):
-				presentation.coordinatorThread = thread
-				presentation.label = "Creating task packages"
+				processingStatus.coordinatorThread = thread
+				processingStatus.label = "Waiting for tasks"
+				if presentation?.hasLaunched == false {
+					presentation?.hasLaunched = true
+					presentation?.isReady = true
+					presentation?.isDeparting = true
+					shouldBeginDeparture = true
+				}
 			case let .tasksFound(count):
-				presentation.expectedTaskCount = count
-				presentation.label = "Found \(count) \(count == 1 ? "task" : "tasks")"
+				processingStatus.expectedTaskCount = count
+				processingStatus.label = "Waiting for tasks"
 			case let .childStarted(thread, _):
-				if !presentation.threads.contains(thread) {
-					presentation.threads.append(thread)
+				if !processingStatus.threads.contains(thread) {
+					processingStatus.threads.append(thread)
 				}
-				let launchedCount = presentation.threads.count
-				let expectedCount = max(presentation.expectedTaskCount, launchedCount)
-				let hasJustLaunched = !presentation.hasLaunched && launchedCount == expectedCount
-				presentation.hasLaunched = launchedCount == expectedCount
-				if presentation.hasLaunched {
-						presentation.label = "Launched \(launchedCount) \(launchedCount == 1 ? "task" : "tasks")"
-						presentation.isReady = true
-						shouldDismissPresentation = hasJustLaunched
-					} else {
-						presentation.label = "Launching \(launchedCount) of \(expectedCount) tasks"
-					}
-			case .completed:
-				if !presentation.hasLaunched {
-					presentation.label = "Handoff completed"
-				}
-				presentation.isReady = true
-			}
-			state.agentHandoffPresentation = presentation
-			guard shouldDismissPresentation else { return .none }
-			return .run { [clock] send in
-				do {
-					try await clock.sleep(for: .seconds(2))
-					await send(.agentHandoffPresentationExpired)
-				} catch {
-					return
-				}
-			}
-			.cancellable(id: CancelID.agentHandoffPresentation, cancelInFlight: true)
+				shouldRemoveProcessingStatus = true
 
-		case let .agentHandoffFailed(message):
-			state.agentHandoffPresentation = nil
-			return .merge(
-				.cancel(id: CancelID.agentHandoffPresentation),
-				.send(.showError(message))
-			)
+				// The journal has registered this child before emitting `childStarted`,
+				// so it is now represented under Recent Handoffs. Remove the temporary
+				// waiting row instead of keeping a stale "Launched" status around.
+				if presentation?.hasLaunched == false {
+					presentation?.hasLaunched = true
+					presentation?.isReady = true
+					presentation?.isDeparting = true
+					shouldBeginDeparture = true
+				}
+			case .completed:
+				processingStatus.label = "Handoff completed"
+				shouldRemoveProcessingStatus = true
+				if presentation?.hasLaunched == false {
+					presentation?.hasLaunched = true
+					presentation?.isReady = true
+					presentation?.isDeparting = true
+					shouldBeginDeparture = true
+				}
+			}
+
+			if shouldRemoveProcessingStatus {
+				state.agentHandoffProcessingStatuses.remove(id: handoffID)
+			} else {
+				state.agentHandoffProcessingStatuses[id: handoffID] = processingStatus
+			}
+			if let presentation {
+				state.agentHandoffPresentation = presentation
+			}
+			return shouldBeginDeparture ? .send(.agentHandoffPresentationExpired) : .none
+
+		case let .agentHandoffFailed(handoffID, message):
+			if let handoffID {
+				state.agentHandoffProcessingStatuses.remove(id: handoffID)
+				state.agentHandoffActiveThreads.removeValue(forKey: handoffID)
+			}
+			let ownsPresentation = handoffID == nil
+				|| state.agentHandoffPresentation?.handoffID == handoffID
+			if ownsPresentation {
+				state.agentHandoffPresentation = nil
+			}
+			return ownsPresentation
+				? .merge(
+					.cancel(id: CancelID.agentHandoffPresentation),
+					.send(.showError(message))
+				)
+				: .send(.showError(message))
 
 		case .openAgentHandoff:
 			guard let presentation = state.agentHandoffPresentation,
@@ -1211,6 +1289,38 @@ struct TranscriptionFeature {
 			guard state.agentHandoffPresentation?.isFlying == true else { return .none }
 			state.agentHandoffPresentation = nil
 			return .cancel(id: CancelID.agentHandoffPresentation)
+
+		#if DEBUG
+		case .debugAgentHandoffAnimation:
+			transcriptionFeatureLogger.debug("Previewing the agent handoff departure animation")
+			let handoffID = UUID(uuidString: "00000000-0000-0000-0000-0000000000D1")!
+			state.agentHandoffProcessingStatuses.remove(id: handoffID)
+			state.agentHandoffProcessingStatuses.append(.init(
+				id: handoffID,
+				provider: .codex,
+				label: "Starting coordinator"
+			))
+			state.agentHandoffPresentation = .init(
+				handoffID: handoffID,
+				label: "Processing"
+			)
+			return .run { [clock] send in
+				do {
+					try await clock.sleep(for: .milliseconds(300))
+					await send(.agentHandoffEvent(handoffID, .coordinatorSubmitted))
+					try await clock.sleep(for: .milliseconds(700))
+					await send(.agentHandoffEvent(handoffID, .tasksFound(2)))
+					try await clock.sleep(for: .milliseconds(650))
+					await send(.agentHandoffEvent(
+						handoffID,
+						.childStarted(.codex("debug-first"), ordinal: 1)
+					))
+				} catch {
+					return
+				}
+			}
+			.cancellable(id: CancelID.debugAgentHandoff, cancelInFlight: true)
+		#endif
 
 		case let .pasteCompletedTranscript(text):
 			return .run { [pasteboard, soundEffect] send in
@@ -1281,7 +1391,7 @@ struct TranscriptionFeature {
 			}
 			if state.agentHandoffPresentation != nil {
 				state.agentHandoffPresentation = nil
-				return .cancel(id: CancelID.agentHandoff)
+				return .cancel(id: CancelID.agentHandoffPresentation)
 			}
         // Only cancel if we're in the middle of recording, transcribing, or post-processing
         guard state.isRecording || state.isTranscribing || state.isRefining || state.isCapturingSelectedTextForRefinement else {
@@ -1356,27 +1466,40 @@ private extension TranscriptionFeature {
 
         // Always keep hotKeyProcessor in sync with current user hotkey preference
         hotKeyProcessor.hotkey = hexSettings.hotkey
-	        let supportsScreenAwareGesture = ScreenAwareActivation.isAvailable(with: hexSettings)
+		let supportsScreenAwareGesture = hexSettings.refinementEnabled
+			&& ScreenAwareActivation.isAvailable(with: hexSettings)
 	        let useDoubleTapOnly = hexSettings.doubleTapLockEnabled
 	          && hexSettings.useDoubleTapOnly
 	        hotKeyProcessor.doubleTapLockEnabled = hexSettings.doubleTapLockEnabled
 	        hotKeyProcessor.useDoubleTapOnly = useDoubleTapOnly
 	        hotKeyProcessor.allowLongPressForOnDemand = hexSettings.allowLongPressForOnDemand
-	        hotKeyProcessor.lockingHoldDuration = max(
-	          hexSettings.minimumKeyTime,
-	          ScreenAwareActivation.minimumHoldDuration
-	        )
+		hotKeyProcessor.lockingHoldDuration = hexSettings.refinementEnabled
+			? max(hexSettings.minimumKeyTime, ScreenAwareActivation.minimumHoldDuration)
+			: nil
 	        hotKeyProcessor.screenAwareSecondTapEnabled = supportsScreenAwareGesture
-        hotKeyProcessor.postHoldRefinementEnabled = !hexSettings.doubleTapLockEnabled
+		hotKeyProcessor.postHoldRefinementEnabled = hexSettings.refinementEnabled
+			&& !hexSettings.doubleTapLockEnabled
         hotKeyProcessor.minimumKeyTime = hexSettings.minimumKeyTime
 
-        switch inputEvent {
-        case .keyboard(let keyEvent):
+		switch inputEvent {
+		case .keyboard(let keyEvent):
+		  #if DEBUG
+		  if keyEvent.physicalKey == .one,
+			 keyEvent.modifiers.matchesExactly([.command])
+		  {
+			  if keyEvent.isKeyDown {
+				  Task { await send(.debugAgentHandoffAnimation) }
+			  }
+			  return true
+		  }
+		  #endif
+
 		  if rewritePromptHoldTracker.hasTriggered() {
 			  hotKeyProcessor.reset()
 		  }
 
-		  if let promptNumber = rewritePromptNumber(for: keyEvent.physicalKey),
+		  if hexSettings.refinementEnabled,
+			 let promptNumber = rewritePromptNumber(for: keyEvent.physicalKey),
 			 keyEvent.modifiers.isEmpty
 		  {
 			  if keyEvent.isKeyDown,
@@ -1438,6 +1561,7 @@ private extension TranscriptionFeature {
           }
 
 
+		  if hexSettings.agentHandoffEnabled {
 		  switch agentHandoffEndingGesture(
 			for: keyEvent,
 			hotkey: hexSettings.hotkey,
@@ -1451,6 +1575,7 @@ private extension TranscriptionFeature {
 			return false
 		  case .none:
 			break
+		  }
 		  }
 
 		  // Process the key event
@@ -1474,10 +1599,7 @@ private extension TranscriptionFeature {
 			return useDoubleTapOnly || keyEvent.key != nil
 
 		  case .startRecordingAndArmScreenAware:
-			Task {
-				await send(.hotKeyPressed)
-				await send(.armScreenAwareActivation)
-			}
+			Task { await send(.hotKeyPressed) }
 			return useDoubleTapOnly || keyEvent.key != nil
 
 		  case .stopRecording:
@@ -1487,8 +1609,6 @@ private extension TranscriptionFeature {
 		  case .locked:
 			if hotKeyProcessor.isLongPressLocked, supportsScreenAwareGesture {
 				Task { await send(.screenAwareModeActivated) }
-			} else {
-				Task { await send(.cancelScreenAwareActivation) }
 			}
 			return false
 
@@ -2186,6 +2306,7 @@ private extension TranscriptionFeature {
 		screenAwareInputSource: ScreenAwareInputSource?,
 		settings: HexSettings
 	) -> AgentHandoffRequest? {
+		guard settings.agentHandoffEnabled else { return nil }
 		let provider: AgentHandoffRequest.Provider?
 		switch settings.agentHandoffProvider {
 		case .codexCLI:
@@ -2199,6 +2320,7 @@ private extension TranscriptionFeature {
 		return .init(
 			provider: provider,
 			modelID: settings.agentHandoffModelID,
+			reasoningEffort: settings.agentHandoffReasoningEffort,
 			transcript: transcript,
 			selectedText: selectedText,
 			screenContext: screenContext,
@@ -2421,11 +2543,11 @@ private extension TranscriptionFeature {
 					historyCheckpointID: historyCheckpointID
 				)
 				guard let handoffRequest else {
-					await send(.agentHandoffFailed(AgentHandoffError.providerUnavailable.localizedDescription))
+					await send(.agentHandoffFailed(nil, AgentHandoffError.providerUnavailable.localizedDescription))
 					return
 				}
 				guard handoffRequest.hasUserRequest else {
-					await send(.agentHandoffFailed(AgentHandoffError.noUserRequest.localizedDescription))
+					await send(.agentHandoffFailed(nil, AgentHandoffError.noUserRequest.localizedDescription))
 					return
 				}
 				await send(.launchAgentHandoff(handoffRequest))

@@ -4,6 +4,7 @@ import SwiftUI
 /// Searches the locally cached OpenRouter catalog while refreshing it in the background.
 struct OpenRouterModelPickerView: View {
 	@Binding var selectedModelID: String?
+	@Binding var shortlistedModelIDs: [String]
 	let apiKey: String
 	let requiredInputModality: OpenRouterModel.InputModality
 	@Environment(\.dismiss) private var dismiss
@@ -31,31 +32,26 @@ struct OpenRouterModelPickerView: View {
 				} else if displayedModels.isEmpty {
 					ContentUnavailableView.search(text: searchText)
 				} else {
-					List(displayedModels) { model in
-						Button {
-							selectedModelID = model.id
-							dismiss()
-						} label: {
-							HStack(spacing: 12) {
-								VStack(alignment: .leading, spacing: 3) {
-									Text(model.name)
-										.foregroundStyle(.primary)
-									Text(model.id)
-										.font(.caption)
-										.foregroundStyle(.secondary)
-								}
-								Spacer()
-								Text(inputPrice(for: model))
-									.font(.caption)
-									.foregroundStyle(.secondary)
-								if selectedModelID == model.id {
-									Image(systemName: "checkmark")
-										.foregroundStyle(.tint)
+					List {
+						if !shortlistedModels.isEmpty {
+							Section("Shortlisted") {
+								ForEach(shortlistedModels) { model in
+									modelRow(model)
 								}
 							}
-							.contentShape(Rectangle())
 						}
-						.buttonStyle(.plain)
+
+						if shortlistedModels.isEmpty {
+							ForEach(displayedModels) { model in
+								modelRow(model)
+							}
+						} else {
+							Section("All Models") {
+								ForEach(displayedModels) { model in
+									modelRow(model)
+								}
+							}
+						}
 					}
 				}
 			}
@@ -73,6 +69,50 @@ struct OpenRouterModelPickerView: View {
 		.task {
 			models = OpenRouterModelCatalog.cachedModels()
 			refresh()
+		}
+	}
+
+	@ViewBuilder
+	private func modelRow(_ model: OpenRouterModel) -> some View {
+		HStack(spacing: 12) {
+			Button {
+				toggleShortlist(for: model.id)
+			} label: {
+				if isShortlisted(model.id) {
+					Image(systemName: "minus.circle.fill")
+						.foregroundStyle(.secondary)
+				} else {
+					Image(systemName: "plus.circle")
+						.foregroundStyle(.tint)
+				}
+			}
+			.buttonStyle(.plain)
+			.accessibilityLabel(isShortlisted(model.id) ? "Remove \(model.name) from shortlist" : "Add \(model.name) to shortlist")
+
+			Button {
+				selectedModelID = model.id
+				dismiss()
+			} label: {
+				HStack(spacing: 12) {
+					VStack(alignment: .leading, spacing: 3) {
+						Text(model.name)
+							.foregroundStyle(.primary)
+						Text(model.id)
+							.font(.caption)
+							.foregroundStyle(.secondary)
+					}
+					Spacer()
+					Text(inputPrice(for: model))
+						.font(.caption)
+						.foregroundStyle(.secondary)
+					if selectedModelID == model.id {
+						Image(systemName: "checkmark")
+							.foregroundStyle(.tint)
+					}
+				}
+				.contentShape(Rectangle())
+			}
+			.buttonStyle(.plain)
 		}
 	}
 
@@ -130,6 +170,22 @@ struct OpenRouterModelPickerView: View {
 				}
 			}
 		})
+	}
+
+	private var shortlistedModels: [OpenRouterModel] {
+		filteredModels.filter { isShortlisted($0.id) }
+	}
+
+	private func isShortlisted(_ modelID: String) -> Bool {
+		shortlistedModelIDs.contains(modelID)
+	}
+
+	private func toggleShortlist(for modelID: String) {
+		if let index = shortlistedModelIDs.firstIndex(of: modelID) {
+			shortlistedModelIDs.remove(at: index)
+		} else {
+			shortlistedModelIDs.append(modelID)
+		}
 	}
 
 	private func refresh() {

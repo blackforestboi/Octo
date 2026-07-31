@@ -8,7 +8,7 @@ private let cacheLogger = HexLog.caches
 class HexAppDelegate: NSObject, NSApplicationDelegate {
 	var invisibleWindow: InvisibleWindow?
 	var settingsWindow: NSWindow?
-	var statusItem: NSStatusItem!
+	private(set) var menuBarStatusItemController: MenuBarStatusItemController?
 	private var launchedAtLogin = false
 
 	@Dependency(\.soundEffects) var soundEffect
@@ -42,6 +42,11 @@ class HexAppDelegate: NSObject, NSApplicationDelegate {
 
 		// Set activation policy first
 		updateAppMode()
+		// AppKit delivers this lifecycle callback on the main thread, but the
+		// legacy delegate protocol is not actor-annotated in Swift 5 mode.
+		MainActor.assumeIsolated {
+			configureMenuBarStatusItem()
+		}
 
 		// Add notification observer
 		NotificationCenter.default.addObserver(
@@ -94,6 +99,12 @@ class HexAppDelegate: NSObject, NSApplicationDelegate {
 		}
 	}
 
+	@MainActor
+	private func configureMenuBarStatusItem() {
+		guard menuBarStatusItemController == nil else { return }
+		menuBarStatusItemController = MenuBarStatusItemController(appDelegate: self)
+	}
+
 	/// Sets XDG_CACHE_HOME so FluidAudio stores models under our app's
 	/// Application Support folder, keeping everything in one place.
     private func configureLocalCaches() {
@@ -130,13 +141,16 @@ class HexAppDelegate: NSObject, NSApplicationDelegate {
 			onOpenHistory: { [weak self] in
 				self?.presentHistoryView()
 			},
-			onPillSizeChange: { [weak self] size in
-				self?.updatePillSize(size)
+			onPillSizeChange: { [weak self] size, preservingCenter in
+				self?.updatePillSize(size, preservingCenter: preservingCenter)
 			},
 			onAgentHandoffDeparture: { [weak self] in
 				// Let SwiftUI finish its status/layout update before the panel begins moving.
 				DispatchQueue.main.async {
-					self?.invisibleWindow?.animateAgentHandoffDeparture()
+					guard let self else { return }
+					self.invisibleWindow?.animateAgentHandoffDeparture(
+						to: self.menuBarStatusItemController?.frameInScreen
+					)
 				}
 			}
 		)
@@ -144,10 +158,11 @@ class HexAppDelegate: NSObject, NSApplicationDelegate {
 		invisibleWindow?.orderFrontRegardless()
 	}
 
-	private func updatePillSize(_ size: CGSize?) {
+	private func updatePillSize(_ size: CGSize?, preservingCenter: Bool = false) {
 		invisibleWindow?.update(
 			size: size,
-			location: hexSettings.indicatorLocation
+			location: hexSettings.indicatorLocation,
+			preservingCenter: preservingCenter
 		)
 	}
 

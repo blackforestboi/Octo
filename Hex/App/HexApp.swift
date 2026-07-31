@@ -1,7 +1,6 @@
 import ComposableArchitecture
 import Inject
 import Sparkle
-import AppKit
 import SwiftUI
 
 @main
@@ -12,53 +11,24 @@ struct HexApp: App {
 
 	@NSApplicationDelegateAdaptor(HexAppDelegate.self) var appDelegate
     var body: some Scene {
-        MenuBarExtra {
-            MenuBarCopyLastTranscriptButton()
-			MenuBarRefineSelectedTextButton()
-			MenuBarRefinementModelPicker()
-			MenuBarSpeakerIdentificationToggle()
-			MenuBarSystemAudioToggle()
-
-            Button("History") {
-                appDelegate.presentHistoryView()
-            }
-
-            Button("Settings…") {
-                appDelegate.presentSettingsView()
-            }.keyboardShortcut(",")
-
-			CheckForUpdatesView()
-
-			MenuBarRecentHandoffs()
-			
-			Divider()
-			
-			Button("Quit Octo") {
-				NSApplication.shared.terminate(nil)
-			}.keyboardShortcut("q")
-		} label: {
-			MenuBarHandoffStatusIcon(image: menuBarIconImage())
+		// AppKit owns the status item so its button window provides the icon's
+		// exact global frame. The Settings scene keeps SwiftUI's app/command
+		// lifecycle without creating a second menu-bar item.
+		Settings {
+			EmptyView()
 		}
 		.commands {
-			CommandGroup(after: .appInfo) {
-				CheckForUpdatesView()
-
+			CommandGroup(replacing: .appSettings) {
 				Button("Settings…") {
 					appDelegate.presentSettingsView()
 				}.keyboardShortcut(",")
 			}
 
+			CommandGroup(after: .appInfo) {
+				CheckForUpdatesView()
+			}
+
 			CommandGroup(replacing: .help) {}
 		}
-	}
-
-	private func menuBarIconImage() -> NSImage? {
-		guard let image = NSImage(named: "OctoMenuBarIcon"), image.size.width > 0 else {
-			return nil
-		}
-
-		let ratio = image.size.height / image.size.width
-		image.size = NSSize(width: 20 / ratio, height: 20)
-		return image
 	}
 }

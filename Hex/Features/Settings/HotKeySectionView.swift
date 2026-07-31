@@ -148,10 +148,10 @@ struct HotKeySectionView: View {
 				}
 			}
 
-			if hotKey.modifiers.contains(.shift) {
+			if store.hexSettings.agentHandoffEnabled, hotKey.modifiers.contains(.shift) {
 				Text("Agent Handoff is unavailable because this hotkey already includes Shift.")
 					.settingsCaption()
-			} else {
+			} else if store.hexSettings.agentHandoffEnabled {
 				Text("Use Shift with this hotkey to end a recording as an Agent Handoff. It creates native Codex or Claude tasks instead of pasting the transcript.")
 					.settingsCaption()
 			}
@@ -190,28 +190,43 @@ struct HotKeySectionView: View {
     }
 
     private var hotKeySequences: [HotKeySequence] {
+        let refinementEnabled = store.hexSettings.refinementEnabled
+		let agentHandoffEnabled = store.hexSettings.agentHandoffEnabled
         if store.hexSettings.doubleTapLockEnabled {
-            ((!store.hexSettings.useDoubleTapOnly || store.hexSettings.allowLongPressForOnDemand)
-				? [HotKeySequence(title: String(localized: "Start on-demand transcription or insta-refine selected text"), presses: [.long])]
+			return ((!store.hexSettings.useDoubleTapOnly || store.hexSettings.allowLongPressForOnDemand)
+				? [HotKeySequence(title: String(localized: refinementEnabled ? "Start on-demand transcription or insta-refine selected text" : "Start on-demand transcription"), presses: [.long])]
                 : []) + [
                 HotKeySequence(title: String(localized: "Start hands-free transcription"), presses: [.short, .short]),
-                HotKeySequence(title: String(localized: "Start screen-aware transcription"), presses: [.short, .long]),
                 HotKeySequence(title: String(localized: "Finish normally"), presses: [.short]),
+			] + (refinementEnabled ? [
+				HotKeySequence(title: String(localized: "Start screen-aware transcription"), presses: [.short, .long]),
                 HotKeySequence(title: String(localized: "Finish with refinement"), presses: [.long]),
 				HotKeySequence(
 					title: String(localized: "Finish with rewrite prompt"),
 					presses: [.numberRange, .long],
 					usesPlusSeparator: true
 				),
-            ]
+			] : []) + agentHandoffSequence(enabled: agentHandoffEnabled)
         } else {
-            [
+			return [
                 HotKeySequence(title: String(localized: "Transcribe while held"), presses: [.long]),
+			] + (refinementEnabled ? [
                 HotKeySequence(title: String(localized: "Start screen-aware transcription"), presses: [.short, .long]),
                 HotKeySequence(title: String(localized: "Refine the last transcription"), presses: [.long, .short]),
-            ]
+			] : []) + agentHandoffSequence(enabled: agentHandoffEnabled)
         }
     }
+
+	private func agentHandoffSequence(enabled: Bool) -> [HotKeySequence] {
+		guard enabled, !store.hexSettings.hotkey.modifiers.contains(.shift) else { return [] }
+		return [
+			HotKeySequence(
+				title: String(localized: "Finish with Agent Handoff"),
+				presses: [.shift, .long],
+				usesPlusSeparator: true
+			),
+		]
+	}
 }
 
 private struct HotKeySequence {
@@ -222,15 +237,18 @@ private struct HotKeySequence {
 
 private enum HotKeyPressKind: Equatable {
     case long
-    case short
+	case short
+	case shift
 	case numberRange
 
     var label: String {
         switch self {
         case .long:
             String(localized: "Long")
-        case .short:
-            String(localized: "Short")
+		case .short:
+			String(localized: "Short")
+		case .shift:
+			String(localized: "Shift")
 		case .numberRange:
 			String(localized: "1 through 9")
         }
@@ -240,8 +258,10 @@ private enum HotKeyPressKind: Equatable {
         switch self {
         case .long:
             54
-        case .short:
-            28
+		case .short:
+			28
+		case .shift:
+			44
 		case .numberRange:
 			54
         }
@@ -251,8 +271,10 @@ private enum HotKeyPressKind: Equatable {
         switch self {
         case .long:
             64
-        case .short:
-            44
+		case .short:
+			44
+		case .shift:
+			54
 		case .numberRange:
 			64
         }
@@ -264,6 +286,7 @@ private struct HotKeyPressPill: View {
     var showsLabel = false
 
     var body: some View {
+		let usesKeyboardKeyStyle = kind == .numberRange || kind == .shift
         Group {
 			if case .numberRange = kind {
 				HStack(spacing: 4) {
@@ -272,7 +295,14 @@ private struct HotKeyPressPill: View {
 				}
 				.font(.caption.weight(.medium))
 				.foregroundStyle(.secondary)
-            } else if showsLabel {
+			} else if case .shift = kind {
+				HStack(spacing: 4) {
+					Image(systemName: "keyboard")
+					Text(kind.label)
+				}
+					.font(.caption.weight(.medium))
+					.foregroundStyle(.secondary)
+			} else if showsLabel {
                 Text(kind.label)
                     .font(.caption.weight(.medium))
                     .foregroundStyle(.secondary)
@@ -282,17 +312,17 @@ private struct HotKeyPressPill: View {
             }
         }
         .frame(
-            width: showsLabel || kind == .numberRange ? kind.labeledWidth : kind.width,
-            height: showsLabel || kind == .numberRange ? 20 : 10
+            width: showsLabel || usesKeyboardKeyStyle ? kind.labeledWidth : kind.width,
+            height: showsLabel || usesKeyboardKeyStyle ? 20 : 10
         )
         .background {
-			if showsLabel || kind == .numberRange {
+			if showsLabel || usesKeyboardKeyStyle {
                 Capsule()
                     .fill(.secondary.opacity(0.12))
             }
         }
         .overlay {
-			if showsLabel || kind == .numberRange {
+			if showsLabel || usesKeyboardKeyStyle {
                 Capsule()
                     .stroke(.secondary.opacity(0.22), lineWidth: 1)
             }

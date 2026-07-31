@@ -31,6 +31,9 @@ public struct KeyEvent {
     /// Sauce does not model modifier keys as `Key` values, so this preserves the
     /// source key for callers that need to distinguish Shift from another modifier.
     public let virtualKeyCode: Int?
+    /// Monotonic timestamp supplied by the originating macOS event, in nanoseconds
+    /// since startup. Synthetic events may omit it.
+    public let timestamp: UInt64?
 
     public var isKeyDown: Bool { phase == .keyDown }
     public var isKeyUp: Bool { phase == .keyUp }
@@ -40,12 +43,14 @@ public struct KeyEvent {
         modifiers: Modifiers,
         physicalKey: Key? = nil,
         phase: KeyEventPhase? = nil,
-        virtualKeyCode: Int? = nil
+        virtualKeyCode: Int? = nil,
+        timestamp: UInt64? = nil
     ) {
         self.key = key
         self.modifiers = modifiers
         self.physicalKey = physicalKey ?? key
         self.phase = phase ?? (key == nil ? .other : .keyDown)
         self.virtualKeyCode = virtualKeyCode
+        self.timestamp = timestamp
     }
 }

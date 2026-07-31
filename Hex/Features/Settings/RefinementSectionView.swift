@@ -42,14 +42,16 @@ struct RefinementSectionView: View {
 
 	var body: some View {
 		Section {
-			Label {
-				Toggle("Include selected text", isOn: $store.hexSettings.includeSelectedTextInRefinement)
-			} icon: {
-				Image(systemName: "text.cursor")
-			}
-
-			Label {
-				Picker("Quick refinement provider", selection: $store.hexSettings.refinementProvider) {
+			VStack(alignment: .leading, spacing: 8) {
+				HStack {
+					Label("Refinement", systemImage: "wand.and.stars")
+						.font(.headline)
+					Spacer()
+					Toggle("Enable Refinement", isOn: $store.hexSettings.refinementEnabled)
+						.labelsHidden()
+				}
+				if store.hexSettings.refinementEnabled {
+				Picker("Provider", selection: $store.hexSettings.refinementProvider) {
 					Text("Apple Intelligence").tag(RefinementProvider.apple)
 					Text("Gemini Flash API").tag(RefinementProvider.gemini)
 					Text("OpenRouter API").tag(RefinementProvider.openRouter)
@@ -58,30 +60,16 @@ struct RefinementSectionView: View {
 					Text("OpenAI Subscription").tag(RefinementProvider.codexCLI)
 					Text("Claude Subscription").tag(RefinementProvider.claudeCLI)
 				}
-			} icon: {
-				Image(systemName: "cpu")
-			}
 
-			Label {
-				Picker("Reasoning", selection: $store.hexSettings.refinementReasoningEffort) {
+				Picker("Thinking", selection: $store.hexSettings.refinementReasoningEffort) {
 					ForEach(RefinementReasoningEffort.allCases, id: \.self) { effort in
 						Text(effort.displayName).tag(effort)
 					}
 				}
-			} icon: {
-				Image(systemName: "brain")
-			}
-			Text("Sets the requested thinking level for refinement. Availability varies by provider and selected model.")
-				.font(.caption)
-				.foregroundStyle(.secondary)
-
 				if store.hexSettings.refinementProvider == .apple {
 					LabeledContent("Model") {
 						Text("Apple Intelligence default")
 					}
-					Text("Uses Apple Intelligence on your Mac; audio is never sent.")
-						.font(.caption)
-						.foregroundStyle(.secondary)
 					if #unavailable(macOS 26.0) {
 						Text("Apple Intelligence refinement requires macOS 26 or later. Until then, Octo keeps the processed transcript unchanged.")
 							.font(.caption)
@@ -105,9 +93,6 @@ struct RefinementSectionView: View {
 						.frame(maxWidth: .infinity, alignment: .leading)
 						.contentShape(Rectangle())
 						.disabled(openAIAPIKey.isEmpty)
-						Text("Uses your OpenAI API key. Octo sends the completed refinement prompt, or a screen image when enabled; audio is never sent.")
-							.font(.caption)
-							.foregroundStyle(.secondary)
 					}
 					.listRowSeparator(.hidden)
 				}
@@ -128,9 +113,6 @@ struct RefinementSectionView: View {
 						.frame(maxWidth: .infinity, alignment: .leading)
 						.contentShape(Rectangle())
 						.disabled(anthropicAPIKey.isEmpty)
-						Text("Uses your Claude API key. Octo sends the completed refinement prompt, or a screen image when enabled; audio is never sent.")
-							.font(.caption)
-							.foregroundStyle(.secondary)
 					}
 					.listRowSeparator(.hidden)
 				}
@@ -141,9 +123,6 @@ struct RefinementSectionView: View {
 					LabeledContent("Model") {
 						Text("Gemini 3.1 Flash Lite")
 					}
-					Text("Uses your Gemini API key. Octo sends the completed refinement prompt to Google; audio is never sent.")
-						.font(.caption)
-						.foregroundStyle(.secondary)
 				}
 
 				if store.hexSettings.refinementProvider == .openRouter {
@@ -162,9 +141,6 @@ struct RefinementSectionView: View {
 						.frame(maxWidth: .infinity, alignment: .leading)
 						.contentShape(Rectangle())
 						.disabled(openRouterAPIKey.isEmpty)
-						Text("Uses your OpenRouter API key. Octo sends the completed refinement prompt to the selected model; audio is never sent.")
-							.font(.caption)
-							.foregroundStyle(.secondary)
 					}
 					.listRowSeparator(.hidden)
 				}
@@ -180,9 +156,6 @@ struct RefinementSectionView: View {
 						}
 						.frame(maxWidth: .infinity, alignment: .leading)
 						.contentShape(Rectangle())
-						Text("Uses your signed-in OpenAI subscription through the local Codex CLI. Octo sends only the completed refinement prompt; audio is never sent.")
-							.font(.caption)
-							.foregroundStyle(.secondary)
 					}
 				}
 
@@ -197,33 +170,43 @@ struct RefinementSectionView: View {
 						}
 						.frame(maxWidth: .infinity, alignment: .leading)
 						.contentShape(Rectangle())
-						Text("Uses your signed-in Claude subscription through the local Claude Code CLI. Octo sends only the completed refinement prompt; audio is never sent.")
-							.font(.caption)
-							.foregroundStyle(.secondary)
 					}
 				}
+				}
+
+			}
 
 				VStack(alignment: .leading, spacing: 8) {
-					Label("Agent Handoff", systemImage: "arrowshape.turn.up.right")
-						.font(.headline)
-					Picker("Handoff provider", selection: $store.hexSettings.agentHandoffProvider) {
+					HStack {
+						Label("Agent Handoff", systemImage: "arrowshape.turn.up.right")
+							.font(.headline)
+						Spacer()
+						Toggle("Enable Agent Handoff", isOn: $store.hexSettings.agentHandoffEnabled)
+							.labelsHidden()
+					}
+					if store.hexSettings.agentHandoffEnabled {
+					Picker("Provider", selection: $store.hexSettings.agentHandoffProvider) {
 						Text("OpenAI Subscription").tag(RefinementProvider.codexCLI)
 						Text("Claude Subscription").tag(RefinementProvider.claudeCLI)
+					}
+					Picker("Thinking", selection: $store.hexSettings.agentHandoffReasoningEffort) {
+						ForEach(RefinementReasoningEffort.allCases, id: \.self) { effort in
+							Text(effort.displayName).tag(effort)
+						}
 					}
 					Button {
 						isShowingAgentHandoffModelPicker = true
 					} label: {
-						LabeledContent("Handoff model") {
+						LabeledContent("Model") {
 							Text(store.hexSettings.agentHandoffModelID ?? handoffDefaultModelName)
 						}
 					}
-					.frame(maxWidth: .infinity, alignment: .leading)
-					.contentShape(Rectangle())
-					Text("Used only when Shift-finishing a recording creates an Agent Handoff. It does not change quick refinement.")
-						.font(.caption)
-						.foregroundStyle(.secondary)
-				}
+						.frame(maxWidth: .infinity, alignment: .leading)
+						.contentShape(Rectangle())
+					}
+					}
 
+			if store.hexSettings.refinementEnabled {
 			rewritePromptsSection
 
 					VStack(alignment: .leading, spacing: 8) {
@@ -288,6 +271,13 @@ struct RefinementSectionView: View {
 						}
 					}
 					.frame(maxWidth: .infinity, alignment: .leading)
+
+				Label {
+					Toggle("Include selected text", isOn: $store.hexSettings.includeSelectedTextInRefinement)
+				} icon: {
+					Image(systemName: "text.cursor")
+				}
+			}
 		} header: {
 			VStack(alignment: .leading, spacing: 4) {
 				Text("Transcription Refinement")
@@ -334,6 +324,7 @@ struct RefinementSectionView: View {
 			.sheet(isPresented: $isShowingOpenRouterModelPicker) {
 				OpenRouterModelPickerView(
 					selectedModelID: $store.hexSettings.openRouterModelID,
+					shortlistedModelIDs: $store.hexSettings.openRouterShortlistedModelIDs,
 					apiKey: openRouterAPIKey,
 					requiredInputModality: .text
 				)
@@ -341,6 +332,7 @@ struct RefinementSectionView: View {
 			.sheet(isPresented: $isShowingScreenAwareModelPicker) {
 				OpenRouterModelPickerView(
 					selectedModelID: $store.hexSettings.screenAwareOpenRouterModelID,
+					shortlistedModelIDs: $store.hexSettings.openRouterShortlistedModelIDs,
 					apiKey: openRouterAPIKey,
 					requiredInputModality: .image
 				)

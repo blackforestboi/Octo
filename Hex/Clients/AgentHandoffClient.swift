@@ -27,6 +27,7 @@ struct AgentHandoffRequest: Equatable, Sendable {
 
 	let provider: Provider
 	let modelID: String?
+	let reasoningEffort: RefinementReasoningEffort
 	let transcript: String
 	/// Text captured from the focused application before recording. When present,
 	/// this is the source material and `transcript` is the user's instruction for it,
@@ -37,13 +38,31 @@ struct AgentHandoffRequest: Equatable, Sendable {
 	let screenContext: ScreenContext?
 	let screenAwareInputSource: ScreenAwareInputSource
 
+	init(
+		provider: Provider,
+		modelID: String?,
+		reasoningEffort: RefinementReasoningEffort = .medium,
+		transcript: String,
+		selectedText: String?,
+		screenContext: ScreenContext?,
+		screenAwareInputSource: ScreenAwareInputSource
+	) {
+		self.provider = provider
+		self.modelID = modelID
+		self.reasoningEffort = reasoningEffort
+		self.transcript = transcript
+		self.selectedText = selectedText
+		self.screenContext = screenContext
+		self.screenAwareInputSource = screenAwareInputSource
+	}
+
 	var hasUserRequest: Bool {
 		let source = selectedText ?? transcript
 		return !source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
 	}
 }
 
-enum AgentHandoffThread: Equatable, Sendable {
+enum AgentHandoffThread: Equatable, Hashable, Sendable {
 	case codex(String)
 	case claude(String)
 }
@@ -120,6 +139,7 @@ extension Notification.Name {
 enum AgentHandoffEvent: Equatable, Sendable {
 	case received
 	case processing
+	case coordinatorSubmitted
 	case coordinatorStarted(AgentHandoffThread)
 	case tasksFound(Int)
 	case childStarted(AgentHandoffThread, ordinal: Int)
@@ -449,7 +469,12 @@ private enum CodexHandoffCoordinator {
 		// Retain the security scope while the planner discovers roots and the child
 		// runners begin inside those roots.
 		defer { _ = discoveryWorkspace }
-		let packages = try await plan(request, workspaceRoot: discoveryWorkspace.root, journal: journal)
+		let packages = try await plan(
+			request,
+			workspaceRoot: discoveryWorkspace.root,
+			journal: journal,
+			onSubmitted: { yield(.coordinatorSubmitted) }
+		)
 		let handoff = try journal.append(request: request, packages: packages)
 		let input = handoff.input ?? .init(request: request, screenshotPath: nil)
 		yield(.tasksFound(handoff.packages.count))
@@ -467,6 +492,7 @@ private enum CodexHandoffCoordinator {
 							package: package,
 							input: input,
 							modelID: request.modelID,
+							reasoningEffort: request.reasoningEffort,
 							projectRoot: projectRoot,
 							journal: journal,
 						onRegistered: { threadID in
@@ -490,7 +516,8 @@ private enum CodexHandoffCoordinator {
 	private static func plan(
 		_ request: AgentHandoffRequest,
 		workspaceRoot: URL,
-		journal: AgentHandoffJournal
+		journal: AgentHandoffJournal,
+		onSubmitted: @escaping @Sendable () -> Void
 	) async throws -> [AgentHandoffPackage] {
 		let executable = try executable(named: "codex", fallback: "/Applications/ChatGPT.app/Contents/Resources/codex")
 		let schemaURL = try journal.writePlannerSchema()
@@ -514,6 +541,13 @@ private enum CodexHandoffCoordinator {
 		if let modelID = request.modelID?.trimmingCharacters(in: .whitespacesAndNewlines), !modelID.isEmpty {
 			arguments.insert(contentsOf: ["--model", modelID], at: 1)
 		}
+		if request.reasoningEffort != .none {
+			arguments.insert(
+				contentsOf: ["--config", "model_reasoning_effort=\"\(request.reasoningEffort.rawValue)\""],
+				at: arguments.count - 1
+			)
+		}
+		onSubmitted()
 		let result = try await runProcess(
 			executable: executable,
 			arguments: arguments,
@@ -917,21 +951,25 @@ private final class AgentHandoffJournal: @unchecked Sendable {
 			guard let sessionURL = files.first(where: {
 				$0.pathExtension == "jsonl" && $0.lastPathComponent.localizedCaseInsensitiveContains(threadID)
 			}) else { continue }
-			guard let contents = try? String(contentsOf: sessionURL, encoding: .utf8),
-				let lastLine = contents.split(separator: "\n").last,
-				let data = lastLine.data(using: .utf8),
-				let event = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-				let payload = event["payload"] as? [String: Any],
-				let type = payload["type"] as? String
-			else { continue }
+			guard let contents = try? String(contentsOf: sessionURL, encoding: .utf8) else { continue }
+			// Codex writes bookkeeping records after a terminal task event, so the
+			// final JSONL line is not necessarily the lifecycle result. Walk backward
+			// to the newest terminal event instead.
+			for line in contents.split(separator: "\n").reversed() {
+				guard let data = line.data(using: .utf8),
+					let event = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+					let payload = event["payload"] as? [String: Any],
+					let type = payload["type"] as? String
+				else { continue }
 
-			switch type {
-			case "task_complete":
-				return (.completed, nil)
-			case "turn_aborted":
-				return (.failed, "Codex task was interrupted before completing.")
-			default:
-				continue
+				switch type {
+				case "task_complete":
+					return (.completed, nil)
+				case "turn_aborted":
+					return (.failed, "Codex task was interrupted before completing.")
+				default:
+					continue
+				}
 			}
 		}
 		return nil
@@ -1188,6 +1226,7 @@ private enum CodexChildRunner {
 		package: StoredAgentHandoffPackage,
 		input: StoredAgentHandoffInput,
 		modelID: String?,
+		reasoningEffort: RefinementReasoningEffort,
 		projectRoot: URL,
 		journal: AgentHandoffJournal,
 		onRegistered: @escaping @Sendable (String) -> Void
@@ -1256,13 +1295,17 @@ private enum CodexChildRunner {
 							"path": screenshotPath,
 						])
 					}
+					var turnParams: [String: Any] = [
+						"threadId": id,
+						"input": inputItems,
+					]
+					if reasoningEffort != .none {
+						turnParams["effort"] = reasoningEffort.rawValue
+					}
 					send([
 						"id": 3,
 						"method": "turn/start",
-						"params": [
-							"threadId": id,
-							"input": inputItems,
-						],
+						"params": turnParams,
 					])
 				}
 
@@ -1403,10 +1446,12 @@ private enum ClaudeHandoffCoordinator {
 		let arguments = ClaudeHandoffCommand.coordinatorLaunchArguments(
 			name: name,
 			modelID: request.modelID,
+			reasoningEffort: request.reasoningEffort,
 			coordinatorInstruction: HandoffPrompt.claudeCoordinatorInstruction(token: token),
 			userRequest: HandoffPrompt.userRequest(request, screenshotPath: screenshotURL?.path)
 		)
 
+		yield(.coordinatorSubmitted)
 		let result = try await runProcess(
 			executable: executable,
 			arguments: arguments,
@@ -1462,6 +1507,7 @@ enum ClaudeHandoffCommand {
 	static func coordinatorLaunchArguments(
 		name: String,
 		modelID: String?,
+		reasoningEffort: RefinementReasoningEffort,
 		coordinatorInstruction: String,
 		userRequest: String
 	) -> [String] {
@@ -1473,6 +1519,9 @@ enum ClaudeHandoffCommand {
 		]
 		if let modelID = modelID?.trimmingCharacters(in: .whitespacesAndNewlines), !modelID.isEmpty {
 			arguments.insert(contentsOf: ["--model", modelID], at: 0)
+		}
+		if reasoningEffort != .none {
+			arguments.insert(contentsOf: ["--effort", reasoningEffort.rawValue], at: 0)
 		}
 		return arguments
 	}

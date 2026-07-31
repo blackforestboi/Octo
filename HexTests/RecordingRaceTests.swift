@@ -1315,38 +1315,6 @@ final class RecordingRaceTests: XCTestCase {
 		await store.finish()
 	}
 
-	func testScreenAwareSecondTapActivatesAtThresholdBeforeRelease() async {
-		let clock = TestClock()
-		let now = Date(timeIntervalSince1970: 1_234)
-		let context = Self.makeScreenContext()
-		var state = Self.makeState()
-		state.isRecording = true
-		state.recordingStartTime = now
-		state.activeRecordingSource = .regular
-		let store = TestStore(initialState: state) {
-			TranscriptionFeature()
-		} withDependencies: {
-			$0.continuousClock = clock
-			$0.date.now = now
-			$0.uuid = .constant(UUID(1))
-			$0.screenCapture.captureDisplayUnderCursor = { _ in context }
-		}
-		store.exhaustivity = .off(showSkippedAssertions: false)
-
-		await store.send(.armScreenAwareActivation)
-		await clock.advance(by: .seconds(0.74))
-		XCTAssertFalse(store.state.isScreenAwareModeActive)
-		await clock.advance(by: .seconds(0.01))
-		await store.receive(\.screenAwareActivationThresholdReached)
-		await store.receive(\.screenAwareModeActivated)
-		await store.receive(\.screenContextCaptured)
-		XCTAssertTrue(store.state.isScreenAwareModeActive)
-		XCTAssertEqual(store.state.forcedRefinementMode, .refined)
-		// No hotKeyReleased action is sent: activation must happen while held.
-		await store.send(.cancelScreenAwareActivation)
-		await store.finish()
-	}
-
 	func testScreenCaptureFailureDoesNotStopScreenAwareRecording() async {
 		let now = Date(timeIntervalSince1970: 1_234)
 		var state = Self.makeState()

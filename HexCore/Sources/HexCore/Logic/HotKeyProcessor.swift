@@ -145,6 +145,10 @@ public struct HotKeyProcessor {
     /// screen-aware hold or a double-tap lock.
     private var secondTapHoldPendingRelease = false
 
+    /// The physical timestamp of the second tap's key-down. This keeps Screen Aware
+    /// classification independent from delays in delivering the corresponding key-up.
+    private var secondTapHoldTimestamp: UInt64?
+
     /// Whether the most recently completed press-and-hold gesture was long
     /// enough to be followed by the quick-tap refinement gesture.
     private var lastTapWasLong = false
@@ -247,7 +251,7 @@ public struct HotKeyProcessor {
 
         // 3) Matching chord => handle as "press"
         if chordMatchesHotkey(keyEvent) {
-            return handleMatchingChord()
+            return handleMatchingChord(keyEvent)
         } else {
             // Potentially become dirty if chord has extra mods or different key
         if shouldMarkChordDirty(keyEvent) {
@@ -354,8 +358,8 @@ public extension HotKeyProcessor {
         /// Begin a new recording session
         case startRecording
 
-		/// Begin recording and arm the screen-aware second-tap hold threshold.
-		case startRecordingAndArmScreenAware
+        /// Begin recording for a second tap that may qualify for Screen Aware on release.
+        case startRecordingAndArmScreenAware
 
         /// Schedule a press-and-hold recording if the first press remains held.
         case armPendingPressAndHold
@@ -419,7 +423,7 @@ extension HotKeyProcessor {
     /// - Second press within threshold: Start recording, then enter the lock on release
     ///
     /// - Returns: `.startRecording` when entering press-and-hold, `.stopRecording` when exiting lock
-    private mutating func handleMatchingChord() -> Output? {
+    private mutating func handleMatchingChord(_ keyEvent: KeyEvent) -> Output? {
         switch state {
         case .idle:
             if postHoldRefinementEnabled,
@@ -438,6 +442,7 @@ extension HotKeyProcessor {
                     if lockingHoldDuration != nil {
                         state = .pressAndHold(startTime: now)
                         secondTapHoldPendingRelease = true
+                        secondTapHoldTimestamp = keyEvent.timestamp
                     } else {
                         state = .doubleTapLock
                     }
@@ -464,6 +469,7 @@ extension HotKeyProcessor {
                     // Screen Aware is unavailable the same gesture safely falls back
                     // to an ordinary lock.
                     secondTapHoldPendingRelease = true
+                    secondTapHoldTimestamp = keyEvent.timestamp
                 }
 				return secondTapHoldPendingRelease && screenAwareSecondTapEnabled
 					? .startRecordingAndArmScreenAware
@@ -553,7 +559,7 @@ extension HotKeyProcessor {
             if isReleaseForActiveHotkey(e) {
                 if secondTapHoldPendingRelease {
                     let wasLongSecondTap = lockingHoldDuration.map {
-                        now.timeIntervalSince(startTime) >= $0
+                        secondTapReached($0, releasedBy: e, startedAt: startTime)
                     } ?? false
                     clearDoubleTapTracking()
                     if doubleTapLockEnabled {
@@ -757,6 +763,22 @@ extension HotKeyProcessor {
     private mutating func clearDoubleTapTracking() {
         lastTapAt = nil
         secondTapHoldPendingRelease = false
+        secondTapHoldTimestamp = nil
         lastTapWasLong = false
+    }
+
+    private func secondTapReached(
+        _ minimumDuration: TimeInterval,
+        releasedBy event: KeyEvent,
+        startedAt startTime: Date
+    ) -> Bool {
+        guard let startTimestamp = secondTapHoldTimestamp,
+              let endTimestamp = event.timestamp
+        else {
+            return now.timeIntervalSince(startTime) >= minimumDuration
+        }
+
+        guard endTimestamp >= startTimestamp else { return false }
+        return Double(endTimestamp - startTimestamp) / 1_000_000_000 >= minimumDuration
     }
 }
