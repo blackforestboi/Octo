@@ -128,6 +128,7 @@ public struct ModelDownloadFeature {
 		public var isLoadingModels = false
 		public var isDownloading = false
 		public var downloadProgress: Double = 0
+		public var downloadPhase: ModelPreparationPhase?
 		public var downloadError: String?
 		public var downloadingModelName: String?
 
@@ -180,7 +181,7 @@ public struct ModelDownloadFeature {
 		// Effects
 		case modelsLoaded(recommended: String, available: [ModelInfo])
 		case modelsLoadFailed
-		case downloadProgress(id: UUID, progress: Double)
+		case downloadProgress(id: UUID, update: ModelPreparationUpdate)
 		case downloadCompleted(id: UUID, result: Result<String, Error>)
 		case cancelDownload
 
@@ -220,6 +221,11 @@ public struct ModelDownloadFeature {
 	}
 
 	private func updateBootstrapState(_ state: inout State) {
+		// Files can arrive before Core ML/FluidAudio has activated the model.
+		// Never let a disk scan reopen the recording gate while preparation owns it.
+		if state.modelBootstrapState.preparationPhase != nil {
+			return
+		}
 		let model = state.hexSettings.selectedModel
 		guard !model.isEmpty else {
 			state.$modelBootstrapState.withLock { bootstrap in
@@ -361,25 +367,24 @@ public struct ModelDownloadFeature {
 			state.downloadError = nil
 			state.isDownloading = true
 			state.downloadProgress = 0
+			state.downloadPhase = .downloading
 			state.downloadingModelName = model
 			state.activeDownloadID = UUID()
 			let downloadID = state.activeDownloadID!
-			if !state.anyModelDownloaded {
-				let displayName = curatedDisplayName(for: model, curated: state.curatedModels)
-				state.$modelBootstrapState.withLock {
-					$0.modelIdentifier = model
-					$0.modelDisplayName = displayName
-					$0.isModelReady = false
-					$0.progress = 0
-					$0.lastError = nil
-				}
+			let displayName = curatedDisplayName(for: model, curated: state.curatedModels)
+			state.$modelBootstrapState.withLock {
+				$0.modelIdentifier = model
+				$0.modelDisplayName = displayName
+				$0.isModelReady = false
+				$0.progress = 0
+				$0.preparationPhase = .downloading
+				$0.lastError = nil
 			}
 			return .run { send in
 				do {
-					try await transcription.downloadModel(model) { progress in
-						let fractionCompleted = progress.fractionCompleted
+					try await transcription.prepareModel(model) { update in
 						Task {
-							await send(.downloadProgress(id: downloadID, progress: fractionCompleted))
+							await send(.downloadProgress(id: downloadID, update: update))
 						}
 					}
 					await send(.downloadCompleted(id: downloadID, result: .success(model)))
@@ -390,12 +395,15 @@ public struct ModelDownloadFeature {
 			}
 			.cancellable(id: downloadID)
 
-		case let .downloadProgress(id, progress):
+		case let .downloadProgress(id, update):
 			guard state.activeDownloadID == id else { return .none }
-			guard state.downloadProgress != progress else { return .none }
-			state.downloadProgress = progress
-			if !state.modelBootstrapState.isModelReady {
-				state.$modelBootstrapState.withLock { $0.progress = progress }
+			guard state.downloadProgress != update.progress || state.downloadPhase != update.phase else { return .none }
+			state.downloadProgress = update.progress
+			state.downloadPhase = update.phase
+			state.$modelBootstrapState.withLock {
+				$0.isModelReady = false
+				$0.preparationPhase = update.phase
+				$0.progress = update.progress
 			}
 			return .none
 
@@ -405,6 +413,7 @@ public struct ModelDownloadFeature {
 			state.downloadingModelName = nil
 			state.activeDownloadID = nil
 			state.downloadProgress = 0
+			state.downloadPhase = nil
 			var failureMessage: String?
 			switch result {
 			case let .success(name):
@@ -433,6 +442,7 @@ public struct ModelDownloadFeature {
 				failureMessage = message
 			}
 			state.$modelBootstrapState.withLock { bootstrap in
+				bootstrap.preparationPhase = nil
 				if let failureMessage {
 					bootstrap.isModelReady = false
 					bootstrap.lastError = failureMessage
@@ -452,7 +462,11 @@ public struct ModelDownloadFeature {
 			state.downloadingModelName = nil
 			state.activeDownloadID = nil
 			state.downloadProgress = 0
-			state.$modelBootstrapState.withLock { $0.progress = 0 }
+			state.downloadPhase = nil
+			state.$modelBootstrapState.withLock {
+				$0.preparationPhase = nil
+				$0.progress = 0
+			}
 			updateBootstrapState(&state)
 			return .cancel(id: id)
 

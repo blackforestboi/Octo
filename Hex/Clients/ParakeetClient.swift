@@ -36,7 +36,11 @@ actor ParakeetClient {
     return available
   }
 
-  func ensureLoaded(modelName: String, progress: @escaping (Progress) -> Void) async throws {
+  func ensureLoaded(
+    modelName: String,
+    progress: @escaping (Progress) -> Void,
+    preparationPhase: @escaping (ModelPreparationPhase) -> Void = { _ in }
+  ) async throws {
     guard let variant = ParakeetModel(rawValue: modelName) else {
       throw NSError(
         domain: "Parakeet",
@@ -78,6 +82,7 @@ actor ParakeetClient {
     // Download + load the requested variant (returns when all assets are present)
     let models = try await AsrModels.downloadAndLoad(version: variant.asrVersion)
     self.models = models
+    preparationPhase(.activating)
     let manager = AsrManager(config: .init(), models: models)
     self.asr = manager
     self.currentVariant = variant

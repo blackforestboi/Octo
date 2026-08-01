@@ -58,12 +58,63 @@ final class ModelDownloadFeatureTests: XCTestCase {
       ModelDownloadFeature()
     }
 
-    await store.send(.downloadProgress(id: UUID(), progress: 0.9))
+    await store.send(.downloadProgress(id: UUID(), update: .init(phase: .downloading, progress: 0.9)))
     await store.send(.downloadCompleted(id: UUID(), result: .success("other-model")))
 
     XCTAssertEqual(store.state.activeDownloadID, currentID)
     XCTAssertEqual(store.state.downloadProgress, 0.25)
     XCTAssertEqual(store.state.hexSettings.selectedModel, "installed-model")
+  }
+
+  func testActivationKeepsModelUnavailableUntilMatchingCompletion() async {
+    let downloadID = UUID()
+    var state = makeState(selectedModel: "new-model")
+    state.availableModels = [ModelInfo(name: "new-model", isDownloaded: false)]
+    state.isDownloading = true
+    state.downloadingModelName = "new-model"
+    state.activeDownloadID = downloadID
+    state.downloadPhase = .downloading
+    state.$modelBootstrapState.withLock {
+      $0.modelIdentifier = "new-model"
+	  $0.modelDisplayName = "New Model"
+      $0.isModelReady = false
+      $0.preparationPhase = .downloading
+      $0.progress = 0.9
+    }
+
+    let store = TestStore(initialState: state) {
+      ModelDownloadFeature()
+    }
+
+    await store.send(.downloadProgress(
+      id: downloadID,
+      update: .init(phase: .activating, progress: 1)
+    )) {
+      $0.downloadProgress = 1
+      $0.downloadPhase = .activating
+      $0.$modelBootstrapState.withLock {
+        $0.isModelReady = false
+        $0.preparationPhase = .activating
+        $0.progress = 1
+      }
+    }
+
+    XCTAssertFalse(store.state.modelBootstrapState.isModelReady)
+
+    await store.send(.downloadCompleted(id: downloadID, result: .success("new-model"))) {
+      $0.availableModels[id: "new-model"]?.isDownloaded = true
+      $0.isDownloading = false
+      $0.downloadingModelName = nil
+      $0.activeDownloadID = nil
+      $0.downloadProgress = 0
+      $0.downloadPhase = nil
+      $0.$hexSettings.withLock { $0.hasCompletedModelBootstrap = true }
+      $0.$modelBootstrapState.withLock {
+        $0.isModelReady = true
+        $0.preparationPhase = nil
+        $0.progress = 1
+      }
+    }
   }
 
   func testModelsLoadedNeverClearsSelectionWhenNothingDetected() async {

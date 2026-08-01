@@ -93,6 +93,16 @@ struct AppFeature {
         return .none
         
       case .task:
+		let selectedModel = state.hexSettings.selectedModel
+		if !selectedModel.isEmpty {
+			state.$modelBootstrapState.withLock { bootstrap in
+				bootstrap.modelIdentifier = selectedModel
+				bootstrap.isModelReady = false
+				bootstrap.preparationPhase = .activating
+				bootstrap.progress = 0
+				bootstrap.lastError = nil
+			}
+		}
         let startupEffects: [Effect<Action>] = [
           startPasteLastTranscriptMonitoring(),
           ensureSelectedModelReadiness(),
@@ -423,24 +433,63 @@ struct AppFeature {
       @Shared(.modelBootstrapState) var modelBootstrapState: ModelBootstrapState
       let selectedModel = hexSettings.selectedModel
       guard !selectedModel.isEmpty else {
+		$modelBootstrapState.withLock { state in
+			state.isModelReady = false
+			state.preparationPhase = nil
+			state.progress = 0
+		}
         await send(.modelStatusEvaluated(false))
         return
       }
-      let isReady = await transcription.isModelDownloaded(selectedModel)
-      $modelBootstrapState.withLock { state in
-        state.modelIdentifier = selectedModel
-        if state.modelDisplayName?.isEmpty ?? true {
-          state.modelDisplayName = selectedModel
-        }
-        state.isModelReady = isReady
-        if isReady {
-          state.lastError = nil
-          state.progress = 1
-        } else {
-          state.progress = 0
-        }
-      }
-      await send(.modelStatusEvaluated(isReady))
+		$modelBootstrapState.withLock { state in
+			state.modelIdentifier = selectedModel
+			if state.modelDisplayName?.isEmpty ?? true {
+				state.modelDisplayName = selectedModel
+			}
+			state.isModelReady = false
+			state.preparationPhase = .activating
+			state.progress = 0
+			state.lastError = nil
+		}
+
+		guard await transcription.isModelDownloaded(selectedModel) else {
+			$modelBootstrapState.withLock { state in
+				guard state.modelIdentifier == selectedModel else { return }
+				state.isModelReady = false
+				state.preparationPhase = nil
+				state.progress = 0
+			}
+			await send(.modelStatusEvaluated(false))
+			return
+		}
+
+		do {
+			try await transcription.prepareModel(selectedModel) { update in
+				$modelBootstrapState.withLock { state in
+					guard state.modelIdentifier == selectedModel else { return }
+					state.isModelReady = false
+					state.preparationPhase = update.phase
+					state.progress = update.progress
+				}
+			}
+			$modelBootstrapState.withLock { state in
+				guard state.modelIdentifier == selectedModel else { return }
+				state.isModelReady = true
+				state.preparationPhase = nil
+				state.progress = 1
+				state.lastError = nil
+			}
+			await send(.modelStatusEvaluated(true))
+		} catch {
+			$modelBootstrapState.withLock { state in
+				guard state.modelIdentifier == selectedModel else { return }
+				state.isModelReady = false
+				state.preparationPhase = nil
+				state.progress = 0
+				state.lastError = error.localizedDescription
+			}
+			await send(.modelStatusEvaluated(false))
+		}
     }
   }
 

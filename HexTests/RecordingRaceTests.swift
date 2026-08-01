@@ -10,6 +10,24 @@ import XCTest
 
 @MainActor
 final class RecordingRaceTests: XCTestCase {
+	func testStartRecordingIsRejectedWhileModelActivates() async {
+		var state = Self.makeState()
+		state.$modelBootstrapState.withLock {
+			$0.isModelReady = false
+			$0.preparationPhase = .activating
+		}
+		let store = TestStore(initialState: state) {
+			TranscriptionFeature()
+		} withDependencies: {
+			$0.soundEffects.play = { _ in }
+		}
+
+		await store.send(.startRecording)
+		await store.receive(\.modelMissing)
+		XCTAssertFalse(store.state.isRecording)
+		await store.finish()
+	}
+
 	func testEscapeRequestsConfirmationAtLongRecordingThreshold() async {
 		let now = Date(timeIntervalSince1970: 1_000)
 		var state = Self.makeState()
