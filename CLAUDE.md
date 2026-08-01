@@ -234,8 +234,9 @@ Releases are automated via a local CLI tool that handles building, signing, nota
 4. Updates `Info.plist` and `project.pbxproj` with new version
 5. Increments build number
 6. Archives an Apple Silicon-only (`arm64`) app with xcodebuild using the persistent
-   Release DerivedData cache; it clears that cache only when dependency inputs or
-   the Xcode toolchain fingerprint changes
+   Release DerivedData cache; version/build-number edits do not invalidate it,
+   and it clears that cache only when dependency inputs or the Xcode toolchain
+   fingerprint changes
 7. Exports and signs with Developer ID
 8. Notarizes app with Apple
 9. Creates and signs DMG
