@@ -101,7 +101,15 @@ fi
 [[ -n "$identity" ]] || die "No Developer ID Application identity found for team $TEAM_ID"
 
 notary_profile="${NOTARY_PROFILE:-$NOTARY_PROFILE_DEFAULT}"
-xcrun notarytool history --keychain-profile "$notary_profile" >/dev/null 2>&1 || die "Notarytool Keychain profile '$notary_profile' is unavailable"
+notary_args=(--keychain-profile "$notary_profile")
+if [[ -n "${NOTARY_KEY_FILE:-}" ]]; then
+  [[ -r "$NOTARY_KEY_FILE" ]] || die "Notary API key is unreadable: $NOTARY_KEY_FILE"
+  : "${NOTARY_KEY_ID:?NOTARY_KEY_ID is required with NOTARY_KEY_FILE}"
+  : "${NOTARY_ISSUER:?NOTARY_ISSUER is required with NOTARY_KEY_FILE}"
+  notary_args=(--key "$NOTARY_KEY_FILE" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER")
+else
+  xcrun notarytool history --keychain-profile "$notary_profile" >/dev/null 2>&1 || die "Notarytool Keychain profile '$notary_profile' is unavailable"
+fi
 
 generate_appcast="$(pwd)/bin/generate_appcast"
 [[ -x "$generate_appcast" ]] || die "Sparkle generate_appcast is unavailable at $generate_appcast"
@@ -249,13 +257,13 @@ archive_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString
 [[ "$archive_version" == "$version" ]] || die "Built app version $archive_version does not match tag $tag"
 
 ditto -c -k --sequesterRsrc --keepParent "$app_path" "$notarization_zip"
-xcrun notarytool submit "$notarization_zip" --keychain-profile "$notary_profile" --wait
+xcrun notarytool submit "$notarization_zip" "${notary_args[@]}" --wait
 xcrun stapler staple "$app_path"
 xcrun stapler validate "$app_path"
 
 ditto -c -k --sequesterRsrc --keepParent "$app_path" "$zip_path"
 hdiutil create -volname "Octo $version" -srcfolder "$app_path" -ov -format UDZO "$dmg_path"
-xcrun notarytool submit "$dmg_path" --keychain-profile "$notary_profile" --wait
+xcrun notarytool submit "$dmg_path" "${notary_args[@]}" --wait
 xcrun stapler staple "$dmg_path"
 xcrun stapler validate "$dmg_path"
 
