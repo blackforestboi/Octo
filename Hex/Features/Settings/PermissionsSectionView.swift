@@ -8,7 +8,6 @@ struct PermissionsSectionView: View {
 	@Bindable var store: StoreOf<SettingsFeature>
 	let microphonePermission: PermissionStatus
 	let accessibilityPermission: PermissionStatus
-	let inputMonitoringPermission: PermissionStatus
 
 	var body: some View {
 		Section {
@@ -21,42 +20,14 @@ struct PermissionsSectionView: View {
 					action: { store.send(.requestMicrophone) }
 				)
 				
-			// Accessibility + Keyboard
-			permissionCard(
-				title: "Accessibility",
-				icon: "accessibility",
-				status: combinedAccessibilityStatus,
-				action: {
-					store.send(.requestAccessibility)
-					store.send(.requestInputMonitoring)
-				}
-			)
-		}
-
-		if store.hotkeyPermissionState.inputMonitoring != .granted {
-			VStack(alignment: .leading, spacing: 6) {
-				Label {
-					Text("Input Monitoring is required so Octo can listen for your hotkey.")
-						.font(.callout)
-						.foregroundStyle(.primary)
-				} icon: {
-					Image(systemName: "exclamationmark.triangle.fill")
-						.foregroundStyle(.yellow)
-				}
-
-				Button {
-					store.send(.requestInputMonitoring)
-				} label: {
-					Text("Open Input Monitoring Settings")
-				}
-				.buttonStyle(.borderedProminent)
-				.controlSize(.small)
+				// Accessibility
+				permissionCard(
+					title: "Accessibility",
+					icon: "accessibility",
+					status: accessibilityPermission,
+					action: { store.send(.requestAccessibility) }
+				)
 			}
-			.padding(12)
-			.background(Color.octoCardBackground)
-			.clipShape(RoundedRectangle(cornerRadius: 10))
-		}
-
 		} header: {
 			Text("Permissions")
 		}
@@ -102,15 +73,5 @@ struct PermissionsSectionView: View {
 		.frame(maxWidth: .infinity)
 		.background(Color.octoCardBackground)
 		.clipShape(RoundedRectangle(cornerRadius: 8))
-	}
-
-	private var combinedAccessibilityStatus: PermissionStatus {
-		if accessibilityPermission == .granted && inputMonitoringPermission == .granted {
-			return .granted
-		}
-		if accessibilityPermission == .denied || inputMonitoringPermission == .denied {
-			return .denied
-		}
-		return .notDetermined
 	}
 }

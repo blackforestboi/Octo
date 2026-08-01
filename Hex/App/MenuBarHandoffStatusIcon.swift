@@ -27,6 +27,12 @@ enum MenuBarHandoffStatus: Equatable, Hashable {
 	}
 }
 
+enum MenuBarRecentHandoffList {
+	static func visibleTasks(from tasks: [AgentHandoffTask]) -> [AgentHandoffTask] {
+		Array(tasks.prefix(10))
+	}
+}
+
 /// Owns Octo's AppKit status item. Keeping the actual `NSStatusItem` gives the
 /// handoff animation a public, live screen-space frame instead of an estimated
 /// menu-bar destination.
@@ -256,7 +262,7 @@ final class MenuBarStatusItemController: NSObject, NSMenuDelegate {
 
 	private func addHandoffItems(from snapshot: HandoffMenuSnapshot) {
 		let tasks = snapshot.tasks
-		let visibleTasks = Array(tasks.filter(\.isOpenable).prefix(10))
+		let visibleTasks = MenuBarRecentHandoffList.visibleTasks(from: tasks)
 		let processingStatuses = snapshot.processingStatuses
 		let activeThreads = Set(snapshot.activeThreadsByRun.values.flatMap { $0 })
 		guard !visibleTasks.isEmpty || !processingStatuses.isEmpty else { return }
@@ -549,6 +555,7 @@ final class MenuBarStatusItemController: NSObject, NSMenuDelegate {
 	@objc private func openHandoffTask(_ sender: NSMenuItem) {
 		guard let id = (sender.representedObject as? TaskReference)?.id,
 			let task = ((try? agentHandoff.tasks()) ?? []).first(where: { $0.id == id }),
+			task.isOpenable,
 			let thread = task.thread
 		else { return }
 		if task.hasUnacknowledgedCompletion {

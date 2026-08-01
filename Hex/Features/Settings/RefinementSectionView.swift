@@ -18,6 +18,8 @@ struct RefinementSectionView: View {
 	@State private var subscriptionModelPickerTarget: SubscriptionModelPickerTarget?
 	@State private var selectedRewritePromptID: RewritePrompt.ID?
 	@State private var isShowingRewritePromptDeletionConfirmation = false
+	@State private var isConnectingCodex = false
+	@State private var codexConnectionError: String?
 	@State private var isRequestingCodexProjectCatalogAccess = false
 	@State private var codexProjectCatalogAccessError: String?
 
@@ -53,7 +55,7 @@ struct RefinementSectionView: View {
 						.labelsHidden()
 				}
 				if store.hexSettings.refinementEnabled {
-				Picker("Provider", selection: $store.hexSettings.refinementProvider) {
+				Picker("Provider", selection: refinementProviderSelection) {
 					Text("Apple Intelligence").tag(RefinementProvider.apple)
 					Text("Gemini Flash API").tag(RefinementProvider.gemini)
 					Text("OpenRouter API").tag(RefinementProvider.openRouter)
@@ -61,6 +63,17 @@ struct RefinementSectionView: View {
 					Text("Claude API").tag(RefinementProvider.anthropic)
 					Text("OpenAI Subscription").tag(RefinementProvider.codexCLI)
 					Text("Claude Subscription").tag(RefinementProvider.claudeCLI)
+				}
+				.disabled(isConnectingCodex)
+
+				if isConnectingCodex {
+					HStack(spacing: 8) {
+						ProgressView()
+							.controlSize(.small)
+						Text("Connecting OpenAI Subscription…")
+							.font(.caption)
+							.foregroundStyle(.secondary)
+					}
 				}
 
 				Picker("Thinking", selection: $store.hexSettings.refinementReasoningEffort) {
@@ -185,13 +198,14 @@ struct RefinementSectionView: View {
 						Spacer()
 						Toggle("Enable Agent Handoff", isOn: agentHandoffEnabled)
 							.labelsHidden()
-							.disabled(isRequestingCodexProjectCatalogAccess)
+							.disabled(isRequestingCodexProjectCatalogAccess || isConnectingCodex)
 					}
 					if store.hexSettings.agentHandoffEnabled {
-					Picker("Provider", selection: $store.hexSettings.agentHandoffProvider) {
+					Picker("Provider", selection: agentHandoffProviderSelection) {
 						Text("OpenAI Subscription").tag(RefinementProvider.codexCLI)
 						Text("Claude Subscription").tag(RefinementProvider.claudeCLI)
 					}
+					.disabled(isConnectingCodex)
 					Picker("Thinking", selection: $store.hexSettings.agentHandoffReasoningEffort) {
 						ForEach(RefinementReasoningEffort.allCases, id: \.self) { effort in
 							Text(effort.displayName).tag(effort)
@@ -301,13 +315,6 @@ struct RefinementSectionView: View {
 		.onChange(of: store.hexSettings.rewritePrompts.map(\.id)) { _, _ in
 			selectFirstRewritePromptIfNeeded()
 		}
-		.onChange(of: store.hexSettings.refinementProvider) { oldProvider, _ in
-			if oldProvider == .gemini { persistGeminiAPIKey() }
-			if oldProvider == .openRouter { persistOpenRouterAPIKey() }
-			if oldProvider == .openAI { persistOpenAIAPIKey() }
-			if oldProvider == .anthropic { persistAnthropicAPIKey() }
-			store.send(.refinementProviderChanged(store.hexSettings.refinementProvider))
-		}
 		.onChange(of: openRouterAPIKey) { _, key in
 			// Clearing the field explicitly opts out of the saved Keychain credential.
 			if key.isEmpty { persistOpenRouterAPIKey() }
@@ -323,6 +330,14 @@ struct RefinementSectionView: View {
 			persistOpenRouterAPIKey()
 			persistOpenAIAPIKey()
 			persistAnthropicAPIKey()
+		}
+		.alert("Couldn’t Connect OpenAI Subscription", isPresented: Binding(
+			get: { codexConnectionError != nil },
+			set: { if !$0 { codexConnectionError = nil } }
+		)) {
+			Button("OK", role: .cancel) {}
+		} message: {
+			Text(codexConnectionError ?? "Unknown error")
 		}
 			.sheet(isPresented: $isShowingOpenRouterModelPicker) {
 				OpenRouterModelPickerView(
@@ -371,6 +386,59 @@ struct RefinementSectionView: View {
 		.enableInjection()
 	}
 
+	private var refinementProviderSelection: Binding<RefinementProvider> {
+		Binding(
+			get: { store.hexSettings.refinementProvider },
+			set: selectRefinementProvider
+		)
+	}
+
+	private func selectRefinementProvider(_ provider: RefinementProvider) {
+		let previousProvider = store.hexSettings.refinementProvider
+		if previousProvider == .gemini { persistGeminiAPIKey() }
+		if previousProvider == .openRouter { persistOpenRouterAPIKey() }
+		if previousProvider == .openAI { persistOpenAIAPIKey() }
+		if previousProvider == .anthropic { persistAnthropicAPIKey() }
+
+		guard provider == .codexCLI else {
+			store.send(.refinementProviderChanged(provider))
+			return
+		}
+		connectCodex { store.send(.refinementProviderChanged(.codexCLI)) }
+	}
+
+	private var agentHandoffProviderSelection: Binding<RefinementProvider> {
+		Binding(
+			get: { store.hexSettings.agentHandoffProvider },
+			set: selectAgentHandoffProvider
+		)
+	}
+
+	private func selectAgentHandoffProvider(_ provider: RefinementProvider) {
+		guard provider == .codexCLI else {
+			store.hexSettings.agentHandoffProvider = provider
+			return
+		}
+		connectCodex { store.hexSettings.agentHandoffProvider = .codexCLI }
+	}
+
+	private func connectCodex(onSuccess: @escaping @MainActor () -> Void) {
+		guard !isConnectingCodex else { return }
+		isConnectingCodex = true
+		codexConnectionError = nil
+		Task { @MainActor in
+			defer { isConnectingCodex = false }
+			do {
+				try await CLIRefinementClient.connectCodexIfNeeded()
+				onSuccess()
+			} catch is CancellationError {
+				return
+			} catch {
+				codexConnectionError = error.localizedDescription
+			}
+		}
+	}
+
 	private var agentHandoffEnabled: Binding<Bool> {
 		Binding(
 			get: { store.hexSettings.agentHandoffEnabled },
@@ -384,7 +452,10 @@ struct RefinementSectionView: View {
 				Task { @MainActor in
 					defer { isRequestingCodexProjectCatalogAccess = false }
 					do {
-						try CodexProjectCatalogAccess.authorize()
+						if store.hexSettings.agentHandoffProvider == .codexCLI {
+							try await CLIRefinementClient.connectCodexIfNeeded()
+						}
+						try await CodexProjectCatalogAccess.authorize()
 						store.hexSettings.agentHandoffEnabled = true
 					} catch {
 						store.hexSettings.agentHandoffEnabled = false

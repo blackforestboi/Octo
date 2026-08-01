@@ -5,6 +5,37 @@ import XCTest
 
 @MainActor
 final class TranscriptionFallbackPresentationTests: XCTestCase {
+	func testDepartingHandoffHidesPillContentBeforeItShrinks() {
+		let waiting = TranscriptionIndicatorView.Status.handoff(
+			"Processing",
+			isReady: true,
+			hasLaunched: true,
+			isDeparting: false,
+			isFlying: false
+		)
+		let departing = TranscriptionIndicatorView.Status.handoff(
+			"Processing",
+			isReady: true,
+			hasLaunched: true,
+			isDeparting: true,
+			isFlying: false
+		)
+
+		XCTAssertFalse(waiting.hidesContentForHandoffDeparture)
+		XCTAssertTrue(departing.hidesContentForHandoffDeparture)
+	}
+
+	func testMicrophonePermissionStatusUsesItsRecoveryTapAction() {
+		XCTAssertTrue(
+			TranscriptionIndicatorView.Status.microphonePermissionRequired
+				.requestsMicrophonePermissionWhenTapped
+		)
+		XCTAssertFalse(
+			TranscriptionIndicatorView.Status.error("Microphone not available")
+				.requestsMicrophonePermissionWhenTapped
+		)
+	}
+
 	func testKnownMissingDestinationShowsTranscriptInsteadOfPasting() async {
 		let probe = ClipboardProbe()
 		let store = TestStore(initialState: TranscriptionFeature.State()) {

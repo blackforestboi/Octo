@@ -377,6 +377,21 @@ final class SuperFastCaptureController {
     }
   }
 
+  /// Establishes the audio cutoff from the physical input event before reducer and actor
+  /// scheduling can move the boundary. Core Graphics timestamps are nanoseconds since boot;
+  /// Core Audio host time uses the same monotonic clock expressed in host ticks.
+  func requestStopBoundary(
+    eventTimestampNanoseconds: UInt64?,
+    postRollDuration: TimeInterval = 0
+  ) {
+    let eventHostTime = eventTimestampNanoseconds.map { Self.hostTimeForEventTimestamp($0) }
+      ?? mach_absolute_time()
+    let targetHostTime = eventHostTime + AVAudioTime.hostTime(
+      forSeconds: max(0, postRollDuration)
+    )
+    _ = installStopBoundary(targetHostTime)
+  }
+
   /// Finalizes at an audio-clock boundary rather than after a wall-clock delay. The hotkey
   /// event supplies the boundary in host time; tap timestamps let us retain every PCM frame
   /// through that point even when Core Audio delivers the final buffer late.
@@ -385,17 +400,26 @@ final class SuperFastCaptureController {
     postRollDuration: TimeInterval = 0
   ) async -> FinishRecordingResult {
     let postRollDuration = max(0, postRollDuration)
-    let targetHostTime = mach_absolute_time() + AVAudioTime.hostTime(
-      forSeconds: postRollDuration
-    )
-    guard requestStopBoundary(targetHostTime) else {
-      return .finalizing
+    let targetHostTime: UInt64
+    if let requestedBoundary = currentStopBoundary() {
+      targetHostTime = requestedBoundary.targetHostTime
+    } else {
+      targetHostTime = mach_absolute_time() + AVAudioTime.hostTime(
+        forSeconds: postRollDuration
+      )
+      guard installStopBoundary(targetHostTime) else {
+        return .finalizing
+      }
     }
 
     return await withCheckedContinuation { continuation in
       processingQueue.async { [weak self] in
         guard let self else {
           continuation.resume(returning: .idle)
+          return
+        }
+        guard self.pendingFinish == nil else {
+          continuation.resume(returning: .finalizing)
           return
         }
         guard self.activeRecording != nil else {
@@ -424,6 +448,10 @@ final class SuperFastCaptureController {
         self.scheduleStopDrainTimeout()
       }
     }
+  }
+
+  static func hostTimeForEventTimestamp(_ timestampNanoseconds: UInt64) -> UInt64 {
+    AVAudioTime.hostTime(forSeconds: Double(timestampNanoseconds) / 1_000_000_000)
   }
 
   private func enqueue(_ buffer: AVAudioPCMBuffer, time: AVAudioTime, generation: Int) {
@@ -495,10 +523,8 @@ final class SuperFastCaptureController {
       }
       if let stopBoundary,
          time.isHostTimeValid,
-         Self.bufferReachesTarget(
+         Self.bufferStartsAtOrAfterTarget(
            bufferStartHostTime: time.hostTime,
-           inputSampleRate: buffer.format.sampleRate,
-           inputFrameCount: Int(buffer.frameLength),
            targetHostTime: stopBoundary.targetHostTime
          )
       {
@@ -551,20 +577,17 @@ final class SuperFastCaptureController {
     )
   }
 
-  static func bufferReachesTarget(
+  /// Finalization waits until Core Audio delivers a buffer beginning at or after the cutoff.
+  /// The buffer containing the cutoff is processed first; this subsequent timestamp is the
+  /// condition-based proof that the callback stream has drained through the requested frame.
+  static func bufferStartsAtOrAfterTarget(
     bufferStartHostTime: UInt64,
-    inputSampleRate: Double,
-    inputFrameCount: Int,
     targetHostTime: UInt64
   ) -> Bool {
-    guard inputSampleRate > 0, inputFrameCount > 0 else { return false }
-    let bufferDurationHostTime = AVAudioTime.hostTime(
-      forSeconds: Double(inputFrameCount) / inputSampleRate
-    )
-    return targetHostTime <= bufferStartHostTime + bufferDurationHostTime
+    bufferStartHostTime >= targetHostTime
   }
 
-  private func requestStopBoundary(_ targetHostTime: UInt64) -> Bool {
+  private func installStopBoundary(_ targetHostTime: UInt64) -> Bool {
     stopBoundaryLock.lock()
     defer { stopBoundaryLock.unlock() }
     guard stopBoundary == nil else { return false }

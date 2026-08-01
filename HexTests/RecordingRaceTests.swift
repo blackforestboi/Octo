@@ -84,6 +84,87 @@ final class RecordingRaceTests: XCTestCase {
     await store.finish()
   }
 
+  func testMicrophonePermissionRequiredAtRecordingStartShowsPersistentAction() async {
+    let now = Date(timeIntervalSince1970: 1_234)
+    let clock = TestClock()
+    let soundProbe = SoundEffectProbe()
+    let store = TestStore(initialState: Self.makeState()) {
+      TranscriptionFeature()
+    } withDependencies: {
+      $0.date.now = now
+      $0.continuousClock = clock
+      $0.recording.startRecording = { .microphonePermissionRequired }
+      $0.recording.stopRecording = { .ignored(.noActiveRecording) }
+      $0.sleepManagement.preventSleep = { _ in }
+      $0.sleepManagement.allowSleep = {}
+      $0.soundEffects.play = { effect in await soundProbe.record(effect) }
+    }
+    store.exhaustivity = .off(showSkippedAssertions: false)
+
+    await store.send(.startRecording)
+    await store.receive(\.recordingPermissionRequired)
+
+    XCTAssertFalse(store.state.isRecording)
+    XCTAssertTrue(store.state.isMicrophonePermissionRequired)
+    XCTAssertEqual(store.state.error, "Microphone access required — click to grant access")
+    let playedEffects = await soundProbe.effects
+    XCTAssertEqual(playedEffects, [.startRecording, .cancel])
+    await store.finish()
+  }
+
+  func testPermissionPillRequestsUndeterminedMicrophoneAccessAndDismissesWhenGranted() async {
+    var state = Self.makeState()
+    state.error = "Microphone access required — click to grant access"
+    state.isMicrophonePermissionRequired = true
+    let probe = MicrophonePermissionProbe()
+    let store = TestStore(initialState: state) {
+      TranscriptionFeature()
+    } withDependencies: {
+      $0.permissions.microphoneStatus = { .notDetermined }
+      $0.permissions.requestMicrophone = {
+        await probe.recordRequest()
+        return true
+      }
+      $0.permissions.openMicrophoneSettings = { await probe.recordSettingsOpen() }
+    }
+
+    await store.send(.requestMicrophonePermission)
+    await store.receive(\.microphonePermissionRequestCompleted) {
+      $0.error = nil
+      $0.isMicrophonePermissionRequired = false
+    }
+    await store.finish()
+
+    let calls = await probe.calls
+    XCTAssertEqual(calls.requests, 1)
+    XCTAssertEqual(calls.settingsOpens, 0)
+  }
+
+  func testPermissionPillOpensSettingsWhenMicrophoneAccessWasDenied() async {
+    var state = Self.makeState()
+    state.error = "Microphone access required — click to grant access"
+    state.isMicrophonePermissionRequired = true
+    let probe = MicrophonePermissionProbe()
+    let store = TestStore(initialState: state) {
+      TranscriptionFeature()
+    } withDependencies: {
+      $0.permissions.microphoneStatus = { .denied }
+      $0.permissions.requestMicrophone = {
+        await probe.recordRequest()
+        return false
+      }
+      $0.permissions.openMicrophoneSettings = { await probe.recordSettingsOpen() }
+    }
+
+    await store.send(.requestMicrophonePermission)
+    await store.finish()
+
+    XCTAssertTrue(store.state.isMicrophonePermissionRequired)
+    let calls = await probe.calls
+    XCTAssertEqual(calls.requests, 0)
+    XCTAssertEqual(calls.settingsOpens, 1)
+  }
+
   func testNewRecordingCancelsPendingDiscardCleanup() async throws {
     let now = Date(timeIntervalSince1970: 1_234)
     let activeApp = NSWorkspace.shared.frontmostApplication
@@ -201,13 +282,12 @@ final class RecordingRaceTests: XCTestCase {
 
     XCTAssertTrue((1_199 ... 1_200).contains(inputFramesToWrite))
     XCTAssertTrue((1_199 ... 1_200).contains(outputFramesToWrite))
-    XCTAssertTrue(
-      SuperFastCaptureController.bufferReachesTarget(
+    XCTAssertFalse(
+      SuperFastCaptureController.bufferStartsAtOrAfterTarget(
         bufferStartHostTime: bufferStart,
-        inputSampleRate: sampleRate,
-        inputFrameCount: inputFrames,
         targetHostTime: target
-      )
+      ),
+      "The buffer containing the cutoff must be written before a later callback proves the audio frontier passed it."
     )
   }
 
@@ -227,12 +307,19 @@ final class RecordingRaceTests: XCTestCase {
       0
     )
     XCTAssertTrue(
-      SuperFastCaptureController.bufferReachesTarget(
+      SuperFastCaptureController.bufferStartsAtOrAfterTarget(
         bufferStartHostTime: laterBufferStart,
-        inputSampleRate: sampleRate,
-        inputFrameCount: inputFrames,
         targetHostTime: target
       )
+    )
+  }
+
+  func testPhysicalKeyTimestampUsesCoreAudioHostClock() {
+    let oneSecondInNanoseconds: UInt64 = 1_000_000_000
+
+    XCTAssertEqual(
+      SuperFastCaptureController.hostTimeForEventTimestamp(oneSecondInNanoseconds),
+      AVAudioTime.hostTime(forSeconds: 1)
     )
   }
 
@@ -1584,6 +1671,23 @@ private actor SoundEffectProbe {
 
   var effects: [SoundEffect] {
     playedEffects
+  }
+}
+
+private actor MicrophonePermissionProbe {
+  private var requestCalls = 0
+  private var settingsOpenCalls = 0
+
+  func recordRequest() {
+    requestCalls += 1
+  }
+
+  func recordSettingsOpen() {
+    settingsOpenCalls += 1
+  }
+
+  var calls: (requests: Int, settingsOpens: Int) {
+    (requestCalls, settingsOpenCalls)
   }
 }
 

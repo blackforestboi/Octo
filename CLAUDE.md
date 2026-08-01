@@ -15,8 +15,14 @@ Changes to existing user experience must be explicitly confirmed by the user. Ne
 Local Debug builds may only be run when the user explicitly requests them.
 
 ```bash
-# Local development build (the default for feature work): builds an unsigned Debug .app.
-# Do not run tests, archives, signing, DMGs, or release builds unless explicitly requested.
+# Local development build (the default for feature work): uses Apple Development signing
+# so macOS TCC permissions such as Accessibility and Input Monitoring remain stable.
+# Do not run tests, archives, Developer ID signing, DMGs, or release builds unless explicitly requested.
+xcodebuild -scheme Octo -configuration Debug \
+  -skipMacroValidation -skipPackagePluginValidation build
+
+# Compile-only fallback for machines without an Apple Development identity.
+# Do not use this build to validate macOS permission registration.
 xcodebuild -scheme Octo -configuration Debug \
   -skipMacroValidation -skipPackagePluginValidation \
   CODE_SIGNING_ALLOWED=NO build
@@ -122,9 +128,10 @@ The app uses **The Composable Architecture (TCA)** for state management. Key arc
 - WhisperKit: `https://github.com/argmaxinc/WhisperKit`
 - FluidAudio: `https://github.com/FluidInference/FluidAudio.git` (link `FluidAudio` to Hex target)
 
-### Entitlements (Sandbox)
+### Signing and Entitlements
 
-- `com.apple.security.app-sandbox = true`
+- App Sandbox is disabled because Octo uses Accessibility APIs for focused-field and selected-text handling. Sandboxed apps cannot register for Accessibility access.
+- Hardened Runtime remains enabled for Developer ID distribution and notarization.
 - `com.apple.security.network.client = true` (HF downloads)
 - `com.apple.security.files.user-selected.read-write = true` (optional import)
 - `com.apple.security.automation.apple-events = true` (media control)
@@ -134,7 +141,8 @@ The app uses **The Composable Architecture (TCA)** for state management. Key arc
 Set at app launch and logged:
 
 ```
-XDG_CACHE_HOME = ~/Library/Containers/io.github.blackforestboi.Octo/Data/Library/Application Support/io.github.blackforestboi.Octo/cache
+New installs: ~/Library/Application Support/io.github.blackforestboi.Octo/cache
+Existing installs: ~/Library/Containers/io.github.blackforestboi.Octo/Data/Library/Application Support/io.github.blackforestboi.Octo/cache
 ```
 
 FluidAudio models reside under `Application Support/FluidAudio/Models`.
@@ -146,7 +154,7 @@ FluidAudio models reside under `Application Support/FluidAudio/Models`.
 
 ## Troubleshooting
 
-- Repeated mic prompts during debug: ensure Debug signing uses "Apple Development" so TCC sticks
+- Missing or repeated permission registration during debug: unsigned `CODE_SIGNING_ALLOWED=NO` builds use an ad-hoc linker signature and are not suitable for testing TCC permissions. Run from Xcode with Apple Development signing, or test a Developer ID-signed release build.
 - Sandbox network errors (‑1003): add `com.apple.security.network.client = true` (already set)
 - Parakeet not detected: ensure it resides under the container path above; downloading from Hex places it correctly.
 
@@ -201,6 +209,7 @@ Releases are automated via a local CLI tool that handles building, signing, nota
    ```bash
    xcodebuild -scheme Octo -configuration Release \
      -skipMacroValidation -skipPackagePluginValidation \
+     ARCHS=arm64 ONLY_ACTIVE_ARCH=YES \
      CODE_SIGNING_ALLOWED=NO build
    ```
    Fix all compiler errors first. In particular, guard APIs introduced after the
@@ -224,7 +233,9 @@ Releases are automated via a local CLI tool that handles building, signing, nota
 3. Syncs changelog to `Hex/Resources/changelog.md`
 4. Updates `Info.plist` and `project.pbxproj` with new version
 5. Increments build number
-6. Cleans DerivedData and archives with xcodebuild
+6. Archives an Apple Silicon-only (`arm64`) app with xcodebuild using the persistent
+   Release DerivedData cache; it clears that cache only when dependency inputs or
+   the Xcode toolchain fingerprint changes
 7. Exports and signs with Developer ID
 8. Notarizes app with Apple
 9. Creates and signs DMG
@@ -242,7 +253,7 @@ The tool will prompt you to either:
 
 ### Artifacts
 
-Each release produces:
+Each release produces Apple Silicon-only artifacts:
 - `Octo-{version}.dmg` - Signed, notarized DMG
 - `Octo-{version}.zip` - For Homebrew cask
 - `appcast.xml` - Sparkle update feed

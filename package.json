@@ -1,12 +1,13 @@
 {
   "name": "octo-app",
-  "version": "2026.7.311",
+  "version": "2026.7.312",
   "description": "Release metadata + changelog automation for the Octo macOS app.",
   "private": true,
   "license": "MIT",
   "type": "module",
   "scripts": {
     "release": "cd tools && bun run build",
+    "release:local": "bash release/local-release.sh",
     "changeset": "changeset",
     "changeset:add": "changeset",
     "changeset:add-ai": "bun run tools/scripts/add-changeset.ts",

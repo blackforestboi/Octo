@@ -10,18 +10,15 @@ struct SettingsView: View {
 	@State private var localEventMonitor: Any?
 	let microphonePermission: PermissionStatus
 	let accessibilityPermission: PermissionStatus
-	let inputMonitoringPermission: PermissionStatus
   
 	var body: some View {
 		Form {
 			if microphonePermission != .granted
-				|| accessibilityPermission != .granted
-				|| inputMonitoringPermission != .granted {
+				|| accessibilityPermission != .granted {
 				PermissionsSectionView(
 					store: store,
 					microphonePermission: microphonePermission,
-					accessibilityPermission: accessibilityPermission,
-					inputMonitoringPermission: inputMonitoringPermission
+					accessibilityPermission: accessibilityPermission
 				)
 			}
 

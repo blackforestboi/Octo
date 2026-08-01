@@ -216,7 +216,9 @@ class KeyEventMonitorClientLive {
   func startMonitoring() {
     setMonitoringIntent(true)
     startTrustMonitorIfNeeded()
-    refreshTrustedFlag(promptIfUntrusted: true)
+    // Checking trust during launch must remain silent. The Settings permission
+    // action is the intentional place where macOS should show its prompt.
+    refreshTrustedFlag(promptIfUntrusted: false)
     Task { [weak self] in
       await self?.refreshMonitoringState(reason: "startMonitoring")
     }

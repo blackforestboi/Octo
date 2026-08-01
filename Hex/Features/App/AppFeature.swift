@@ -34,6 +34,7 @@ struct AppFeature {
 		var settings: SettingsFeature.State = .init()
 		var history: HistoryFeature.State = .init()
 		var activeTab: ActiveTab = .settings
+		var speakerProfileIDToFocus: UUID?
 		@Shared(.hexSettings) var hexSettings: HexSettings
 		@Shared(.modelBootstrapState) var modelBootstrapState: ModelBootstrapState
 
@@ -50,6 +51,7 @@ struct AppFeature {
     case settings(SettingsFeature.Action)
     case history(HistoryFeature.Action)
     case setActiveTab(ActiveTab)
+		case focusSpeakerProfile(UUID)
     case task
     case pasteLastTranscript
     case interruptedRecordingsRecovered([RecoveredRecording], [RecoveredSystemAudioRecording])
@@ -57,6 +59,7 @@ struct AppFeature {
     // Permission actions
     case checkPermissions
     case permissionsUpdated(mic: PermissionStatus, acc: PermissionStatus, input: PermissionStatus, screenRecording: Bool)
+		case microphonePermissionRequestCompleted(Bool)
 		case appActivated
 		case modelStatusEvaluated(Bool)
 		case preferredSubscriptionProviderDetected(RefinementProvider?)
@@ -267,9 +270,10 @@ struct AppFeature {
         return .none
 
       case .settings(.requestMicrophone):
+		guard state.microphonePermission != .granted else { return .none }
         return .run { send in
-          _ = await permissions.requestMicrophone()
-          await send(.checkPermissions)
+		  let granted = await permissions.requestMicrophone()
+		  await send(.microphonePermissionRequestCompleted(granted))
         }
 
       case .settings(.requestAccessibility):
@@ -325,6 +329,13 @@ struct AppFeature {
         return .none
 		case let .setActiveTab(tab):
 			state.activeTab = tab
+			if tab != .speakers {
+				state.speakerProfileIDToFocus = nil
+			}
+			return .none
+		case let .focusSpeakerProfile(profileID):
+			state.activeTab = .speakers
+			state.speakerProfileIDToFocus = profileID
 			return .none
 
       // Permission handling
@@ -349,6 +360,14 @@ struct AppFeature {
           state.settings.needsScreenRecordingPermission = true
         }
         return .none
+
+	  case let .microphonePermissionRequestCompleted(granted):
+		state.microphonePermission = granted ? .granted : .denied
+		guard granted else { return .send(.checkPermissions) }
+		return .run { send in
+			await recording.warmUpRecorder()
+			await send(.checkPermissions)
+		}
 
       case .appActivated:
         // App became active - re-check permissions
@@ -511,12 +530,11 @@ struct AppView: View {
         SettingsView(
           store: store.scope(state: \.settings, action: \.settings),
           microphonePermission: store.microphonePermission,
-          accessibilityPermission: store.accessibilityPermission,
-          inputMonitoringPermission: store.inputMonitoringPermission
+          accessibilityPermission: store.accessibilityPermission
         )
         .navigationTitle("Settings")
 		case .speakers:
-			SpeakersView()
+			SpeakersView(profileIDToFocus: store.speakerProfileIDToFocus)
 				.navigationTitle("Speakers")
       case .handoffs:
         HandoffsView()
@@ -525,8 +543,11 @@ struct AppView: View {
         WordRemappingsView(store: store.scope(state: \.settings, action: \.settings))
           .navigationTitle("Transforms")
       case .history:
-        HistoryView(store: store.scope(state: \.history, action: \.history))
-          .navigationTitle("History")
+		HistoryView(
+			store: store.scope(state: \.history, action: \.history),
+			onOpenSpeaker: { store.send(.focusSpeakerProfile($0)) }
+		)
+		  .navigationTitle("History")
       case .about:
         AboutView(store: store.scope(state: \.settings, action: \.settings))
           .navigationTitle("About")

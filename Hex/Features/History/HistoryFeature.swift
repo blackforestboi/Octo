@@ -636,7 +636,9 @@ private struct RunHistoryItemView: View {
 	let onRerunTranscription: () -> Void
 	let onRerunFullRun: () -> Void
 	let onDelete: () -> Void
+	let onOpenSpeaker: (UUID) -> Void
 	let searchQuery: String
+	@Shared(.speakerVoiceLibrary) private var speakerVoiceLibrary: SpeakerVoiceLibrary
 	@State private var transcriptPresentation: TranscriptPresentation = .textOnly
 	@State private var isHoveringTranscription = false
 	@FocusState private var focusedTranscriptPresentation: TranscriptPresentation?
@@ -645,12 +647,20 @@ private struct RunHistoryItemView: View {
 	private var hasDistinctResult: Bool { transcript.text != rawTranscript || transcript.wasRefined == true }
 	private var timestampedSections: [TimestampedTranscriptSection] { transcript.timestampedSections ?? [] }
 	private var speakerSegments: [SpeakerAttributedSegment] { transcript.speakerSegments ?? [] }
-	private func speakerName(for section: TimestampedTranscriptSection) -> String? {
-		if let displayLabel = section.displayLabel { return displayLabel }
+	private func speakerSegment(for section: TimestampedTranscriptSection) -> SpeakerAttributedSegment? {
 		let matchingSegments = speakerSegments.filter {
 			$0.startTime <= section.startTime && $0.endTime >= section.endTime
 		}
-		return matchingSegments.count == 1 ? matchingSegments[0].speakerName : nil
+		return matchingSegments.count == 1 ? matchingSegments[0] : nil
+	}
+	private func speakerProfile(for section: TimestampedTranscriptSection) -> SpeakerVoiceProfile? {
+		guard let profileID = speakerSegment(for: section)?.profileID else { return nil }
+		return speakerVoiceLibrary.profiles.first { $0.id == profileID }
+	}
+	private func speakerName(for section: TimestampedTranscriptSection) -> String? {
+		if let profile = speakerProfile(for: section) { return profile.name }
+		if let displayLabel = section.displayLabel { return displayLabel }
+		return speakerSegment(for: section)?.speakerName
 	}
 	private var shouldShowTranscriptPresentationControls: Bool {
 		isHoveringTranscription || focusedTranscriptPresentation != nil
@@ -859,9 +869,19 @@ private struct RunHistoryItemView: View {
 								.frame(width: 72, alignment: .leading)
 							VStack(alignment: .leading, spacing: 2) {
 								if let speakerName = speakerName(for: section) {
-									Text(speakerName)
+									if let profile = speakerProfile(for: section), profile.isUnknownSpeaker {
+										Button(speakerName) {
+											onOpenSpeaker(profile.id)
+										}
+										.buttonStyle(.plain)
 										.font(.caption.weight(.semibold))
 										.foregroundStyle(.secondary)
+										.help("Name this speaker")
+									} else {
+										Text(speakerName)
+											.font(.caption.weight(.semibold))
+											.foregroundStyle(.secondary)
+									}
 								}
 								Text(highlightedText(section.text, matching: searchQuery))
 									.textSelection(.enabled)
@@ -966,6 +986,7 @@ private extension ScreenAwareInputSource {
 struct HistoryView: View {
 	@ObserveInjection var inject
 	let store: StoreOf<HistoryFeature>
+	let onOpenSpeaker: (UUID) -> Void
 	@State private var showingDeleteConfirmation = false
 	@State private var searchQuery = ""
 	@State private var submittedSearchQuery = ""
@@ -1033,9 +1054,10 @@ struct HistoryView: View {
                   onPlay: { store.send(.playTranscript(transcript.id)) },
                   onSeek: { store.send(.seekTranscript(transcript.id, $0)) },
                   onCopy: { store.send(.copyToClipboard(transcript.text)) },
-                  onRerunTranscription: { store.send(.rerunTranscription(transcript.id)) },
-                  onRerunFullRun: { store.send(.rerunFullRun(transcript.id)) },
+				  onRerunTranscription: { store.send(.rerunTranscription(transcript.id)) },
+				  onRerunFullRun: { store.send(.rerunFullRun(transcript.id)) },
 					onDelete: { store.send(.deleteTranscript(transcript.id)) },
+					onOpenSpeaker: onOpenSpeaker,
 					searchQuery: matchingTranscriptIDs == nil ? "" : submittedSearchQuery
                 )
               }

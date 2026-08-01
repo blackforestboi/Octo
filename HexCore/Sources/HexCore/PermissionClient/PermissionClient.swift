@@ -62,7 +62,7 @@ public struct PermissionClient: Sendable {
 
   /// Request input monitoring permission from the user.
   ///
-  /// Triggers the consent dialog introduced in macOS Sequoia when listening for keyboard events.
+  /// Registers the app with Input Monitoring and triggers the system consent dialog.
   public var requestInputMonitoring: @Sendable () async -> Bool = { false }
 
   /// Request Screen Recording permission from the user.

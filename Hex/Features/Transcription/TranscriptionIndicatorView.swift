@@ -25,6 +25,7 @@ struct TranscriptionIndicatorView: View {
 		case completedTranscript(String)
 		case copied(String)
 		case hidingCopied(String)
+		case microphonePermissionRequired
 		case error(String)
 
 		var showsWaveform: Bool {
@@ -49,6 +50,15 @@ struct TranscriptionIndicatorView: View {
 		var isHandoffFlying: Bool {
 			guard case let .handoff(_, _, _, _, isFlying) = self else { return false }
 			return isFlying
+		}
+
+		/// Content must be gone before the departing handoff pill starts shrinking.
+		var hidesContentForHandoffDeparture: Bool {
+			isHandoffDeparting
+		}
+
+		var requestsMicrophonePermissionWhenTapped: Bool {
+			self == .microphonePermissionRequired
 		}
 	}
 
@@ -101,6 +111,7 @@ struct TranscriptionIndicatorView: View {
 	var onDismissAgentHandoff: () -> Void = {}
 	var onCopyCompletedTranscript: () -> Void = {}
 	var onDismissCompletedTranscript: () -> Void = {}
+	var onRequestMicrophonePermission: () -> Void = {}
 	var onCardSizeChange: (CGSize?, Bool) -> Void = { _, _ in }
 
 	@State private var waveformSamples: [CGFloat] = []
@@ -149,7 +160,7 @@ struct TranscriptionIndicatorView: View {
 	}
 	private var opensHistoryWhenTapped: Bool {
 		switch status {
-		case .hidden, .handoff(_, _, _, _, _), .completedTranscript, .copied, .hidingCopied:
+		case .hidden, .handoff(_, _, _, _, _), .completedTranscript, .copied, .hidingCopied, .microphonePermissionRequired:
 			false
 		default:
 			true
@@ -177,7 +188,7 @@ struct TranscriptionIndicatorView: View {
 			expandedSize(for: text).width
 		case .copied, .hidingCopied:
 			recordingPillSize.width
-		case .error:
+		case .microphonePermissionRequired, .error:
 			300
 		}
 	}
@@ -275,6 +286,7 @@ struct TranscriptionIndicatorView: View {
 		case .completedTranscript: "Transcript ready to copy"
 		case .copied: "Transcript copied"
 		case .hidingCopied: "Transcript copied"
+		case .microphonePermissionRequired: "Microphone access required. Click to grant access."
 		case let .error(message): "Error: \(message)"
 		}
 		guard status.showsWaveform, !activeRecordingCapabilities.isEmpty else { return statusLabel }
@@ -283,7 +295,13 @@ struct TranscriptionIndicatorView: View {
 
 	@ViewBuilder
 	var body: some View {
-	if opensHistoryWhenTapped {
+		if status.requestsMicrophonePermissionWhenTapped {
+			indicatorBody
+				.onTapGesture(perform: onRequestMicrophonePermission)
+				.accessibilityAddTraits(.isButton)
+				.accessibilityHint("Requests microphone access from macOS")
+				.accessibilityAction { onRequestMicrophonePermission() }
+		} else if opensHistoryWhenTapped {
 			indicatorBody.onTapGesture(perform: onOpenHistory)
 		} else if case let .handoff(_, isReady, _, isDeparting, _) = status, isReady, !isDeparting {
 			indicatorBody.onTapGesture(perform: onOpenAgentHandoff)
@@ -339,7 +357,11 @@ struct TranscriptionIndicatorView: View {
 
 			content
 				.frame(width: visibleCardSize.width, height: visibleCardSize.height)
-				.opacity(Double(1 - min(CGFloat(1), handoffDepartureProgress * 4)))
+				// The Shift-ended handoff begins its visual departure here. Remove the
+				// preceding rewrite/loading label before the pill starts condensing so
+				// no text is visible inside the departing ball.
+				.opacity(status.hidesContentForHandoffDeparture ? 0 : 1)
+				.animation(nil, value: status.hidesContentForHandoffDeparture)
 		}
 			.frame(width: panelSize.width, height: panelSize.height)
 	}
@@ -425,6 +447,13 @@ struct TranscriptionIndicatorView: View {
 			copiedLabel
 		} else if case .hidingCopied = status {
 			copiedLabel
+		} else if case .microphonePermissionRequired = status {
+			Label("Microphone access required — click to grant access", systemImage: "exclamationmark.triangle.fill")
+				.font(.system(size: 10, weight: .semibold))
+				.foregroundStyle(.white)
+				.lineLimit(2)
+				.multilineTextAlignment(.center)
+				.padding(.horizontal, 10)
 		} else if case let .error(message) = status {
 			Label(message, systemImage: "exclamationmark.triangle.fill")
 				.font(.system(size: 10, weight: .semibold))
@@ -770,6 +799,8 @@ struct TranscriptionIndicatorOverlayView: View {
 			case let .copied(text): return .copied(text)
 			case let .hidingCopied(text): return .hidingCopied(text)
 			}
+		} else if store.isMicrophonePermissionRequired {
+			return .microphonePermissionRequired
 		} else if let error = store.error {
 			return .error(error)
 		} else if let handoff = store.agentHandoffPresentation {
@@ -808,6 +839,7 @@ struct TranscriptionIndicatorOverlayView: View {
 			onDismissAgentHandoff: { store.send(.dismissAgentHandoff) },
 			onCopyCompletedTranscript: { store.send(.copyCompletedTranscript) },
 			onDismissCompletedTranscript: { store.send(.dismissCompletedTranscript) },
+			onRequestMicrophonePermission: { store.send(.requestMicrophonePermission) },
 			onCardSizeChange: { size, preservingCenter in
 				currentPillSize = size
 				onPillSizeChange(size, preservingCenter)

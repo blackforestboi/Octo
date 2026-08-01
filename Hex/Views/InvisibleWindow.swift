@@ -326,29 +326,11 @@ class InvisibleWindow: NSPanel {
   private func updateFrame(size: CGSize, animated: Bool) {
     guard let screen = currentScreen else { return }
 
-    let horizontalInset: CGFloat = 24
-    let verticalInset: CGFloat = 18
-    let screenFrame = screen.frame
-    let originX: CGFloat
-    let originY: CGFloat
-
-    switch indicatorLocation {
-    case .topLeading, .bottomLeading:
-      originX = screenFrame.minX + horizontalInset
-    case .topCenter, .bottomCenter:
-      originX = screenFrame.midX - size.width / 2
-    case .topTrailing, .bottomTrailing:
-      originX = screenFrame.maxX - horizontalInset - size.width
-    }
-
-    switch indicatorLocation {
-    case .topLeading, .topCenter, .topTrailing:
-      originY = screenFrame.maxY - verticalInset - size.height
-    case .bottomLeading, .bottomCenter, .bottomTrailing:
-      originY = screenFrame.minY + verticalInset
-    }
-
-    let newFrame = NSRect(origin: .init(x: originX, y: originY), size: size)
+    let newFrame = Self.indicatorFrame(
+      size: size,
+      location: indicatorLocation,
+      screenFrame: screen.frame
+    )
     guard animated else {
       setFrame(newFrame, display: true)
       return
@@ -358,6 +340,37 @@ class InvisibleWindow: NSPanel {
       context.duration = 0.22
       animator().setFrame(newFrame, display: true)
     }
+  }
+
+  static func indicatorFrame(
+    size: CGSize,
+    location: IndicatorLocation,
+    screenFrame: NSRect
+  ) -> NSRect {
+    let horizontalInset: CGFloat = 24
+    // Keep top-positioned pills clear of the MacBook camera island/menu bar.
+    let topInset: CGFloat = 48
+    let bottomInset: CGFloat = 18
+    let originX: CGFloat
+    let originY: CGFloat
+
+    switch location {
+    case .topLeading, .bottomLeading:
+      originX = screenFrame.minX + horizontalInset
+    case .topCenter, .bottomCenter:
+      originX = screenFrame.midX - size.width / 2
+    case .topTrailing, .bottomTrailing:
+      originX = screenFrame.maxX - horizontalInset - size.width
+    }
+
+    switch location {
+    case .topLeading, .topCenter, .topTrailing:
+      originY = screenFrame.maxY - topInset - size.height
+    case .bottomLeading, .bottomCenter, .bottomTrailing:
+      originY = screenFrame.minY + bottomInset
+    }
+
+    return NSRect(origin: .init(x: originX, y: originY), size: size)
   }
 }
 

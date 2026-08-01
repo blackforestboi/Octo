@@ -1,26 +1,58 @@
 # Octo Release Process
 
-Releases are created by pushing a `v*` tag. The GitHub Actions workflow signs and notarizes Octo, publishes an `Octo-{version}.dmg` and `Octo-{version}.zip` GitHub release, then generates and deploys the signed Sparkle feed.
+Releases are built for Apple Silicon (`arm64`), signed, notarized, stapled, and
+packaged locally. The local release command thins Sparkle's prebuilt universal
+binaries and verifies every Mach-O file is `arm64`-only, then creates or updates
+the GitHub Release and commits the signed Sparkle feed. GitHub Actions does not
+build or notarize the app; it only deploys the committed feed to GitHub Pages.
 
-## Required repository secrets
+## Local prerequisites
 
-- `MACOS_CERTIFICATE` and `MACOS_CERTIFICATE_PWD` — Developer ID certificate used to sign the app.
-- `APPLE_API_KEY`, `APPLE_API_KEY_ID`, and `APPLE_API_ISSUER` — App Store Connect credentials used for notarization.
-- `SPARKLE_PRIVATE_KEY` — the private Ed25519 Sparkle signing key. It signs the update feed and must match `SUPublicEDKey` in `Hex/Info.plist`.
+- A Developer ID Application identity for team `5YUPQC9D96` in the login Keychain.
+- A validated `notarytool` Keychain profile named `AC_PASSWORD` (or another
+  profile supplied through `NOTARY_PROFILE`).
+- GitHub CLI authentication with write access: `gh auth login`.
+- The Sparkle private Ed25519 key. Store it in the Keychain once, without putting
+  it in the repository or shell history:
+
+  ```bash
+  read -s -p "Sparkle private key: " sparkle_key; echo
+  security add-generic-password -U -a "$USER" -s "Octo Sparkle Private Key" -w "$sparkle_key"
+  unset sparkle_key
+  ```
+
+  Alternatively, set `SPARKLE_PRIVATE_KEY_FILE` for an individual release.
 
 ## First-time setup
 
 1. In **Settings → Pages**, select **GitHub Actions** as the source.
 2. Push `docs/updates/appcast.xml` or manually run **Publish Initial Update Feed**. This serves the initial feed at <https://blackforestboi.github.io/Octo/appcast.xml>.
-3. Confirm the feed returns an XML document before the first release.
+3. Confirm the feed returns an XML document before the first release. The
+   `Publish Initial Update Feed` workflow remains responsible only for deploying
+   this static feed.
 
 ## Publish a release
 
 ```bash
-git tag v2026.7.162
-git push origin v2026.7.162
+bun run release:local -- --tag v2026.7.162 --publish
 ```
 
-The tag must match `CFBundleShortVersionString`. Once the release job succeeds, open the appcast and confirm its newest item has a `sparkle:edSignature` and points to the corresponding GitHub release asset.
+Run the command only from a clean default branch after the release version is
+committed. It verifies that the tag matches `CFBundleShortVersionString`, creates
+and pushes the tag if needed, produces an Apple Silicon-only notarized ZIP and
+DMG locally, uploads them to GitHub Releases, then signs and commits the appcast.
+The appcast commit triggers the lightweight Pages deployment workflow; it does
+not start a macOS build.
+
+The command refuses to publish unless `--publish` is provided. This prevents an
+accidental build or GitHub release while preparing a release.
+
+Release archives use the persistent, ignored `build/DerivedData-Release` cache.
+The command fingerprints the SwiftPM manifests and lockfiles, Xcode project
+package references, and the Xcode toolchain version. It clears that cache only
+when the fingerprint changes; ordinary Swift source changes stay incremental.
+
+Once it completes, open the appcast and confirm its newest item has a
+`sparkle:edSignature` and points to the corresponding GitHub release asset.
 
 The MIT license and Hex attribution remain in the repository; Octo's feed, signing key, bundle identifier, release assets, and GitHub links are independent from upstream Hex.
