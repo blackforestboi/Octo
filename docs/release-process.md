@@ -49,8 +49,10 @@ accidental build or GitHub release while preparing a release.
 
 Release archives use the persistent, ignored `build/DerivedData-Release` cache.
 The command fingerprints the SwiftPM manifests and lockfiles, Xcode project
-package references, and the Xcode toolchain version. It clears that cache only
-when the fingerprint changes; ordinary Swift source changes stay incremental.
+package references, and the Xcode toolchain version. Version/build-number edits
+are excluded from the project fingerprint, so version bumps do not clear the
+dependency cache. It clears that cache only when dependency inputs or the
+toolchain change; ordinary Swift source changes stay incremental.
 
 Once it completes, open the appcast and confirm its newest item has a
 `sparkle:edSignature` and points to the corresponding GitHub release asset.

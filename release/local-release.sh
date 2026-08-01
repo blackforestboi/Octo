@@ -132,7 +132,11 @@ dependency_fingerprint="$({
   xcodebuild -version
   for dependency_input in "${dependency_inputs[@]}"; do
     printf '%s\n' "$dependency_input"
-    shasum -a 256 "$dependency_input"
+    if [[ "$dependency_input" == "Hex.xcodeproj/project.pbxproj" ]]; then
+      sed -E '/^[[:space:]]*(CURRENT_PROJECT_VERSION|MARKETING_VERSION) = /d' "$dependency_input" | shasum -a 256
+    else
+      shasum -a 256 "$dependency_input"
+    fi
   done
 } | shasum -a 256 | awk '{print $1}')"
 
