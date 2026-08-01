@@ -28,13 +28,13 @@ final class AgentHandoffClientTests: XCTestCase {
 		XCTAssertNil(AgentHandoffThreadDestination.codexURL(for: "not-a-thread"))
 	}
 
-	func testHandoffTaskIsOpenableOnlyWithANativeThread() {
+	func testHandoffTaskIsOpenableOnlyWhenDoneWithANativeThread() {
 		let task = AgentHandoffTask(
 			id: UUID(),
 			createdAt: .now,
 			provider: .codex,
 			title: "Update menu bar",
-			state: .pending,
+			state: .completed,
 			thread: .codex("528b9ff2-d685-4c1a-b2d8-76d6a1661de3"),
 			handoff: ""
 		)
@@ -50,6 +50,24 @@ final class AgentHandoffClientTests: XCTestCase {
 
 		XCTAssertTrue(task.isOpenable)
 		XCTAssertFalse(legacyTask.isOpenable)
+	}
+
+	func testHandoffTaskIsNotOpenableBeforeItIsDone() {
+		let thread = AgentHandoffThread.codex("528b9ff2-d685-4c1a-b2d8-76d6a1661de3")
+
+		for state in [AgentHandoffTask.Status.pending, .threadCreated, .registered, .running, .failed] {
+			let task = AgentHandoffTask(
+				id: UUID(),
+				createdAt: .now,
+				provider: .codex,
+				title: "Update menu bar",
+				state: state,
+				thread: thread,
+				handoff: ""
+			)
+
+			XCTAssertFalse(task.isOpenable, "Unexpectedly openable in state \(state)")
+		}
 	}
 
 	func testHandoffTaskExposesLifecycleStateForMenuBarStatus() {
@@ -171,7 +189,6 @@ final class AgentHandoffClientTests: XCTestCase {
 			screenContext: nil,
 			screenAwareInputSource: .localOCR
 		)
-		let workspace = URL(fileURLWithPath: "/Users/example/GitHub", isDirectory: true)
 		let guidance = HandoffPrompt.workPackagePlanningGuidance
 
 		XCTAssertTrue(guidance.contains("`handoff start`/`handoff end`"))
@@ -179,6 +196,9 @@ final class AgentHandoffClientTests: XCTestCase {
 		XCTAssertTrue(guidance.contains("Create one separate work package for each marked block"))
 		XCTAssertTrue(guidance.contains("default to the fewest cohesive master work packages necessary"))
 		XCTAssertTrue(guidance.contains("lists, conjunctions, and several requested actions are not themselves split signals"))
+		XCTAssertTrue(guidance.contains("bare domain or path"))
+		XCTAssertTrue(guidance.contains("Do not browse, fetch, evaluate, or otherwise research any URL yourself"))
+		XCTAssertTrue(guidance.contains("Source URLs to research"))
 		let projectCatalog = [
 			CodexProjectCatalog.Project(
 				id: "research",
@@ -188,15 +208,36 @@ final class AgentHandoffClientTests: XCTestCase {
 		]
 		let plannerRequest = HandoffPrompt.codexPlannerRequest(
 			request,
-			workspaceRoot: workspace,
 			projectCatalog: projectCatalog
 		)
 		XCTAssertTrue(plannerRequest.contains(guidance))
-		XCTAssertTrue(plannerRequest.contains(workspace.path))
+		XCTAssertFalse(plannerRequest.contains("handoff_discovery_workspace"))
 		XCTAssertTrue(plannerRequest.contains("projectPath"))
 		XCTAssertTrue(plannerRequest.contains("Research Tasks"))
 		XCTAssertTrue(plannerRequest.contains("/Users/example/GitHub/research-tasks"))
 		XCTAssertTrue(HandoffPrompt.claudeCoordinatorInstruction(token: "test").contains(guidance))
+	}
+
+	func testSourceContextExtractsProtocolAndBareURLsForChildResearch() {
+		let context = HandoffPrompt.sourceContext(
+			transcript: "Compare https://api.example.com/v1?limit=1, then check docs.example.org/guide.",
+			selectedText: "Reference www.example.net/releases and docs.example.org/guide.",
+			screenRecognizedText: "Also see HTTP://status.example.io/health.",
+			screenPixelWidth: nil,
+			screenPixelHeight: nil,
+			screenCursorX: nil,
+			screenCursorY: nil,
+			screenAwareInputSource: nil,
+			hasAttachedScreenshot: false
+		)
+
+		XCTAssertTrue(context.contains("<source_urls>"))
+		XCTAssertTrue(context.contains("Source URLs to research:"))
+		XCTAssertTrue(context.contains("https://api.example.com/v1?limit=1"))
+		XCTAssertTrue(context.contains("https://docs.example.org/guide"))
+		XCTAssertTrue(context.contains("https://www.example.net/releases"))
+		XCTAssertTrue(context.contains("HTTP://status.example.io/health"))
+		XCTAssertEqual(context.components(separatedBy: "https://docs.example.org/guide").count, 2)
 	}
 
 	func testCodexProjectCatalogUsesSidebarProjectsInCodexOrder() throws {
@@ -251,15 +292,24 @@ final class AgentHandoffClientTests: XCTestCase {
 		)
 	}
 
-	func testCodexProjectCatalogFiltersPathsOutsideDiscoveryWorkspace() {
-		let catalog = CodexProjectCatalog(projects: [
-			.init(id: "research", name: "Research Tasks", path: "/tmp/GitHub/research"),
-			.init(id: "documents", name: "Documents", path: "/tmp/Documents/project"),
-		])
+	func testCodexProjectStateDiscoveryUsesTheHomeReportedByCodex() throws {
+		let temporaryRoot = FileManager.default.temporaryDirectory
+			.appendingPathComponent(UUID().uuidString, isDirectory: true)
+		defer { try? FileManager.default.removeItem(at: temporaryRoot) }
+		let reportedHome = temporaryRoot.appendingPathComponent("relocated-runtime-data", isDirectory: true)
+		try FileManager.default.createDirectory(at: reportedHome, withIntermediateDirectories: true)
+		let stateFile = reportedHome.appendingPathComponent(".codex-global-state.json")
+		try Data("{}".utf8).write(to: stateFile)
+		let escapedPath = reportedHome.path.replacingOccurrences(of: "\\", with: "\\\\")
+			.replacingOccurrences(of: "\"", with: "\\\"")
+		let initializeOutput = """
+		{"id":1,"result":{"codexHome":"\(escapedPath)"}}
+		{"method":"unrelated/notification","params":{}}
+		"""
 
 		XCTAssertEqual(
-			catalog.projects(inside: URL(fileURLWithPath: "/tmp/GitHub", isDirectory: true)),
-			[.init(id: "research", name: "Research Tasks", path: "/tmp/GitHub/research")]
+			CodexProjectCatalogLocation.stateFile(fromInitializeOutput: initializeOutput),
+			stateFile.standardizedFileURL
 		)
 	}
 

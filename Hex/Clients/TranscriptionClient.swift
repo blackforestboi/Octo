@@ -27,6 +27,10 @@ struct TranscriptionClient {
   /// Ensures a model is downloaded (if missing) and loaded into memory, reporting progress via `progressCallback`.
   var downloadModel: @Sendable (String, @escaping (Progress) -> Void) async throws -> Void
 
+  /// Ensures a model's assets are downloaded and the model is activated in memory.
+  /// The phase-tagged updates let callers keep recording unavailable until activation completes.
+  var prepareModel: @Sendable (String, @escaping (ModelPreparationUpdate) -> Void) async throws -> Void
+
   /// Deletes a model from disk if it exists
   var deleteModel: @Sendable (String) async throws -> Void
 
@@ -46,6 +50,7 @@ extension TranscriptionClient: DependencyKey {
     return Self(
       transcribe: { try await live.transcribe(url: $0, model: $1, options: $2, progressCallback: $3) },
       downloadModel: { try await live.downloadAndLoadModel(variant: $0, progressCallback: $1) },
+      prepareModel: { try await live.downloadAndLoadModel(variant: $0, progressCallback: { _ in }, preparationUpdate: $1) },
       deleteModel: { try await live.deleteModel(variant: $0) },
       isModelDownloaded: { await live.isModelDownloaded($0) },
       getRecommendedModels: { await live.getRecommendedModels() },
@@ -99,10 +104,23 @@ actor TranscriptionClientLive {
 
   /// Ensures the given `variant` model is downloaded and loaded, reporting
   /// overall progress (0%–50% for downloading, 50%–100% for loading).
-  func downloadAndLoadModel(variant: String, progressCallback: @escaping (Progress) -> Void) async throws {
+  func downloadAndLoadModel(
+    variant: String,
+    progressCallback: @escaping (Progress) -> Void,
+    preparationUpdate: @escaping (ModelPreparationUpdate) -> Void = { _ in }
+  ) async throws {
     // If Parakeet, use Parakeet client path
     if isParakeet(variant) {
-      try await parakeet.ensureLoaded(modelName: variant, progress: progressCallback)
+      try await parakeet.ensureLoaded(
+        modelName: variant,
+        progress: { progress in
+          progressCallback(progress)
+          preparationUpdate(.init(phase: .downloading, progress: progress.fractionCompleted))
+        },
+        preparationPhase: { phase in
+          preparationUpdate(.init(phase: phase, progress: 1))
+        }
+      )
       currentModelName = variant
       return
     }
@@ -122,6 +140,7 @@ actor TranscriptionClientLive {
     let overallProgress = Progress(totalUnitCount: 100)
     overallProgress.completedUnitCount = 0
     progressCallback(overallProgress)
+    preparationUpdate(.init(phase: .downloading, progress: 0))
 
     modelsLogger.info("Preparing model download and load for \(variant)")
 
@@ -131,18 +150,22 @@ actor TranscriptionClientLive {
         let fraction = downloadProgress.fractionCompleted * 0.5
         overallProgress.completedUnitCount = Int64(fraction * 100)
         progressCallback(overallProgress)
+        preparationUpdate(.init(phase: .downloading, progress: fraction))
       }
     } else {
       // Skip download phase if already downloaded
       overallProgress.completedUnitCount = 50
       progressCallback(overallProgress)
+      preparationUpdate(.init(phase: .downloading, progress: 0.5))
     }
 
     // 2) Model loading phase (50-100% progress)
+    preparationUpdate(.init(phase: .activating, progress: 0.5))
     try await loadWhisperKitModel(variant) { loadingProgress in
       let fraction = 0.5 + (loadingProgress.fractionCompleted * 0.5)
       overallProgress.completedUnitCount = Int64(fraction * 100)
       progressCallback(overallProgress)
+      preparationUpdate(.init(phase: .activating, progress: fraction))
     }
 
     // Final progress update

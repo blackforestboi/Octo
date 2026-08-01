@@ -84,7 +84,7 @@ struct AgentHandoffTask: Equatable, Identifiable, Sendable {
 	let title: String
 	/// The last lifecycle state reported by the native handoff runner.
 	let state: Status
-	/// The native task to open, when this journal entry completed provider registration.
+	/// The native task to open after this journal entry's child task is done.
 	let thread: AgentHandoffThread?
 	/// The complete text delivered to the child task.
 	let handoff: String
@@ -116,7 +116,7 @@ struct AgentHandoffTask: Equatable, Identifiable, Sendable {
 	}
 
 	var isOpenable: Bool {
-		thread != nil
+		state == .completed && thread != nil
 	}
 
 	var isRunning: Bool {
@@ -154,6 +154,7 @@ enum AgentHandoffError: LocalizedError, Equatable {
 	case executableNotFound(String)
 	case workspaceUnavailable
 	case projectCatalogUnavailable
+	case projectCatalogEmpty
 	case launchFailed(String, diagnostic: String? = nil)
 
 	var errorDescription: String? {
@@ -168,10 +169,12 @@ enum AgentHandoffError: LocalizedError, Equatable {
 			"Agent Handoff requires a spoken request or selected text."
 		case let .executableNotFound(provider):
 			"\(provider) CLI was not found."
-	case .workspaceUnavailable:
+		case .workspaceUnavailable:
 			"Choose an Agent Handoff workspace or Agent Handoffs folder before starting an agent handoff."
 		case .projectCatalogUnavailable:
-			"Allow read access to Codex’s project-state file in Agent Handoff settings, then try again."
+			"Codex’s project-state file is unavailable. Open Codex Desktop once, then try again."
+		case .projectCatalogEmpty:
+			"Codex has no available local projects. Add or open a project in Codex Desktop, then try again."
 		case let .launchFailed(provider, diagnostic):
 			["\(provider) could not start the agent handoff.", diagnostic]
 				.compactMap { $0 }
@@ -244,12 +247,6 @@ extension DependencyValues {
 
 private enum AgentHandoffWorkspace {
 	private static let bookmarkKey = "agent-handoff-workspace-bookmark"
-	private static let codexDiscoveryBookmarkKey = "agent-handoff-codex-discovery-bookmark"
-	private static let codexProjectCatalogBookmarkKey = "agent-handoff-codex-project-catalog-bookmark"
-	private static let obsoleteCodexProjectBookmarkKeys = [
-		"agent-handoff-codex-project-bookmark",
-		"agent-handoff-codex-projectless-bookmark",
-	]
 
 	final class SecurityScopedDirectory: @unchecked Sendable {
 		let root: URL
@@ -265,97 +262,15 @@ private enum AgentHandoffWorkspace {
 		}
 	}
 
-	final class SecurityScopedFile: @unchecked Sendable {
-		let url: URL
-		private let accessURL: URL?
-
-		init(url: URL, accessURL: URL? = nil) {
-			self.url = url
-			self.accessURL = accessURL
-		}
-
-		deinit {
-			accessURL?.stopAccessingSecurityScopedResource()
-		}
-	}
-
-	private static var codexProjectStateURL: URL {
-		FileManager.default.homeDirectoryForCurrentUser
-			.appendingPathComponent(".codex", isDirectory: true)
-			.appendingPathComponent(".codex-global-state.json", isDirectory: false)
-			.standardizedFileURL
-	}
-
-	/// Requests access to exactly Codex Desktop's project-state file. The bookmark is
-	/// used read-only to keep each handoff's routing catalogue current.
+	/// Verifies that Codex Desktop has created its project-state file. Octo is not
+	/// sandboxed, so it can use the home reported by the active Codex runtime.
 	@MainActor
-	static func authorizeCodexProjectCatalog() throws {
-		if let resolved = resolveCodexProjectCatalogBookmark() {
-			resolved.stopAccessingSecurityScopedResource()
-			return
-		}
-
-		let panel = NSOpenPanel()
-		panel.title = "Allow Codex Project Routing"
-		panel.message = "Choose Codex’s .codex-global-state.json file. Octo reads this file before each Codex handoff to identify your current projects; it never modifies it."
-		panel.prompt = "Allow Read Access"
-		panel.canChooseFiles = true
-		panel.canChooseDirectories = false
-		panel.allowsMultipleSelection = false
-		panel.showsHiddenFiles = true
-		panel.directoryURL = codexProjectStateURL.deletingLastPathComponent()
-
-		guard panel.runModal() == .OK,
-			let selected = panel.url?.standardizedFileURL,
-			selected == codexProjectStateURL,
-			selected.startAccessingSecurityScopedResource()
-		else { throw AgentHandoffError.projectCatalogUnavailable }
-		defer { selected.stopAccessingSecurityScopedResource() }
-		let bookmark = try selected.bookmarkData(
-			options: [.withSecurityScope, .securityScopeAllowOnlyReadAccess],
-			includingResourceValuesForKeys: nil,
-			relativeTo: nil
-		)
-		UserDefaults.standard.set(bookmark, forKey: codexProjectCatalogBookmarkKey)
+	static func authorizeCodexProjectCatalog() async throws {
+		_ = try await CodexProjectCatalogLocation.discoverStateFile()
 	}
 
-	static func openCodexProjectCatalog() throws -> SecurityScopedFile {
-		guard let resolved = resolveCodexProjectCatalogBookmark() else {
-			throw AgentHandoffError.projectCatalogUnavailable
-		}
-		guard FileManager.default.fileExists(atPath: resolved.path) else {
-			resolved.stopAccessingSecurityScopedResource()
-			throw AgentHandoffError.projectCatalogUnavailable
-		}
-		return .init(url: resolved.standardizedFileURL, accessURL: resolved)
-	}
-
-	/// Codex rewrites its global JSON state, which may mark a valid file bookmark
-	/// stale. Refresh the bookmark while its existing security scope is active rather
-	/// than asking the user to authorize the same file again.
-	private static func resolveCodexProjectCatalogBookmark() -> URL? {
-		var bookmarkIsStale = false
-		guard let bookmark = UserDefaults.standard.data(forKey: codexProjectCatalogBookmarkKey),
-			let resolved = try? URL(
-				resolvingBookmarkData: bookmark,
-				options: [.withSecurityScope],
-				relativeTo: nil,
-				bookmarkDataIsStale: &bookmarkIsStale
-			),
-			resolved.standardizedFileURL == codexProjectStateURL,
-			resolved.startAccessingSecurityScopedResource()
-		else { return nil }
-
-		if bookmarkIsStale,
-			let refreshedBookmark = try? resolved.bookmarkData(
-				options: [.withSecurityScope, .securityScopeAllowOnlyReadAccess],
-				includingResourceValuesForKeys: nil,
-				relativeTo: nil
-			)
-		{
-			UserDefaults.standard.set(refreshedBookmark, forKey: codexProjectCatalogBookmarkKey)
-		}
-		return resolved
+	static func openCodexProjectCatalog() async throws -> URL {
+		try await CodexProjectCatalogLocation.discoverStateFile()
 	}
 
 	/// Resolves the dedicated Claude workspace and retains its sandbox access until
@@ -440,67 +355,128 @@ private enum AgentHandoffWorkspace {
 		return url
 	}
 
-	/// Grants Octo access to the project folders eligible for Codex child tasks.
-	/// The coordinator receives current Codex project metadata separately from the
-	/// user-authorized state file and may only select a project under this root.
-	static func openCodexDiscoveryRoot() async throws -> SecurityScopedDirectory {
-		// The previous one-project configuration is deliberately not a migration
-		// source: it would make the coordinator's discovery boundary implicit.
-		obsoleteCodexProjectBookmarkKeys.forEach { UserDefaults.standard.removeObject(forKey: $0) }
-		var bookmarkIsStale = false
-		if let bookmark = UserDefaults.standard.data(forKey: codexDiscoveryBookmarkKey),
-			let resolved = try? URL(
-				resolvingBookmarkData: bookmark,
-				options: [.withSecurityScope],
-				relativeTo: nil,
-				bookmarkDataIsStale: &bookmarkIsStale
-			),
-			!bookmarkIsStale,
-			resolved.startAccessingSecurityScopedResource()
-		{
-			return .init(root: resolved.standardizedFileURL, accessURL: resolved)
+}
+
+enum CodexProjectCatalogLocation {
+	private static let cachedHomeKey = "agent-handoff-discovered-codex-home"
+	private static let stateFileName = ".codex-global-state.json"
+
+	static func discoverStateFile(fileManager: FileManager = .default) async throws -> URL {
+		let codex = try executable(named: "codex", fallback: "/Applications/ChatGPT.app/Contents/Resources/codex")
+		let output = try await initializeAppServer(executableURL: codex)
+		guard let stateFile = stateFile(fromInitializeOutput: output, fileManager: fileManager) else {
+			throw AgentHandoffError.projectCatalogUnavailable
+		}
+		UserDefaults.standard.set(stateFile.deletingLastPathComponent().path, forKey: cachedHomeKey)
+		return stateFile
+	}
+
+	static func stateFile(
+		fromInitializeOutput output: String,
+		fileManager: FileManager = .default
+	) -> URL? {
+		guard let home = codexHome(fromInitializeOutput: output) else { return nil }
+		let stateFile = home.appendingPathComponent(stateFileName, isDirectory: false).standardizedFileURL
+		return fileManager.isReadableFile(atPath: stateFile.path) ? stateFile : nil
+	}
+
+	static func cachedHomeDirectory(fileManager: FileManager = .default) -> URL? {
+		guard let path = UserDefaults.standard.string(forKey: cachedHomeKey) else { return nil }
+		let home = URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
+		var isDirectory: ObjCBool = false
+		guard fileManager.fileExists(atPath: home.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+			return nil
+		}
+		return home
+	}
+
+	private static func codexHome(fromInitializeOutput output: String) -> URL? {
+		for line in output.split(whereSeparator: \.isNewline) {
+			guard let data = line.data(using: .utf8),
+				let message = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+				(message["id"] as? NSNumber)?.intValue == 1,
+				let result = message["result"] as? [String: Any],
+				let path = (result["codexHome"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+				!path.isEmpty
+			else { continue }
+			return URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
+		}
+		return nil
+	}
+
+	private static func initializeAppServer(executableURL: URL) async throws -> String {
+		let process = Process()
+		let standardInput = Pipe()
+		let standardOutput = Pipe()
+		let standardError = Pipe()
+		process.executableURL = executableURL
+		process.arguments = ["app-server"]
+		process.currentDirectoryURL = FileManager.default.temporaryDirectory
+		process.environment = ProcessInfo.processInfo.environment
+		process.standardInput = standardInput
+		process.standardOutput = standardOutput
+		process.standardError = standardError
+		let request: [String: Any] = [
+			"id": 1,
+			"method": "initialize",
+			"params": [
+				"clientInfo": ["name": "Octo", "version": "1.0.0"],
+				"capabilities": [:],
+			],
+		]
+		guard let requestData = try? JSONSerialization.data(withJSONObject: request) else {
+			throw AgentHandoffError.projectCatalogUnavailable
 		}
 
-		return try await MainActor.run {
-			let panel = NSOpenPanel()
-			panel.title = "Choose Agent Handoff Workspace"
-			panel.message = "Choose a folder containing projects that may receive handoffs. Octo reads your current Codex project list for each handoff and uses only projects inside this folder."
-			panel.prompt = "Allow Workspace"
-			panel.canChooseFiles = false
-			panel.canChooseDirectories = true
-			panel.allowsMultipleSelection = false
-			let gitHubDirectory = FileManager.default.homeDirectoryForCurrentUser
-				.appendingPathComponent("GitHub", isDirectory: true)
-			panel.directoryURL = FileManager.default.fileExists(atPath: gitHubDirectory.path)
-				? gitHubDirectory
-				: FileManager.default.homeDirectoryForCurrentUser
+		return try await withTaskCancellationHandler(operation: {
+			try await withCheckedThrowingContinuation { continuation in
+				let lock = NSLock()
+				var isFinished = false
 
-			guard panel.runModal() == .OK,
-				let selected = panel.url?.standardizedFileURL,
-				selected.startAccessingSecurityScopedResource()
-			else { throw AgentHandoffError.workspaceUnavailable }
-			do {
-				let bookmark = try selected.bookmarkData(
-					options: [.withSecurityScope],
-					includingResourceValuesForKeys: nil,
-					relativeTo: nil
-				)
-				UserDefaults.standard.set(bookmark, forKey: codexDiscoveryBookmarkKey)
-				return .init(root: selected, accessURL: selected)
-			} catch {
-				selected.stopAccessingSecurityScopedResource()
-				throw error
+				func finish(_ result: Result<String, Error>) {
+					lock.lock()
+					guard !isFinished else {
+						lock.unlock()
+						return
+					}
+					isFinished = true
+					lock.unlock()
+					continuation.resume(with: result)
+				}
+
+				process.terminationHandler = { completed in
+					let output = String(decoding: standardOutput.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+					guard completed.terminationStatus == 0 else {
+						let diagnostic = String(decoding: standardError.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+						finish(.failure(AgentHandoffError.launchFailed(
+							"Codex app server",
+							diagnostic: conciseProcessDiagnostic(diagnostic)
+						)))
+						return
+					}
+					finish(.success(output))
+				}
+				do {
+					try process.run()
+					try standardInput.fileHandleForWriting.write(contentsOf: requestData + Data([0x0A]))
+					try standardInput.fileHandleForWriting.close()
+				} catch {
+					finish(.failure(error))
+					if process.isRunning { process.terminate() }
+				}
 			}
-		}
+		}, onCancel: {
+			if process.isRunning { process.terminate() }
+		})
 	}
 }
 
-/// Settings uses this small surface instead of receiving access to Codex's state
-/// directory. The actual file is selected explicitly and is read-only.
+/// Settings uses this small surface to verify that Codex Desktop's read-only project
+/// catalogue is available from the home reported by the resolved Codex runtime.
 enum CodexProjectCatalogAccess {
 	@MainActor
-	static func authorize() throws {
-		try AgentHandoffWorkspace.authorizeCodexProjectCatalog()
+	static func authorize() async throws {
+		try await AgentHandoffWorkspace.authorizeCodexProjectCatalog()
 	}
 }
 
@@ -560,14 +536,6 @@ struct CodexProjectCatalog: Equatable, Sendable {
 
 	static func load(from file: URL) throws -> Self {
 		try .init(data: Data(contentsOf: file))
-	}
-
-	func projects(inside workspaceRoot: URL) -> [Project] {
-		let root = workspaceRoot.standardizedFileURL
-		let rootPrefix = root.path.hasSuffix("/") ? root.path : root.path + "/"
-		return projects.filter { project in
-			project.path == root.path || project.path.hasPrefix(rootPrefix)
-		}
 	}
 }
 
@@ -641,17 +609,13 @@ private enum CodexHandoffCoordinator {
 		yield: @escaping @Sendable (AgentHandoffEvent) -> Void
 	) async throws {
 		let journal = AgentHandoffJournal.shared
-		let discoveryWorkspace = try await AgentHandoffWorkspace.openCodexDiscoveryRoot()
-		let projectState = try AgentHandoffWorkspace.openCodexProjectCatalog()
-		let projectCatalog = try CodexProjectCatalog.load(from: projectState.url)
-		let eligibleProjects = projectCatalog.projects(inside: discoveryWorkspace.root)
-		guard !eligibleProjects.isEmpty else { throw AgentHandoffError.projectCatalogUnavailable }
-		// Retain the security scope while the planner discovers roots and the child
-		// runners begin inside those roots.
-		defer { _ = discoveryWorkspace }
+		let projectState = try await AgentHandoffWorkspace.openCodexProjectCatalog()
+		let projectCatalog = try CodexProjectCatalog.load(from: projectState)
+		let eligibleProjects = projectCatalog.projects
+		guard !eligibleProjects.isEmpty else { throw AgentHandoffError.projectCatalogEmpty }
+		let allowedProjectPaths = Set(eligibleProjects.map(\.path))
 		let packages = try await plan(
 			request,
-			workspaceRoot: discoveryWorkspace.root,
 			projectCatalog: eligibleProjects,
 			journal: journal,
 			onSubmitted: { yield(.coordinatorSubmitted) }
@@ -666,7 +630,7 @@ private enum CodexHandoffCoordinator {
 					do {
 						guard let projectRoot = validatedProjectRoot(
 							at: package.projectPath,
-							inside: discoveryWorkspace.root
+							allowedProjectPaths: allowedProjectPaths
 						) else { throw AgentHandoffError.launchFailed("Codex project routing") }
 						try await CodexChildRunner.run(
 							handoffID: handoff.id,
@@ -696,7 +660,6 @@ private enum CodexHandoffCoordinator {
 
 	private static func plan(
 		_ request: AgentHandoffRequest,
-		workspaceRoot: URL,
 		projectCatalog: [CodexProjectCatalog.Project],
 		journal: AgentHandoffJournal,
 		onSubmitted: @escaping @Sendable () -> Void
@@ -717,7 +680,6 @@ private enum CodexHandoffCoordinator {
 			"--output-last-message", resultURL.path,
 			HandoffPrompt.codexPlannerRequest(
 				request,
-				workspaceRoot: workspaceRoot,
 				projectCatalog: projectCatalog
 			),
 		]
@@ -737,7 +699,7 @@ private enum CodexHandoffCoordinator {
 		let result = try await runProcess(
 			executable: executable,
 			arguments: arguments,
-			currentDirectoryURL: workspaceRoot
+			currentDirectoryURL: FileManager.default.temporaryDirectory
 		)
 		guard result.status == 0 else {
 			throw AgentHandoffError.launchFailed(
@@ -753,7 +715,6 @@ private enum CodexHandoffCoordinator {
 		}
 		return try AgentHandoffManifest.decode(
 			output,
-			workspaceRoot: workspaceRoot,
 			allowedProjectPaths: Set(projectCatalog.map(\.path))
 		).packages
 	}
@@ -764,14 +725,15 @@ private enum CodexHandoffCoordinator {
 		return [prefix, diagnostic].compactMap { $0 }.joined(separator: " ")
 	}
 
-	fileprivate static func validatedProjectRoot(at path: String?, inside workspaceRoot: URL) -> URL? {
+	fileprivate static func validatedProjectRoot(
+		at path: String?,
+		allowedProjectPaths: Set<String>
+	) -> URL? {
 		guard let path = path?.trimmingCharacters(in: .whitespacesAndNewlines), !path.isEmpty else {
 			return nil
 		}
-		let root = workspaceRoot.standardizedFileURL
 		let candidate = URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
-		let rootPrefix = root.path.hasSuffix("/") ? root.path : root.path + "/"
-		guard candidate.path == root.path || candidate.path.hasPrefix(rootPrefix) else { return nil }
+		guard allowedProjectPaths.contains(candidate.path) else { return nil }
 		var isDirectory: ObjCBool = false
 		guard FileManager.default.fileExists(atPath: candidate.path, isDirectory: &isDirectory), isDirectory.boolValue else {
 			return nil
@@ -785,7 +747,6 @@ private struct AgentHandoffManifest: Codable, Sendable {
 
 	static func decode(
 		_ output: String,
-		workspaceRoot: URL,
 		allowedProjectPaths: Set<String>
 	) throws -> AgentHandoffManifest {
 		let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -805,14 +766,15 @@ private struct AgentHandoffManifest: Codable, Sendable {
 		guard !manifest.packages.isEmpty,
 			manifest.packages.allSatisfy({
 				!$0.title.isEmpty && !$0.objective.isEmpty
-				&& CodexHandoffCoordinator.validatedProjectRoot(at: $0.projectPath, inside: workspaceRoot).map {
-					allowedProjectPaths.contains($0.path)
-				} == true
+					&& CodexHandoffCoordinator.validatedProjectRoot(
+						at: $0.projectPath,
+						allowedProjectPaths: allowedProjectPaths
+					) != nil
 			})
 		else {
 			throw AgentHandoffError.launchFailed(
 				"Codex planner",
-				diagnostic: "Codex returned no usable tasks for a project inside the selected workspace."
+				diagnostic: "Codex returned no usable tasks for a project in its current project catalogue."
 			)
 		}
 		return manifest
@@ -1157,8 +1119,10 @@ private final class AgentHandoffJournal: @unchecked Sendable {
 	}
 
 	private func terminalState(forCodexThread threadID: String, createdAt: Date) -> (state: AgentHandoffPackageState, failure: String?)? {
-		let sessionsRoot = fileManager.homeDirectoryForCurrentUser
-			.appendingPathComponent(".codex/sessions", isDirectory: true)
+		guard let codexHome = CodexProjectCatalogLocation.cachedHomeDirectory(fileManager: fileManager) else {
+			return nil
+		}
+		let sessionsRoot = codexHome.appendingPathComponent("sessions", isDirectory: true)
 		let calendar = Calendar(identifier: .gregorian)
 		let candidateDays = [-1, 0, 1].compactMap {
 			calendar.date(byAdding: .day, value: $0, to: createdAt)
@@ -1847,29 +1811,29 @@ private enum AgentJSON {
 // MARK: - Provider utilities
 
 enum HandoffPrompt {
+	private static let urlPattern = #"(?i)\b(?:(?:https?://)|(?:www\.))?(?:(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,})(?::\d{1,5})?(?:/[^\s<>\[\]{}()\"']*)?(?:\?[^\s<>\[\]{}()\"']*)?(?:#[^\s<>\[\]{}()\"']*)?"#
+	private static let urlTrailingPunctuation = CharacterSet(charactersIn: ".,;:!?)]}\"'")
+
 	static let codexChildInstruction = """
-	You own one bounded Agent Handoff work package. First discover only the relevant configured native tools, skills, plugins, and MCP servers in the user's normal environment. Then execute this package under the user's ordinary approval rules. Do not add a Nomen dependency or a custom discovery bridge. Do not delegate, split, or broaden the package.
+	You own one bounded Agent Handoff work package. First discover only the relevant configured native tools, skills, plugins, and MCP servers in the user's normal environment. If your package context lists source URLs to research, research those URLs yourself as needed for the bounded objective; URLs are research targets, not pre-researched findings. Then execute this package under the user's ordinary approval rules. Do not add a Nomen dependency or a custom discovery bridge. Do not delegate, split, or broaden the package.
 	"""
 
 	static let workPackagePlanningGuidance = """
 	Respect user-provided manual handoff boundaries. The paired, case-insensitive markers `handoff start`/`handoff end` and `task start`/`task end` delimit manual work-package blocks. Create one separate work package for each marked block and never merge work across those boundaries. Keep all related steps, sub-tasks, and implementation details inside a marked block together unless the user creates another marked block inside it.
 
 	When no explicit markers define boundaries, default to the fewest cohesive master work packages necessary. Related steps, sub-tasks, and implementation details normally belong in one master package; lists, conjunctions, and several requested actions are not themselves split signals. Split only genuinely distinct, independent work streams. When separation is unclear, keep work together and expect the user to state a separation explicitly.
+
+	Before splitting, cleanly extract every URL from all source information. Treat a bare domain or path such as `example.com/docs` as a URL even when it has no `http://` or `https://` protocol, and normalize bare URLs with `https://`. Do not browse, fetch, evaluate, or otherwise research any URL yourself. Instead, put the relevant normalized URLs directly in each receiving work package's context under `Source URLs to research`; the child task, not the coordinator, owns that research.
 	"""
 
 	static func codexPlannerRequest(
 		_ request: AgentHandoffRequest,
-		workspaceRoot: URL,
 		projectCatalog: [CodexProjectCatalog.Project]
 	) -> String {
 		let encodedCatalog = (try? JSONEncoder().encode(projectCatalog))
 			.flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
 		return """
 		You are an ephemeral Agent Handoff planner. First use the current Codex project catalogue below to select the relevant existing project for each bounded work package. Then split the user's request into independently executable, bounded work packages. Do not inspect or choose tools, skills, plugins, or MCP servers. Do not execute package work and do not create tasks. Return only JSON matching the supplied schema. Each package needs a short title, an objective that can be completed by one agent, only the user context required for that objective, and the exact absolute projectPath from one catalogue entry. Never invent a path or select another directory. The full handoff input below, including any attached screenshot, is the same user context that each child task will receive.
-
-		<handoff_discovery_workspace>
-		\(workspaceRoot.path)
-		</handoff_discovery_workspace>
 
 		<codex_project_catalog>
 		\(encodedCatalog)
@@ -1903,7 +1867,7 @@ enum HandoffPrompt {
 
 		\(workPackagePlanningGuidance)
 
-		Use Claude's native `claude --bg` sessions in the current working directory. Name each child `Octo handoff child \(token) <short title>`. Do not disable the child's normal configuration, skills, plugins, MCP servers, or approval rules. Pass this focused system instruction to every child with `--append-system-prompt`: first discover the relevant configured native tools, skills, plugins, and MCP servers in the user's normal environment; then execute only its bounded objective under the user's ordinary approval rules. Do not add a Nomen dependency or custom discovery bridge. Give each child the complete original handoff input as well as its bounded objective. If the input includes a `screen_screenshot_path`, include that path verbatim so the child can inspect the user-provided screenshot when relevant. Do not create a local task manifest and do not ask Octo to create the child sessions.
+		Use Claude's native `claude --bg` sessions in the current working directory. Name each child `Octo handoff child \(token) <short title>`. Do not disable the child's normal configuration, skills, plugins, MCP servers, or approval rules. Pass this focused system instruction to every child with `--append-system-prompt`: first discover the relevant configured native tools, skills, plugins, and MCP servers in the user's normal environment; if its context lists source URLs to research, research those URLs itself as needed for its bounded objective; then execute only that objective under the user's ordinary approval rules. Do not add a Nomen dependency or custom discovery bridge. Give each child the complete original handoff input, its bounded objective, and the relevant `Source URLs to research` list. If the input includes a `screen_screenshot_path`, include that path verbatim so the child can inspect the user-provided screenshot when relevant. Do not create a local task manifest and do not ask Octo to create the child sessions.
 		"""
 	}
 
@@ -1990,7 +1954,35 @@ enum HandoffPrompt {
 			""")
 		}
 
+		let sourceURLs = extractURLs(from: [transcript, selectedText, screenRecognizedText].compactMap { $0 })
+		if !sourceURLs.isEmpty {
+			sections.append("<source_urls>\nSource URLs to research:\n\(sourceURLs.joined(separator: "\n"))\n</source_urls>")
+		}
+
 		return sections.joined(separator: "\n\n")
+	}
+
+	private static func extractURLs(from sources: [String]) -> [String] {
+		let expression = try? NSRegularExpression(pattern: urlPattern)
+		var seen = Set<String>()
+		var urls = [String]()
+
+		for source in sources {
+			let range = NSRange(source.startIndex..., in: source)
+			for match in expression?.matches(in: source, range: range) ?? [] {
+				guard let matchRange = Range(match.range, in: source) else { continue }
+				let candidate = String(source[matchRange])
+					.trimmingCharacters(in: urlTrailingPunctuation)
+				guard !candidate.isEmpty else { continue }
+				let normalized = candidate.range(of: #"(?i)^https?://"#, options: .regularExpression) == nil
+					? "https://\(candidate)"
+					: candidate
+				guard seen.insert(normalized.lowercased()).inserted else { continue }
+				urls.append(normalized)
+			}
+		}
+
+		return urls
 	}
 }
 

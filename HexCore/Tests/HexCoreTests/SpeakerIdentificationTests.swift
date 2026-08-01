@@ -71,6 +71,106 @@ final class SpeakerIdentificationTests: XCTestCase {
 		XCTAssertEqual(attributed?.segments.first?.profileID, library.profiles[0].id)
 	}
 
+	func testNonFiniteDiarizationValuesDoNotPreventIntroducedSpeakerProfilePersistence() {
+		let output = TranscriptionOutput(
+			text: "My name is Natty.",
+			words: [
+				.init(word: "My", startTime: 0, endTime: 0.2),
+				.init(word: "name", startTime: 0.2, endTime: 0.4),
+				.init(word: "is", startTime: 0.4, endTime: 0.6),
+				.init(word: "Natty.", startTime: 0.6, endTime: 0.9),
+			]
+		)
+		let diarization = SpeakerDiarizationOutput(segments: [
+			.init(speakerID: "speaker-0", embedding: [.nan, 1], startTime: 0, endTime: 1, qualityScore: 1),
+		])
+		var library = SpeakerVoiceLibrary()
+
+		let attributed = SpeakerIdentification.attribute(
+			transcription: output,
+			diarization: diarization,
+			library: &library,
+			now: Date(timeIntervalSince1970: 1),
+			introductions: [.init(speakerID: "speaker-0", name: "Natty")]
+		)
+
+		XCTAssertEqual(attributed?.segments.map(\.speakerName), ["Natty"])
+		XCTAssertEqual(library.profiles.map(\.embedding), [[0, 1]])
+		XCTAssertNoThrow(try JSONEncoder().encode(library))
+	}
+
+	func testUnnamedSpeakersBecomeProfilesAndUseRenamedProfilesLater() {
+		let firstOutput = TranscriptionOutput(
+			text: "Hello there. Good morning.",
+			words: [
+				.init(word: "Hello", startTime: 0, endTime: 0.2),
+				.init(word: "there.", startTime: 0.2, endTime: 0.5),
+				.init(word: "Good", startTime: 1, endTime: 1.2),
+				.init(word: "morning.", startTime: 1.2, endTime: 1.5),
+			]
+		)
+		let firstDiarization = SpeakerDiarizationOutput(segments: [
+			.init(speakerID: "first", embedding: [1, 0], startTime: 0, endTime: 0.8, qualityScore: 1),
+			.init(speakerID: "second", embedding: [0, 1], startTime: 1, endTime: 1.8, qualityScore: 1),
+		])
+		var library = SpeakerVoiceLibrary()
+
+		let firstAttribution = SpeakerIdentification.attribute(
+			transcription: firstOutput,
+			diarization: firstDiarization,
+			library: &library,
+			now: Date(timeIntervalSince1970: 1)
+		)
+
+		XCTAssertEqual(firstAttribution?.segments.map(\.speakerName), ["Unknown Speaker 1", "Unknown Speaker 2"])
+		XCTAssertEqual(library.profiles.map(\.name), ["Unknown Speaker 1", "Unknown Speaker 2"])
+		XCTAssertTrue(library.profiles.allSatisfy(\.isUnknownSpeaker))
+		XCTAssertEqual(firstAttribution?.segments.compactMap(\.profileID).count, 2)
+
+		library.profiles[0].name = "Oliver"
+		library.profiles[0].isNameUserEdited = true
+		library.profiles[1].name = "Guest"
+		library.profiles[1].isNameUserEdited = true
+
+		let laterOutput = TranscriptionOutput(
+			text: "Back again. Likewise.",
+			words: [
+				.init(word: "Back", startTime: 0, endTime: 0.2),
+				.init(word: "again.", startTime: 0.2, endTime: 0.5),
+				.init(word: "Likewise.", startTime: 1, endTime: 1.4),
+			]
+		)
+		let laterDiarization = SpeakerDiarizationOutput(segments: [
+			.init(speakerID: "new-first", embedding: [0.99, 0.01], startTime: 0, endTime: 0.8, qualityScore: 1),
+			.init(speakerID: "new-second", embedding: [0.01, 0.99], startTime: 1, endTime: 1.8, qualityScore: 1),
+		])
+
+		let laterAttribution = SpeakerIdentification.attribute(
+			transcription: laterOutput,
+			diarization: laterDiarization,
+			library: &library,
+			now: Date(timeIntervalSince1970: 2)
+		)
+
+		XCTAssertEqual(laterAttribution?.segments.map(\.speakerName), ["Oliver", "Guest"])
+		XCTAssertFalse(library.profiles.contains(where: \.isUnknownSpeaker))
+		XCTAssertEqual(library.profiles.count, 2)
+	}
+
+	func testLegacyGeneratedSpeakerNamesMigrateWithoutOverwritingUserNames() throws {
+		let legacyLibrary = SpeakerVoiceLibrary(profiles: [
+			.init(name: "Speaker 1", embedding: [1, 0]),
+			.init(name: "Speaker 2", embedding: [0, 1], isNameUserEdited: true),
+			.init(name: "Oliver", embedding: [0.5, 0.5]),
+		])
+
+		let encoded = try JSONEncoder().encode(legacyLibrary)
+		let decoded = try JSONDecoder().decode(SpeakerVoiceLibrary.self, from: encoded)
+
+		XCTAssertEqual(decoded.profiles.map(\.name), ["Unknown Speaker 1", "Speaker 2", "Oliver"])
+		XCTAssertEqual(decoded.profiles.map(\.isUnknownSpeaker), [true, false, false])
+	}
+
 	func testKnownVoiceLabelsFutureRecordingWithoutAnIntroduction() {
 		let output = TranscriptionOutput(
 			text: "Thanks for joining.",
@@ -203,7 +303,7 @@ final class SpeakerIdentificationTests: XCTestCase {
 		XCTAssertEqual(library.profiles.map(\.name), ["Richard"])
 	}
 
-	func testCasualImPhraseDoesNotCreateAProfile() {
+	func testCasualImPhraseCreatesAnUnnamedProfile() {
 		let output = TranscriptionOutput(
 			text: "I'm imagining hitting like control one.",
 			words: [
@@ -227,11 +327,11 @@ final class SpeakerIdentificationTests: XCTestCase {
 			now: .now
 		)
 
-		XCTAssertEqual(attributed?.segments.map(\.speakerName), ["Speaker 1"])
-		XCTAssertTrue(library.profiles.isEmpty)
+		XCTAssertEqual(attributed?.segments.map(\.speakerName), ["Unknown Speaker 1"])
+		XCTAssertEqual(library.profiles.map(\.name), ["Unknown Speaker 1"])
 	}
 
-	func testCasualIAmPhraseDoesNotCreateAProfile() {
+	func testCasualIAmPhraseCreatesAnUnnamedProfile() {
 		let output = TranscriptionOutput(
 			text: "I am thinking about the next action.",
 			words: [
@@ -256,7 +356,7 @@ final class SpeakerIdentificationTests: XCTestCase {
 			now: .now
 		)
 
-		XCTAssertTrue(library.profiles.isEmpty)
+		XCTAssertEqual(library.profiles.map(\.name), ["Unknown Speaker 1"])
 	}
 
 	func testUnalignedWordsDoNotCreateAnAttributionOrProfile() {

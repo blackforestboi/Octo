@@ -6,7 +6,56 @@ import HexCore
 /// out of History so a profile remains audible when its originating recording is pruned.
 enum SpeakerVoiceSampleStore {
 	static let maximumSampleDuration: TimeInterval = 12
+	static let minimumSampleDuration: TimeInterval = 0.25
+	static let leadingBoundaryPaddingDuration: TimeInterval = 0.5
+	static let trailingBoundaryPaddingDuration: TimeInterval = 0.25
+	static let currentExtractionVersion = 1
 	static let comparisonSilenceDuration: TimeInterval = 0.75
+
+	struct SampleRange: Equatable {
+		let startTime: TimeInterval
+		let duration: TimeInterval
+
+		var endTime: TimeInterval { startTime + duration }
+	}
+
+	/// Word timestamps describe recognized tokens, not the full acoustic envelope.
+	/// Preserve a small amount around them so plosives and trailing phonemes are not clipped.
+	static func sampleRange(
+		sourceDuration: TimeInterval,
+		startTime: TimeInterval,
+		endTime: TimeInterval
+	) -> SampleRange? {
+		guard sourceDuration.isFinite,
+			startTime.isFinite,
+			endTime.isFinite,
+			sourceDuration > 0,
+			endTime > startTime
+		else { return nil }
+
+		let recognizedStart = min(max(0, startTime), sourceDuration)
+		let recognizedEnd = min(max(recognizedStart, endTime), sourceDuration)
+		let recognizedDuration = recognizedEnd - recognizedStart
+		guard recognizedDuration > 0 else { return nil }
+
+		if recognizedDuration >= maximumSampleDuration {
+			return .init(startTime: recognizedStart, duration: maximumSampleDuration)
+		}
+
+		var leadingPadding = min(leadingBoundaryPaddingDuration, recognizedStart)
+		var trailingPadding = min(trailingBoundaryPaddingDuration, sourceDuration - recognizedEnd)
+		let availablePadding = maximumSampleDuration - recognizedDuration
+		let requestedPadding = leadingPadding + trailingPadding
+		if requestedPadding > availablePadding {
+			let scale = availablePadding / requestedPadding
+			leadingPadding *= scale
+			trailingPadding *= scale
+		}
+
+		let duration = recognizedDuration + leadingPadding + trailingPadding
+		guard duration >= minimumSampleDuration else { return nil }
+		return .init(startTime: recognizedStart - leadingPadding, duration: duration)
+	}
 
 	static func capture(
 		from sourceURL: URL,
@@ -16,10 +65,11 @@ enum SpeakerVoiceSampleStore {
 	) async throws -> SpeakerVoiceSample? {
 		let asset = AVURLAsset(url: sourceURL)
 		let sourceDuration = try await asset.load(.duration).seconds
-		let start = min(max(0, startTime), sourceDuration)
-		let requestedDuration = min(maximumSampleDuration, max(0, endTime - start))
-		let duration = min(requestedDuration, sourceDuration - start)
-		guard duration >= 0.25 else { return nil }
+		guard let range = sampleRange(
+			sourceDuration: sourceDuration,
+			startTime: startTime,
+			endTime: endTime
+		) else { return nil }
 
 		guard let exporter = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetAppleM4A),
 			exporter.supportedFileTypes.contains(.m4a)
@@ -31,12 +81,16 @@ enum SpeakerVoiceSampleStore {
 		let destinationURL = directory
 			.appendingPathComponent("\(profileID.uuidString)-\(UUID().uuidString).m4a")
 		exporter.timeRange = CMTimeRange(
-			start: CMTime(seconds: start, preferredTimescale: 600),
-			duration: CMTime(seconds: duration, preferredTimescale: 600)
+			start: CMTime(seconds: range.startTime, preferredTimescale: 600),
+			duration: CMTime(seconds: range.duration, preferredTimescale: 600)
 		)
 		try await export(exporter, to: destinationURL, as: .m4a)
 
-		return .init(audioURL: destinationURL, duration: duration)
+		return .init(
+			audioURL: destinationURL,
+			duration: range.duration,
+			extractionVersion: currentExtractionVersion
+		)
 	}
 
 	static func delete(_ samples: [SpeakerVoiceSample]) {
@@ -88,7 +142,7 @@ enum SpeakerVoiceSampleStore {
 		let candidateDuration = try await candidateAsset.load(.duration).seconds
 		let start = min(max(0, candidateStartTime), candidateDuration)
 		let duration = min(maximumSampleDuration, min(candidateEndTime - start, candidateDuration - start))
-		guard duration >= 0.25 else { return nil }
+		guard duration >= minimumSampleDuration else { return nil }
 		let candidateRange = CMTimeRange(
 			start: CMTime(seconds: start, preferredTimescale: 600),
 			duration: CMTime(seconds: duration, preferredTimescale: 600)

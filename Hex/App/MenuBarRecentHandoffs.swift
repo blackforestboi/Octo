@@ -40,7 +40,7 @@ struct MenuBarRecentHandoffs: View {
 				Section("Recent Handoffs") {
 					ForEach(visibleTasks) { task in
 						Button {
-							guard let thread = task.thread else { return }
+							guard task.isOpenable, let thread = task.thread else { return }
 							if task.hasUnacknowledgedCompletion {
 								try? agentHandoff.acknowledgeTaskCompletions([task.id])
 								loadTasks()
@@ -95,10 +95,7 @@ struct MenuBarRecentHandoffs: View {
 	}
 
 	private var visibleTasks: [AgentHandoffTask] {
-		allTasks
-			.filter(\.isOpenable)
-			.prefix(10)
-			.map { $0 }
+		MenuBarRecentHandoffList.visibleTasks(from: allTasks)
 	}
 
 	private var activeThreads: Set<AgentHandoffThread> {

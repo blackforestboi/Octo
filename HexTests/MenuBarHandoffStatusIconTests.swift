@@ -64,6 +64,20 @@ final class MenuBarHandoffStatusIconTests: XCTestCase {
 		XCTAssertEqual(MenuBarHandoffStatus.status(for: [completedTask]), .idle)
 	}
 
+	func testRecentHandoffsIncludeTasksThatAreNotOpenableYet() {
+		let pendingTask = handoffTask(state: .pending, thread: nil)
+		let runningTask = handoffTask(state: .running)
+		let completedTask = handoffTask(state: .completed)
+
+		XCTAssertEqual(
+			MenuBarRecentHandoffList.visibleTasks(from: [pendingTask, runningTask, completedTask]),
+			[pendingTask, runningTask, completedTask]
+		)
+		XCTAssertFalse(pendingTask.isOpenable)
+		XCTAssertFalse(runningTask.isOpenable)
+		XCTAssertTrue(completedTask.isOpenable)
+	}
+
 	func testCompletedIndicatorsUseNonTemplateImages() {
 		XCTAssertFalse(AgentHandoffStatusImages.completedDot.isTemplate)
 		XCTAssertFalse(AgentHandoffStatusImages.blueIcon(from: NSImage(size: .init(width: 18, height: 18))).isTemplate)
@@ -93,6 +107,7 @@ final class MenuBarHandoffStatusIconTests: XCTestCase {
 
 	private func handoffTask(
 		state: AgentHandoffTask.Status,
+		thread: AgentHandoffThread? = .codex("528b9ff2-d685-4c1a-b2d8-76d6a1661de3"),
 		isCompletionAcknowledged: Bool = false
 	) -> AgentHandoffTask {
 		AgentHandoffTask(
@@ -101,7 +116,7 @@ final class MenuBarHandoffStatusIconTests: XCTestCase {
 			provider: .codex,
 			title: "Update menu bar",
 			state: state,
-			thread: .codex("528b9ff2-d685-4c1a-b2d8-76d6a1661de3"),
+			thread: thread,
 			handoff: "",
 			isCompletionAcknowledged: isCompletionAcknowledged
 		)

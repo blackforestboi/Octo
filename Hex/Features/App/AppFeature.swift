@@ -34,6 +34,7 @@ struct AppFeature {
 		var settings: SettingsFeature.State = .init()
 		var history: HistoryFeature.State = .init()
 		var activeTab: ActiveTab = .settings
+		var speakerProfileIDToFocus: UUID?
 		@Shared(.hexSettings) var hexSettings: HexSettings
 		@Shared(.modelBootstrapState) var modelBootstrapState: ModelBootstrapState
 
@@ -50,6 +51,7 @@ struct AppFeature {
     case settings(SettingsFeature.Action)
     case history(HistoryFeature.Action)
     case setActiveTab(ActiveTab)
+		case focusSpeakerProfile(UUID)
     case task
     case pasteLastTranscript
     case interruptedRecordingsRecovered([RecoveredRecording], [RecoveredSystemAudioRecording])
@@ -57,6 +59,7 @@ struct AppFeature {
     // Permission actions
     case checkPermissions
     case permissionsUpdated(mic: PermissionStatus, acc: PermissionStatus, input: PermissionStatus, screenRecording: Bool)
+		case microphonePermissionRequestCompleted(Bool)
 		case appActivated
 		case modelStatusEvaluated(Bool)
 		case preferredSubscriptionProviderDetected(RefinementProvider?)
@@ -90,6 +93,16 @@ struct AppFeature {
         return .none
         
       case .task:
+		let selectedModel = state.hexSettings.selectedModel
+		if !selectedModel.isEmpty {
+			state.$modelBootstrapState.withLock { bootstrap in
+				bootstrap.modelIdentifier = selectedModel
+				bootstrap.isModelReady = false
+				bootstrap.preparationPhase = .activating
+				bootstrap.progress = 0
+				bootstrap.lastError = nil
+			}
+		}
         let startupEffects: [Effect<Action>] = [
           startPasteLastTranscriptMonitoring(),
           ensureSelectedModelReadiness(),
@@ -267,9 +280,10 @@ struct AppFeature {
         return .none
 
       case .settings(.requestMicrophone):
+		guard state.microphonePermission != .granted else { return .none }
         return .run { send in
-          _ = await permissions.requestMicrophone()
-          await send(.checkPermissions)
+		  let granted = await permissions.requestMicrophone()
+		  await send(.microphonePermissionRequestCompleted(granted))
         }
 
       case .settings(.requestAccessibility):
@@ -325,6 +339,13 @@ struct AppFeature {
         return .none
 		case let .setActiveTab(tab):
 			state.activeTab = tab
+			if tab != .speakers {
+				state.speakerProfileIDToFocus = nil
+			}
+			return .none
+		case let .focusSpeakerProfile(profileID):
+			state.activeTab = .speakers
+			state.speakerProfileIDToFocus = profileID
 			return .none
 
       // Permission handling
@@ -349,6 +370,14 @@ struct AppFeature {
           state.settings.needsScreenRecordingPermission = true
         }
         return .none
+
+	  case let .microphonePermissionRequestCompleted(granted):
+		state.microphonePermission = granted ? .granted : .denied
+		guard granted else { return .send(.checkPermissions) }
+		return .run { send in
+			await recording.warmUpRecorder()
+			await send(.checkPermissions)
+		}
 
       case .appActivated:
         // App became active - re-check permissions
@@ -404,24 +433,63 @@ struct AppFeature {
       @Shared(.modelBootstrapState) var modelBootstrapState: ModelBootstrapState
       let selectedModel = hexSettings.selectedModel
       guard !selectedModel.isEmpty else {
+		$modelBootstrapState.withLock { state in
+			state.isModelReady = false
+			state.preparationPhase = nil
+			state.progress = 0
+		}
         await send(.modelStatusEvaluated(false))
         return
       }
-      let isReady = await transcription.isModelDownloaded(selectedModel)
-      $modelBootstrapState.withLock { state in
-        state.modelIdentifier = selectedModel
-        if state.modelDisplayName?.isEmpty ?? true {
-          state.modelDisplayName = selectedModel
-        }
-        state.isModelReady = isReady
-        if isReady {
-          state.lastError = nil
-          state.progress = 1
-        } else {
-          state.progress = 0
-        }
-      }
-      await send(.modelStatusEvaluated(isReady))
+		$modelBootstrapState.withLock { state in
+			state.modelIdentifier = selectedModel
+			if state.modelDisplayName?.isEmpty ?? true {
+				state.modelDisplayName = selectedModel
+			}
+			state.isModelReady = false
+			state.preparationPhase = .activating
+			state.progress = 0
+			state.lastError = nil
+		}
+
+		guard await transcription.isModelDownloaded(selectedModel) else {
+			$modelBootstrapState.withLock { state in
+				guard state.modelIdentifier == selectedModel else { return }
+				state.isModelReady = false
+				state.preparationPhase = nil
+				state.progress = 0
+			}
+			await send(.modelStatusEvaluated(false))
+			return
+		}
+
+		do {
+			try await transcription.prepareModel(selectedModel) { update in
+				$modelBootstrapState.withLock { state in
+					guard state.modelIdentifier == selectedModel else { return }
+					state.isModelReady = false
+					state.preparationPhase = update.phase
+					state.progress = update.progress
+				}
+			}
+			$modelBootstrapState.withLock { state in
+				guard state.modelIdentifier == selectedModel else { return }
+				state.isModelReady = true
+				state.preparationPhase = nil
+				state.progress = 1
+				state.lastError = nil
+			}
+			await send(.modelStatusEvaluated(true))
+		} catch {
+			$modelBootstrapState.withLock { state in
+				guard state.modelIdentifier == selectedModel else { return }
+				state.isModelReady = false
+				state.preparationPhase = nil
+				state.progress = 0
+				state.lastError = error.localizedDescription
+			}
+			await send(.modelStatusEvaluated(false))
+		}
     }
   }
 
@@ -511,12 +579,11 @@ struct AppView: View {
         SettingsView(
           store: store.scope(state: \.settings, action: \.settings),
           microphonePermission: store.microphonePermission,
-          accessibilityPermission: store.accessibilityPermission,
-          inputMonitoringPermission: store.inputMonitoringPermission
+          accessibilityPermission: store.accessibilityPermission
         )
         .navigationTitle("Settings")
 		case .speakers:
-			SpeakersView()
+			SpeakersView(profileIDToFocus: store.speakerProfileIDToFocus)
 				.navigationTitle("Speakers")
       case .handoffs:
         HandoffsView()
@@ -525,8 +592,11 @@ struct AppView: View {
         WordRemappingsView(store: store.scope(state: \.settings, action: \.settings))
           .navigationTitle("Transforms")
       case .history:
-        HistoryView(store: store.scope(state: \.history, action: \.history))
-          .navigationTitle("History")
+		HistoryView(
+			store: store.scope(state: \.history, action: \.history),
+			onOpenSpeaker: { store.send(.focusSpeakerProfile($0)) }
+		)
+		  .navigationTitle("History")
       case .about:
         AboutView(store: store.scope(state: \.settings, action: \.settings))
           .navigationTitle("About")

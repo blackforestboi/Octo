@@ -28,8 +28,8 @@ struct AudioInputDevice: Identifiable, Equatable {
 @DependencyClient
 struct RecordingClient {
   var startRecording: @Sendable () async -> RecordingStartResult = { .failed }
+  var requestStopBoundary: @Sendable (UInt64?) async -> Void = { _ in }
   var stopRecording: @Sendable () async -> RecordingStopResult = { .ignored(.noActiveRecording) }
-  var requestMicrophoneAccess: @Sendable () async -> Bool = { false }
   var observeAudioLevel: @Sendable () async -> AsyncStream<Meter> = { AsyncStream { _ in } }
   var getAvailableInputDevices: @Sendable () async -> [AudioInputDevice] = { [] }
   var getDefaultInputDeviceName: @Sendable () async -> String? = { nil }
@@ -47,8 +47,8 @@ extension RecordingClient: DependencyKey {
     }
     return Self(
       startRecording: { await live.startRecording() },
+      requestStopBoundary: { await live.requestStopBoundary(eventTimestampNanoseconds: $0) },
       stopRecording: { await live.stopRecording() },
-      requestMicrophoneAccess: { await live.requestMicrophoneAccess() },
       observeAudioLevel: { await live.observeAudioLevel() },
       getAvailableInputDevices: { await live.getAvailableInputDevices() },
       getDefaultInputDeviceName: { await live.getDefaultInputDeviceName() },
@@ -111,6 +111,7 @@ struct RecordingCheckpoint: Equatable, Sendable {
 
 enum RecordingStartResult: Equatable, Sendable {
   case started(RecordingCheckpoint)
+  case microphonePermissionRequired
   case microphoneUnavailable
   case failed
 }
@@ -445,6 +446,9 @@ actor RecordingClientLive {
   private var captureSuspensionSources: Set<CaptureSuspensionSource> = []
 
   private var isCaptureSuspended: Bool { !captureSuspensionSources.isEmpty }
+  private var isMicrophoneAuthorized: Bool {
+    AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+  }
 
   @Shared(.hexSettings) var hexSettings: HexSettings
 
@@ -674,6 +678,11 @@ actor RecordingClientLive {
   /// Synchronous on purpose: no awaits means no actor reentrancy, so the recording-state
   /// snapshot below cannot go stale while this method runs.
   private func handleCaptureEnvironmentChange(reason: String) {
+    guard isMicrophoneAuthorized else {
+      recordingLogger.debug("Ignoring capture environment change until microphone permission is granted reason=\(reason)")
+      return
+    }
+
     let currentInputDevice = getDefaultInputDevice()
     let currentOutputDevice = getDefaultOutputDevice()
     let isRecorderRecording = recorder?.isRecording == true
@@ -957,10 +966,6 @@ actor RecordingClientLive {
     } else {
       recordingLogger.notice("Selected input device set to \(deviceID)")
     }
-  }
-
-  func requestMicrophoneAccess() async -> Bool {
-    await AVCaptureDevice.requestAccess(for: .audio)
   }
 
   // MARK: - Input Device Query
@@ -1280,6 +1285,11 @@ actor RecordingClientLive {
   }
 
   func startRecording() async -> RecordingStartResult {
+    guard isMicrophoneAuthorized else {
+      recordingLogger.notice("Skipping recording start until microphone permission is granted")
+      return .microphonePermissionRequired
+    }
+
     let sessionID = UUID()
     recordingSessionID = sessionID
     // A pending environment-change debounce is superseded: the start path below applies
@@ -1589,6 +1599,25 @@ actor RecordingClientLive {
     return .captured(exportedURL)
   }
 
+  /// Records the physical stop event before reducer scheduling can move the audio cutoff.
+  /// The capture controller then drains callbacks by their Core Audio timestamps.
+  func requestStopBoundary(eventTimestampNanoseconds: UInt64?) {
+    let postRollDuration = Double(hexSettings.stopDelayMilliseconds) / 1_000
+    if activeRecordingSession?.backend == .fallbackCaptureEngine,
+       let fallbackCaptureController
+    {
+      fallbackCaptureController.requestStopBoundary(
+        eventTimestampNanoseconds: eventTimestampNanoseconds,
+        postRollDuration: postRollDuration
+      )
+    } else if captureController.isRecording {
+      captureController.requestStopBoundary(
+        eventTimestampNanoseconds: eventTimestampNanoseconds,
+        postRollDuration: postRollDuration
+      )
+    }
+  }
+
   private func resumeMediaIfNeeded() async {
     let playersToResume = pausedPlayers
     let shouldResumeMedia = didPauseMedia
@@ -1782,6 +1811,11 @@ actor RecordingClientLive {
   }
 
   func warmUpRecorder() async {
+    guard isMicrophoneAuthorized else {
+      recordingLogger.debug("Skipping recorder warm-up until microphone permission is granted")
+      return
+    }
+
     guard activeRecordingSession == nil, recorder?.isRecording != true, !captureController.isRecording else {
       recordingLogger.notice("Skipping recorder warm-up while recording is active")
       return

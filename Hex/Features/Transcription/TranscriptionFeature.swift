@@ -355,6 +355,7 @@ struct TranscriptionFeature {
 		var activeSystemAudioEnabled = false
 		var activeSystemAudioStartOffset: TimeInterval = 0
 	var error: String?
+	var isMicrophonePermissionRequired = false
 	var recordingStartTime: Date?
 	var isLongRecordingCancellationConfirmationPresented = false
 	var outputGenerationStartTime: Date?
@@ -412,6 +413,9 @@ struct TranscriptionFeature {
 		case startRefinedRecording
     case stopRecording
 	case recordingStartFailed
+	case recordingPermissionRequired
+	case requestMicrophonePermission
+	case microphonePermissionRequestCompleted(Bool)
 	case recordingCheckpointStarted(RecordingCheckpoint)
 	case recordingCheckpointFinalized(URL, TimeInterval, TranscriptStatus)
 
@@ -486,6 +490,7 @@ struct TranscriptionFeature {
 	@Dependency(\.speakerDiarization) var speakerDiarization
 	@Dependency(\.speakerIntroduction) var speakerIntroduction
 	@Dependency(\.recording) var recording
+	@Dependency(\.permissions) var permissions
 	@Dependency(\.systemAudioCapture) var systemAudioCapture
   @Dependency(\.pasteboard) var pasteboard
   @Dependency(\.keyEventMonitor) var keyEventMonitor
@@ -964,10 +969,18 @@ struct TranscriptionFeature {
 
 		case .stopRecording:
 		state.pendingTerminalRefinementID = nil
+		let stopRecording = handleStopRecording(&state)
 		return .merge(
 			.cancel(id: CancelID.terminalRefinementHold),
 			.cancel(id: CancelID.screenAwareActivation),
-			handleStopRecording(&state)
+			.concatenate(
+				.run { _ in
+					// Physical hotkey paths establish this boundary before sending the
+					// action. Programmatic stops fall back to the current host time here.
+					await recording.requestStopBoundary(nil)
+				},
+				stopRecording
+			)
 		)
 
 		case .recordingStartFailed:
@@ -979,6 +992,39 @@ struct TranscriptionFeature {
 				},
 				.send(.showError("Microphone not available"))
 			)
+
+		case .recordingPermissionRequired:
+			guard state.isRecording else { return .none }
+			let discard = handleDiscard(&state)
+			state.error = "Microphone access required — click to grant access"
+			state.isMicrophonePermissionRequired = true
+			return .merge(
+				discard,
+				.run { _ in
+					soundEffect.play(.cancel)
+				},
+				.cancel(id: CancelID.errorPresentation)
+			)
+
+		case .requestMicrophonePermission:
+			guard state.isMicrophonePermissionRequired else { return .none }
+			return .run { send in
+				switch await permissions.microphoneStatus() {
+				case .notDetermined:
+					let granted = await permissions.requestMicrophone()
+					await send(.microphonePermissionRequestCompleted(granted))
+				case .denied:
+					await permissions.openMicrophoneSettings()
+				case .granted:
+					await send(.microphonePermissionRequestCompleted(true))
+				}
+			}
+
+		case let .microphonePermissionRequestCompleted(granted):
+			guard granted else { return .none }
+			state.error = nil
+			state.isMicrophonePermissionRequired = false
+			return .none
 
 		case let .recordingCheckpointStarted(checkpoint):
 			guard state.isRecording, state.hexSettings.saveTranscriptionHistory else { return .none }
@@ -1135,6 +1181,7 @@ struct TranscriptionFeature {
 
 		case let .showError(message):
 			state.error = message
+			state.isMicrophonePermissionRequired = false
 			return .run { send in
 				try? await clock.sleep(for: .seconds(5))
 				guard !Task.isCancelled else { return }
@@ -1144,6 +1191,7 @@ struct TranscriptionFeature {
 
 		case .dismissError:
 			state.error = nil
+			state.isMicrophonePermissionRequired = false
 			return .cancel(id: CancelID.errorPresentation)
 
 		case let .launchAgentHandoff(request):
@@ -1548,6 +1596,7 @@ private extension TranscriptionFeature {
 					  }
 					  guard !Task.isCancelled else { return }
 					  hold.markTriggered()
+					  await recording.requestStopBoundary(nil)
 					  await send(.finishRecordingWithRewritePrompt(promptNumber))
 				  }
 				  rewritePromptHoldTracker.replace(with: hold, task: task)
@@ -1594,7 +1643,11 @@ private extension TranscriptionFeature {
 		  ) {
 		  case .finish:
 			hotKeyProcessor.reset()
-			Task { await send(.finishRecordingWithAgentHandoff) }
+			let stopEventTimestamp = keyEvent.timestamp
+			Task {
+				await recording.requestStopBoundary(stopEventTimestamp)
+				await send(.finishRecordingWithAgentHandoff)
+			}
 			return false
 		  case .consume:
 			return false
@@ -1631,7 +1684,11 @@ private extension TranscriptionFeature {
 			return useDoubleTapOnly || keyEvent.key != nil
 
 		  case .stopRecording:
-			Task { await send(.hotKeyReleased(.regular)) }
+			let stopEventTimestamp = keyEvent.timestamp
+			Task {
+				await recording.requestStopBoundary(stopEventTimestamp)
+				await send(.hotKeyReleased(.regular))
+			}
             return false // or `true` if you want to intercept
 
 		  case .locked:
@@ -1640,11 +1697,17 @@ private extension TranscriptionFeature {
 			return false
 
 		  case .stopRecordingWithRefinement:
-			Task { await send(.finishRecordingWithRefinement) }
+			let stopEventTimestamp = keyEvent.timestamp
+			Task {
+				await recording.requestStopBoundary(stopEventTimestamp)
+				await send(.finishRecordingWithRefinement)
+			}
 			return false
 
 		  case .stopRecordingWithScreenContext:
+			let stopEventTimestamp = keyEvent.timestamp
 			Task {
+				await recording.requestStopBoundary(stopEventTimestamp)
 				await send(.screenAwareModeActivated)
 				await send(.stopRecording)
 			}
@@ -1754,6 +1817,8 @@ private extension TranscriptionFeature {
       )
     }
 	state.isRecording = true
+	state.error = nil
+	state.isMicrophonePermissionRequired = false
 	state.isLongRecordingCancellationConfirmationPresented = false
 	state.completedTranscriptPresentation = nil
 	state.agentHandoffPresentation = nil
@@ -1790,6 +1855,7 @@ private extension TranscriptionFeature {
 
     // Prevent system sleep during recording
 	return .merge(
+			.cancel(id: CancelID.errorPresentation),
 			.cancel(id: CancelID.completedTranscriptPresentation),
 			.cancel(id: CancelID.agentHandoffPresentation),
 			.cancel(id: CancelID.transcriptPaste),
@@ -1825,6 +1891,8 @@ private extension TranscriptionFeature {
 						await send(.showError("System audio could not be started. Microphone recording will continue."))
 					}
 				}
+			case .microphonePermissionRequired:
+				await send(.recordingPermissionRequired)
 			case .microphoneUnavailable:
 				await send(.recordingStartFailed)
 			case .failed:
@@ -2168,8 +2236,8 @@ private extension TranscriptionFeature {
   }
 }
 
-/// Retain the first local clip for each saved profile. This runs after speaker
-/// matching, so no audio is kept for anonymous labels or repeatedly added later.
+/// Retain one local clip for each saved profile. This runs after attribution so unnamed
+/// profiles receive a recognition sample, and legacy clips refresh after their next match.
 private func storeSpeakerVoiceSamples(
 	from attribution: SpeakerAttributedTranscript,
 	sourceURL: URL,
@@ -2185,8 +2253,9 @@ private func storeSpeakerVoiceSamples(
 	}
 	@Shared(.speakerVoiceLibrary) var voiceLibrary: SpeakerVoiceLibrary
 	var samplesToDelete = [SpeakerVoiceSample]()
-	let profilesNeedingSample = $voiceLibrary.withLock { library -> Set<UUID> in
-		var profileIDs = Set<UUID>()
+	let sampleState = $voiceLibrary.withLock { library -> (missing: Set<UUID>, legacy: Set<UUID>) in
+		var missingProfileIDs = Set<UUID>()
+		var legacyProfileIDs = Set<UUID>()
 		for index in library.profiles.indices {
 			let storedSamples = library.profiles[index].audioSamples ?? []
 			let usableSamples = storedSamples.filter { FileManager.default.fileExists(atPath: $0.audioURL.path) }
@@ -2194,22 +2263,25 @@ private func storeSpeakerVoiceSamples(
 			if let firstSample = usableSamples.first {
 				library.profiles[index].audioSamples = [firstSample]
 				samplesToDelete.append(contentsOf: usableSamples.dropFirst())
+				if firstSample.extractionVersion != SpeakerVoiceSampleStore.currentExtractionVersion {
+					legacyProfileIDs.insert(library.profiles[index].id)
+				}
 			} else {
 				library.profiles[index].audioSamples = []
-				profileIDs.insert(library.profiles[index].id)
+				missingProfileIDs.insert(library.profiles[index].id)
 			}
 		}
-		return profileIDs
+		return (missingProfileIDs, legacyProfileIDs)
 	}
 	SpeakerVoiceSampleStore.delete(samplesToDelete)
 	let profileIDsReplacingSample = Set(attribution.segments.compactMap { segment -> UUID? in
 		guard replacingSamplesForSpeakerIDs.contains(segment.speakerID) else { return nil }
 		return segment.profileID
-	})
+	}).union(sampleState.legacy)
 
 	var captured = [(profileID: UUID, sample: SpeakerVoiceSample)]()
 	for (profileID, segment) in candidates {
-		guard profilesNeedingSample.contains(profileID) || profileIDsReplacingSample.contains(profileID) else { continue }
+		guard sampleState.missing.contains(profileID) || profileIDsReplacingSample.contains(profileID) else { continue }
 		do {
 			guard let sample = try await SpeakerVoiceSampleStore.capture(
 				from: sourceURL,

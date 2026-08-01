@@ -173,10 +173,10 @@ actor PermissionClientLive {
   func requestInputMonitoring() async -> Bool {
     logger.info("Requesting input monitoring permission...")
     let granted = await MainActor.run {
-      if CGPreflightListenEventAccess() {
+      if IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeGranted {
         return true
       }
-      return CGRequestListenEventAccess()
+      return IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)
     }
 
     if !granted {

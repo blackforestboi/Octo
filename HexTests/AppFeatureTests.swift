@@ -17,6 +17,22 @@ final class AppFeatureTests: XCTestCase {
 		}
 	}
 
+	func testSpeakerProfileFocusSelectsSpeakersAndClearsAfterLeavingTab() async {
+		let profileID = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
+		let store = TestStore(initialState: AppFeature.State()) {
+			AppFeature()
+		}
+
+		await store.send(.focusSpeakerProfile(profileID)) {
+			$0.activeTab = .speakers
+			$0.speakerProfileIDToFocus = profileID
+		}
+		await store.send(.setActiveTab(.history)) {
+			$0.activeTab = .history
+			$0.speakerProfileIDToFocus = nil
+		}
+	}
+
 	func testHandoffsTabCanBeSelected() async {
 		let store = TestStore(initialState: AppFeature.State()) {
 			AppFeature()
@@ -35,6 +51,97 @@ final class AppFeatureTests: XCTestCase {
 		await store.send(.setActiveTab(.support)) {
 			$0.activeTab = .support
 		}
+	}
+
+	func testMicrophoneGrantUpdatesPermissionAndWarmsRecorder() async {
+		let probe = MicrophonePermissionProbe()
+		let store = TestStore(initialState: AppFeature.State()) {
+			AppFeature()
+		} withDependencies: {
+			$0.permissions.requestMicrophone = {
+				await probe.recordRequest()
+				return true
+			}
+			$0.permissions.microphoneStatus = { .granted }
+			$0.permissions.accessibilityStatus = { .granted }
+			$0.permissions.inputMonitoringStatus = { .granted }
+			$0.permissions.screenRecordingStatus = { false }
+			$0.recording.warmUpRecorder = { await probe.recordWarmUp() }
+		}
+		store.exhaustivity = .off(showSkippedAssertions: false)
+
+		await store.send(.settings(.requestMicrophone))
+		await store.receive(\.microphonePermissionRequestCompleted) {
+			$0.microphonePermission = .granted
+		}
+		await store.receive(\.checkPermissions)
+		await store.receive(\.permissionsUpdated) {
+			$0.accessibilityPermission = .granted
+			$0.inputMonitoringPermission = .granted
+		}
+		await store.finish()
+
+		let counts = await probe.counts
+		XCTAssertEqual(counts.requests, 1)
+		XCTAssertEqual(counts.warmUps, 1)
+		XCTAssertEqual(counts.settingsOpens, 0)
+	}
+
+	func testMicrophoneGrantRetriesNativeRequestWhenPermissionWasDenied() async {
+		var state = AppFeature.State()
+		state.microphonePermission = .denied
+		let probe = MicrophonePermissionProbe()
+		let store = TestStore(initialState: state) {
+			AppFeature()
+		} withDependencies: {
+			$0.permissions.requestMicrophone = {
+				await probe.recordRequest()
+				return false
+			}
+			$0.permissions.microphoneStatus = { .denied }
+			$0.permissions.accessibilityStatus = { .granted }
+			$0.permissions.inputMonitoringStatus = { .granted }
+			$0.permissions.screenRecordingStatus = { false }
+			$0.permissions.openMicrophoneSettings = { await probe.recordSettingsOpen() }
+		}
+		store.exhaustivity = .off(showSkippedAssertions: false)
+
+		await store.send(.settings(.requestMicrophone))
+		await store.receive(\.microphonePermissionRequestCompleted)
+		await store.receive(\.checkPermissions)
+		await store.receive(\.permissionsUpdated) {
+			$0.accessibilityPermission = .granted
+			$0.inputMonitoringPermission = .granted
+		}
+		await store.finish()
+
+		let counts = await probe.counts
+		XCTAssertEqual(counts.requests, 1)
+		XCTAssertEqual(counts.warmUps, 0)
+		XCTAssertEqual(counts.settingsOpens, 0)
+	}
+
+	func testMicrophoneStatusCheckDoesNotRequestNativePrompt() async {
+		let probe = MicrophonePermissionProbe()
+		let store = TestStore(initialState: AppFeature.State()) {
+			AppFeature()
+		} withDependencies: {
+			$0.permissions.microphoneStatus = { .notDetermined }
+			$0.permissions.accessibilityStatus = { .notDetermined }
+			$0.permissions.inputMonitoringStatus = { .notDetermined }
+			$0.permissions.screenRecordingStatus = { false }
+			$0.permissions.requestMicrophone = {
+				await probe.recordRequest()
+				return false
+			}
+		}
+
+		await store.send(.checkPermissions)
+		await store.receive(\.permissionsUpdated)
+		await store.finish()
+
+		let counts = await probe.counts
+		XCTAssertEqual(counts.requests, 0)
 	}
 
 	func testPasteLastTranscriptPrefersMostRecentLiveTranscript() async {
@@ -129,5 +236,27 @@ private actor PasteProbe {
 
 	func record(_ value: String) {
 		self.value = value
+	}
+}
+
+private actor MicrophonePermissionProbe {
+	private var requestCount = 0
+	private var warmUpCount = 0
+	private var settingsOpenCount = 0
+
+	var counts: (requests: Int, warmUps: Int, settingsOpens: Int) {
+		(requestCount, warmUpCount, settingsOpenCount)
+	}
+
+	func recordRequest() {
+		requestCount += 1
+	}
+
+	func recordWarmUp() {
+		warmUpCount += 1
+	}
+
+	func recordSettingsOpen() {
+		settingsOpenCount += 1
 	}
 }

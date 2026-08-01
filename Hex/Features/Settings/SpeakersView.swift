@@ -9,6 +9,11 @@ import SwiftUI
 struct SpeakersView: View {
 	@ObserveInjection var inject
 	@Shared(.speakerVoiceLibrary) private var speakerVoiceLibrary: SpeakerVoiceLibrary
+	let profileIDToFocus: UUID?
+
+	init(profileIDToFocus: UUID? = nil) {
+		self.profileIDToFocus = profileIDToFocus
+	}
 
 	var body: some View {
 		Group {
@@ -19,15 +24,28 @@ struct SpeakersView: View {
 					description: Text("Turn on speaker identification, then have each person say their name during a recording.")
 				)
 			} else {
-				ScrollView(.vertical, showsIndicators: true) {
-					LazyVStack(alignment: .leading, spacing: 14) {
-						ForEach(profiles) { profile in
-							SpeakerProfileCard(profile: profile)
+				ScrollViewReader { proxy in
+					ScrollView(.vertical, showsIndicators: true) {
+						LazyVStack(alignment: .leading, spacing: 14) {
+							ForEach(profiles) { profile in
+								SpeakerProfileCard(
+									profile: profile,
+									shouldFocusName: profile.id == profileIDToFocus
+								)
+								.id(profile.id)
+							}
+						}
+						.frame(width: 760, alignment: .leading)
+						.frame(maxWidth: .infinity, alignment: .leading)
+						.padding(20)
+					}
+					.task(id: profileIDToFocus) {
+						guard let profileIDToFocus else { return }
+						await Task.yield()
+						withAnimation {
+							proxy.scrollTo(profileIDToFocus, anchor: .center)
 						}
 					}
-					.frame(width: 760, alignment: .leading)
-					.frame(maxWidth: .infinity, alignment: .leading)
-					.padding(20)
 				}
 				.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
 			}
@@ -44,14 +62,19 @@ struct SpeakersView: View {
 
 private struct SpeakerProfileCard: View {
 	let profile: SpeakerVoiceProfile
+	let shouldFocusName: Bool
 	@Shared(.speakerVoiceLibrary) private var speakerVoiceLibrary: SpeakerVoiceLibrary
 	@State private var draftName: String
 	@FocusState private var isEditingName: Bool
 	@State private var audioPlayer: AVAudioPlayer?
 	@State private var playingSampleID: UUID?
 
-	init(profile: SpeakerVoiceProfile) {
+	init(
+		profile: SpeakerVoiceProfile,
+		shouldFocusName: Bool = false
+	) {
 		self.profile = profile
+		self.shouldFocusName = shouldFocusName
 		_draftName = State(initialValue: profile.name)
 	}
 
@@ -125,6 +148,11 @@ private struct SpeakerProfileCard: View {
 		.onChange(of: profile.name) { _, newName in
 			guard !isEditingName else { return }
 			draftName = newName
+		}
+		.task(id: shouldFocusName) {
+			guard shouldFocusName else { return }
+			await Task.yield()
+			isEditingName = true
 		}
 		.onDisappear {
 			audioPlayer?.stop()

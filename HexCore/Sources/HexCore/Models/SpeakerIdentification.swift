@@ -193,17 +193,22 @@ public struct SpeakerVoiceSample: Codable, Equatable, Identifiable, Sendable {
 	public var audioURL: URL
 	public var duration: TimeInterval
 	public var createdAt: Date
+	/// Identifies how the clip boundaries were chosen. Optional keeps samples
+	/// written by earlier app versions decodable so they can be refreshed later.
+	public var extractionVersion: Int?
 
 	public init(
 		id: UUID = UUID(),
 		audioURL: URL,
 		duration: TimeInterval,
-		createdAt: Date = .now
+		createdAt: Date = .now,
+		extractionVersion: Int? = nil
 	) {
 		self.id = id
 		self.audioURL = audioURL
 		self.duration = duration
 		self.createdAt = createdAt
+		self.extractionVersion = extractionVersion
 	}
 }
 
@@ -221,6 +226,14 @@ public struct SpeakerVoiceProfile: Codable, Equatable, Identifiable, Sendable {
 	public var audioSamples: [SpeakerVoiceSample]?
 	public var createdAt: Date
 	public var lastSeenAt: Date
+
+	public var isUnknownSpeaker: Bool {
+		guard isNameUserEdited != true else { return false }
+		let prefix = "Unknown Speaker "
+		guard name.hasPrefix(prefix) else { return false }
+		let number = name.dropFirst(prefix.count)
+		return !number.isEmpty && number.allSatisfy(\.isNumber)
+	}
 
 	public init(
 		id: UUID = UUID(),
@@ -248,6 +261,25 @@ public struct SpeakerVoiceLibrary: Codable, Equatable, Sendable {
 
 	public init(profiles: [SpeakerVoiceProfile] = []) {
 		self.profiles = profiles
+	}
+
+	public init(from decoder: Decoder) throws {
+		let container = try decoder.container(keyedBy: CodingKeys.self)
+		profiles = try container.decodeIfPresent([SpeakerVoiceProfile].self, forKey: .profiles) ?? []
+		for index in profiles.indices {
+			guard profiles[index].isNameUserEdited != true,
+				let number = Self.legacyUnnamedSpeakerNumber(from: profiles[index].name)
+			else { continue }
+			profiles[index].name = "Unknown Speaker \(number)"
+		}
+	}
+
+	private static func legacyUnnamedSpeakerNumber(from name: String) -> String? {
+		let prefix = "Speaker "
+		guard name.hasPrefix(prefix) else { return nil }
+		let number = String(name.dropFirst(prefix.count))
+		guard !number.isEmpty, number.allSatisfy(\.isNumber) else { return nil }
+		return number
 	}
 }
 
@@ -353,18 +385,19 @@ public enum SpeakerIdentification {
 	) -> SpeakerAttributedTranscript? {
 		guard !transcription.words.isEmpty, !diarization.segments.isEmpty else { return nil }
 
-		let orderedSpeakerIDs = Dictionary(grouping: diarization.segments, by: \.speakerID)
+		let diarizedSpeakerIDs = Dictionary(grouping: diarization.segments, by: \.speakerID)
 			.sorted { lhs, rhs in
 				(lhs.value.map(\.startTime).min() ?? 0) < (rhs.value.map(\.startTime).min() ?? 0)
 			}
 			.map(\.key)
-		guard !orderedSpeakerIDs.isEmpty else { return nil }
 
 		let orderedWords = transcription.words.sorted { $0.startTime < $1.startTime }
 		let wordsBySpeaker = Dictionary(grouping: orderedWords.compactMap { word -> (String, TimedTranscriptWord)? in
 			guard let speakerID = speakerID(for: word, segments: diarization.segments) else { return nil }
 			return (speakerID, word)
 		}, by: \.0)
+		let orderedSpeakerIDs = diarizedSpeakerIDs.filter { !(wordsBySpeaker[$0] ?? []).isEmpty }
+		guard !orderedSpeakerIDs.isEmpty else { return nil }
 
 		var displayNames = [String: String]()
 		var profileIDs = [String: UUID]()
@@ -376,9 +409,9 @@ public enum SpeakerIdentification {
 			let speakerSegments = diarization.segments.filter { $0.speakerID == speakerID }
 			let embedding = averageEmbedding(from: speakerSegments.map(\.embedding))
 
-			// A strong voice match always wins. Spoken introductions are useful for
-			// creating a new profile, but must never rename an existing one because
-			// transcription can easily turn ordinary speech into a plausible name.
+			// A strong voice match always wins. Spoken introductions can provide the
+			// initial name, but must never rename an existing profile because transcription
+			// can easily turn ordinary speech into a plausible name.
 			if let profileID = verifiedProfileIDs[speakerID],
 				let profile = library.profiles.first(where: { $0.id == profileID })
 			{
@@ -389,12 +422,11 @@ public enum SpeakerIdentification {
 				displayNames[speakerID] = profile.name
 				profileIDs[speakerID] = profile.id
 				markSeen(profileID: profile.id, in: &library, at: now, embedding: embedding)
-			} else if let name = introducedNames[speakerID], !embedding.isEmpty {
+			} else {
+				let name = introducedNames[speakerID] ?? "Unknown Speaker \(index + 1)"
 				let profile = createProfile(named: name, embedding: embedding, library: &library, now: now)
 				displayNames[speakerID] = profile.name
 				profileIDs[speakerID] = profile.id
-			} else {
-				displayNames[speakerID] = "Speaker \(index + 1)"
 			}
 		}
 
@@ -542,11 +574,19 @@ public enum SpeakerIdentification {
 
 	private static func averageEmbedding(from embeddings: [[Float]]) -> [Float] {
 		guard let first = embeddings.first, !first.isEmpty else { return [] }
-		let compatible = embeddings.filter { $0.count == first.count }
+		let compatible = embeddings
+			.filter { $0.count == first.count }
+			.map { embedding in
+				// JSONEncoder rejects NaN and infinity, which would otherwise drop the
+				// entire voice library after a correctly detected introduction.
+				embedding.map { $0.isFinite ? $0 : 0 }
+			}
 		guard !compatible.isEmpty else { return [] }
-		return (0..<first.count).map { index in
+		let average = (0..<first.count).map { index in
 			compatible.map { $0[index] }.reduce(0, +) / Float(compatible.count)
 		}
+		guard average.allSatisfy(\.isFinite) else { return [] }
+		return average
 	}
 
 	private static func cosineSimilarity(_ lhs: [Float], _ rhs: [Float]) -> Float? {

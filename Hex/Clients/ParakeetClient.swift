@@ -36,7 +36,11 @@ actor ParakeetClient {
     return available
   }
 
-  func ensureLoaded(modelName: String, progress: @escaping (Progress) -> Void) async throws {
+  func ensureLoaded(
+    modelName: String,
+    progress: @escaping (Progress) -> Void,
+    preparationPhase: @escaping (ModelPreparationPhase) -> Void = { _ in }
+  ) async throws {
     guard let variant = ParakeetModel(rawValue: modelName) else {
       throw NSError(
         domain: "Parakeet",
@@ -60,13 +64,11 @@ actor ParakeetClient {
     progress(p)
 
     // Best-effort progress polling while FluidAudio downloads
-    let fm = FileManager.default
-    let support = try? fm.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
-    let faDir = support?.appendingPathComponent("FluidAudio/Models/\(variant.identifier)", isDirectory: true)
+    let faDir = AsrModels.defaultCacheDirectory(for: variant.asrVersion)
     let pollTask = Task {
       while p.completedUnitCount < 95 {
         try? await Task.sleep(nanoseconds: 250_000_000)
-        if let dir = faDir, let size = directorySize(dir) {
+        if let size = directorySize(faDir) {
           let target: Double = 650 * 1024 * 1024 // ~650MB
           let frac = max(0.0, min(1.0, Double(size) / target))
           p.completedUnitCount = Int64(5 + frac * 90)
@@ -80,6 +82,7 @@ actor ParakeetClient {
     // Download + load the requested variant (returns when all assets are present)
     let models = try await AsrModels.downloadAndLoad(version: variant.asrVersion)
     self.models = models
+    preparationPhase(.activating)
     let manager = AsrManager(config: .init(), models: models)
     self.asr = manager
     self.currentVariant = variant
@@ -186,9 +189,10 @@ actor ParakeetClient {
     let fm = FileManager.default
     let xdg = ProcessInfo.processInfo.environment["XDG_CACHE_HOME"].flatMap { URL(fileURLWithPath: $0, isDirectory: true) }
     let appSupport = try? fm.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: false)
+    let preferredAppSupport = try? URL.hexApplicationSupportRoot
     let appCache = try? URL.hexApplicationSupport.appendingPathComponent("cache", isDirectory: true)
     let userCache = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".cache", isDirectory: true)
-    return [xdg, appCache, appSupport, userCache].compactMap { $0 }
+    return [xdg, appCache, appSupport, preferredAppSupport, userCache].compactMap { $0 }
   }
 }
 

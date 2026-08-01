@@ -270,7 +270,8 @@ struct SettingsFeature {
         }
         return .none
 
-	  case .refinementProviderChanged:
+	  case let .refinementProviderChanged(provider):
+		state.$hexSettings.withLock { $0.refinementProvider = provider }
 		return .none
 
       case .task:

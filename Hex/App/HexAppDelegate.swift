@@ -18,6 +18,7 @@ class HexAppDelegate: NSObject, NSApplicationDelegate {
 
 	func applicationDidFinishLaunching(_: Notification) {
 		DiagnosticsLogging.bootstrapIfNeeded()
+		migrateLegacySandboxUserDefaultsIfNeeded()
 		// Ensure Parakeet/FluidAudio caches live under Application Support, not ~/.cache
 		configureLocalCaches()
 		if isTesting {
@@ -103,6 +104,31 @@ class HexAppDelegate: NSObject, NSApplicationDelegate {
 	private func configureMenuBarStatusItem() {
 		guard menuBarStatusItemController == nil else { return }
 		menuBarStatusItemController = MenuBarStatusItemController(appDelegate: self)
+	}
+
+	/// Preserve preferences that macOS stored inside the former App Sandbox container.
+	/// Existing unsandboxed values win so this migration is safe to repeat.
+	private func migrateLegacySandboxUserDefaultsIfNeeded() {
+		guard let bundleIdentifier = Bundle.main.bundleIdentifier else { return }
+		let preferencesURL = FileManager.default.homeDirectoryForCurrentUser
+			.appendingPathComponent("Library/Containers", isDirectory: true)
+			.appendingPathComponent(bundleIdentifier, isDirectory: true)
+			.appendingPathComponent("Data/Library/Preferences", isDirectory: true)
+			.appendingPathComponent("\(bundleIdentifier).plist")
+		guard
+			let data = try? Data(contentsOf: preferencesURL),
+			let legacyPreferences = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any]
+		else { return }
+
+		let defaults = UserDefaults.standard
+		var migratedCount = 0
+		for (key, value) in legacyPreferences where defaults.object(forKey: key) == nil {
+			defaults.set(value, forKey: key)
+			migratedCount += 1
+		}
+		if migratedCount > 0 {
+			appLogger.info("Migrated \(migratedCount) preferences from the former sandbox container")
+		}
 	}
 
 	/// Sets XDG_CACHE_HOME so FluidAudio stores models under our app's

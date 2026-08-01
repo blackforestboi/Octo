@@ -4,6 +4,20 @@ import XCTest
 @testable import Octo
 
 final class CLIRefinementClientTests: XCTestCase {
+	private actor CommandRunnerStub {
+		private var results: [CLIRefinementClient.ProcessResult]
+		private(set) var commands: [CLIRefinementClient.Command] = []
+
+		init(results: [CLIRefinementClient.ProcessResult]) {
+			self.results = results
+		}
+
+		func run(_ command: CLIRefinementClient.Command, input: String?) throws -> CLIRefinementClient.ProcessResult {
+			commands.append(command)
+			return results.removeFirst()
+		}
+	}
+
 	func testCodexCommandUsesOneShotReadOnlyInvocation() throws {
 		let command = try CLIRefinementClient.command(
 			for: .codex,
@@ -16,6 +30,7 @@ final class CLIRefinementClientTests: XCTestCase {
 		XCTAssertTrue(command.arguments.contains("read-only"))
 		XCTAssertTrue(command.arguments.contains("--ephemeral"))
 		XCTAssertTrue(command.arguments.contains("--ignore-user-config"))
+		XCTAssertTrue(command.arguments.contains("--json"))
 		XCTAssertFalse(command.arguments.contains("model_reasoning_effort=\"none\""))
 		XCTAssertEqual(command.arguments.last, "-")
 	}
@@ -97,9 +112,87 @@ final class CLIRefinementClientTests: XCTestCase {
 		XCTAssertEqual(claude.arguments, ["auth", "status"])
 	}
 
+	func testCodexLoginUsesTheManagedChatGPTSignInCommand() {
+		let command = CLIRefinementClient.loginCommand(
+			executableURL: URL(fileURLWithPath: "/Applications/ChatGPT.app/Contents/Resources/codex")
+		)
+
+		XCTAssertEqual(command.provider, .codex)
+		XCTAssertEqual(command.executableURL.path, "/Applications/ChatGPT.app/Contents/Resources/codex")
+		XCTAssertEqual(command.arguments, ["login"])
+	}
+
+	func testCodexConnectionReusesAnExistingLoginWithoutPrompting() async throws {
+		let executableURL = URL(fileURLWithPath: "/usr/local/bin/codex")
+		let runner = CommandRunnerStub(results: [.init(status: 0, standardOutput: "", standardError: "")])
+
+		try await CLIRefinementClient.connectCodexIfNeeded(
+			executableURL: executableURL,
+			commandRunner: runner.run
+		)
+
+		let commands = await runner.commands
+		XCTAssertEqual(commands.map(\.arguments), [["login", "status"]])
+	}
+
+	func testCodexConnectionSignsInAndVerifiesAnUnauthenticatedRuntime() async throws {
+		let executableURL = URL(fileURLWithPath: "/Applications/ChatGPT.app/Contents/Resources/codex")
+		let runner = CommandRunnerStub(results: [
+			.init(status: 1, standardOutput: "", standardError: "Not logged in"),
+			.init(status: 0, standardOutput: "Login successful", standardError: ""),
+			.init(status: 0, standardOutput: "Logged in using ChatGPT", standardError: ""),
+		])
+
+		try await CLIRefinementClient.connectCodexIfNeeded(
+			executableURL: executableURL,
+			commandRunner: runner.run
+		)
+
+		let commands = await runner.commands
+		XCTAssertEqual(commands.map(\.arguments), [
+			["login", "status"],
+			["login"],
+			["login", "status"],
+		])
+	}
+
+	func testCodexConnectionReportsAnIncompleteLogin() async {
+		let executableURL = URL(fileURLWithPath: "/Applications/ChatGPT.app/Contents/Resources/codex")
+		let runner = CommandRunnerStub(results: [
+			.init(status: 1, standardOutput: "", standardError: "Not logged in"),
+			.init(status: 1, standardOutput: "", standardError: "Login cancelled"),
+		])
+
+		do {
+			try await CLIRefinementClient.connectCodexIfNeeded(
+				executableURL: executableURL,
+				commandRunner: runner.run
+			)
+			XCTFail("Expected Codex sign-in to fail")
+		} catch {
+			XCTAssertEqual(error.localizedDescription, "Codex sign-in did not complete. Please try again.")
+		}
+
+		let commands = await runner.commands
+		XCTAssertEqual(commands.map(\.arguments), [["login", "status"], ["login"]])
+	}
+
 	func testCodexResultUsesTerminalStandardOutput() {
 		XCTAssertEqual(
 			CLIRefinementClient.outputText(from: "\nRefined transcript\n", provider: .codex),
+			"Refined transcript"
+		)
+	}
+
+	func testCodexResultExtractsOnlyTheTerminalAgentMessageFromJSONEvents() {
+		let output = """
+		{"type":"thread.started","thread_id":"thread-1"}
+		{"type":"item.completed","item":{"id":"item-0","type":"agent_message","text":"Refined transcript"}}
+		{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":2}}
+		"""
+
+		XCTAssertEqual(
+			CLIRefinementClient.outputText(from: output, provider: .codex),
 			"Refined transcript"
 		)
 	}
@@ -122,5 +215,26 @@ final class CLIRefinementClientTests: XCTestCase {
 			),
 			"Selected model is unavailable."
 		)
+	}
+
+	func testFailureDiagnosticSkipsCodexBannerAndPrivatePrompt() {
+		let standardError = """
+		OpenAI Codex v0.146.0-alpha.3.1
+		--------
+		user
+		PRIVATE TRANSCRIPT THAT MUST NOT BE SHOWN
+		"""
+		let standardOutput = """
+		{"type":"thread.started","thread_id":"thread-1"}
+		{"type":"turn.failed","error":{"message":"{\"type\":\"error\",\"status\":400,\"error\":{\"message\":\"Selected model is unavailable.\"}}"}}
+		"""
+
+		let diagnostic = CLIRefinementClient.failureDiagnostic(
+			standardError: standardError,
+			standardOutput: standardOutput
+		)
+
+		XCTAssertEqual(diagnostic, "Selected model is unavailable.")
+		XCTAssertFalse(diagnostic?.contains("PRIVATE TRANSCRIPT") == true)
 	}
 }

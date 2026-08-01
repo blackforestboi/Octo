@@ -98,6 +98,10 @@ final class HexSettingsMigrationTests: XCTestCase {
 		XCTAssertFalse(HexSettings().hasCompletedRefinementProviderDetection)
 	}
 
+	func testNewSettingsDefaultToDoubleTapOnly() {
+		XCTAssertTrue(HexSettings().useDoubleTapOnly)
+	}
+
 	func testInitNormalizesDoubleTapOnlyWhenLockDisabled() {
 		let settings = HexSettings(useDoubleTapOnly: true, doubleTapLockEnabled: false)
 

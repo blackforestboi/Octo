@@ -32,6 +32,16 @@ public struct ModelDownloadView: View {
 					style: .error
 				)
 			}
+			if !store.modelBootstrapState.isModelReady,
+			   store.modelBootstrapState.preparationPhase == .activating,
+			   !store.isDownloading
+			{
+				AutoDownloadBannerView(
+					title: "Finalizing \(store.modelBootstrapState.modelDisplayName ?? "model")…",
+					subtitle: "Loading the model on this Mac. Dictation will be ready in a moment.",
+					progress: nil
+				)
+			}
 			if selectedModelName == nil, downloadingModel == nil {
 				NoModelChooser(
 					models: parakeetModels,
@@ -50,6 +60,7 @@ public struct ModelDownloadView: View {
 					isDownloadingAnything: store.isDownloading,
 					downloadingModel: downloadingModel,
 					downloadProgress: store.downloadProgress,
+					downloadPhase: store.downloadPhase,
 					onBrowse: { isModelLibraryPresented = true },
 					onDownload: {
 						if let name = selectedModelName {
@@ -242,6 +253,7 @@ private struct CurrentModelSummary: View {
 	let isDownloadingAnything: Bool
 	let downloadingModel: CuratedModelInfo?
 	let downloadProgress: Double
+	let downloadPhase: ModelPreparationPhase?
 	let onBrowse: () -> Void
 	let onDownload: () -> Void
 	let onCancelDownload: () -> Void
@@ -312,7 +324,11 @@ private struct CurrentModelSummary: View {
 				.replacingOccurrences(of: "_", with: " ")
 				.capitalized
 		}
-		if let downloadingModel { return "Downloading \(downloadingModel.displayName)…" }
+		if let downloadingModel {
+			return downloadPhase == .activating
+				? "Finalizing \(downloadingModel.displayName)…"
+				: "Downloading \(downloadingModel.displayName)…"
+		}
 		return "Choose a transcription model"
 	}
 
@@ -320,13 +336,21 @@ private struct CurrentModelSummary: View {
 		if needsDownload { return "Not downloaded — transcription won't work until you download it." }
 		if let model { return "\(model.size) · \(model.storageSize)" }
 		if selectedModelName != nil { return "Installed local model" }
+		if downloadPhase == .activating {
+			return "Loading the model on this Mac. Dictation will be ready in a moment."
+		}
 		if let downloadingModel { return "\(downloadingModel.storageSize) will be stored locally on this Mac." }
 		return "Download a local model to start transcribing."
 	}
 
 	private var activeDownloadStatus: String? {
 		guard selectedModelName != nil, let downloadingModel else { return nil }
-		return "Downloading \(downloadingModel.displayName)…"
+		switch downloadPhase {
+		case .activating:
+			return "Finalizing and activating \(downloadingModel.displayName)…"
+		case .downloading, nil:
+			return "Downloading \(downloadingModel.displayName)…"
+		}
 	}
 
 	private var iconName: String {
@@ -417,6 +441,7 @@ private struct ModelLibrarySheet: View {
 						// Only the active row receives live progress so the other
 						// rows don't re-render on every tick.
 						downloadProgress: isDownloading(model) ? store.downloadProgress : 0,
+						downloadPhase: isDownloading(model) ? store.downloadPhase : nil,
 						isDisabled: store.isDownloading && !isDownloading(model),
 						showsBadge: showsBadges && !model.isDownloaded,
 						onSelect: { select(model) },
@@ -462,6 +487,7 @@ private struct ModelLibraryRow: View {
 	let isSelected: Bool
 	let isDownloading: Bool
 	let downloadProgress: Double
+	let downloadPhase: ModelPreparationPhase?
 	let isDisabled: Bool
 	let showsBadge: Bool
 	let onSelect: () -> Void
@@ -585,7 +611,9 @@ private struct ModelLibraryRow: View {
 	}
 
 	private var statusText: String? {
-		if isDownloading { return "Downloading…" }
+		if isDownloading {
+			return downloadPhase == .activating ? "Finalizing…" : "Downloading…"
+		}
 		if isSelected { return "In Use" }
 		if model.isDownloaded { return "Installed" }
 		return nil

@@ -275,7 +275,7 @@ public struct HexSettings: Codable, Equatable, Sendable {
 	public init(
 		soundEffectsEnabled: Bool = true,
 		soundEffectsVolume: Double = HexSettings.baseSoundEffectsVolume,
-		hotkey: HotKey = .init(key: nil, modifiers: [.option]),
+		hotkey: HotKey = .init(key: nil, modifiers: [.control]),
 		openOnLogin: Bool = false,
 		showDockIcon: Bool = true,
 		indicatorSize: IndicatorSize = .regular,
@@ -289,7 +289,7 @@ public struct HexSettings: Codable, Equatable, Sendable {
 		longRecordingConfirmationThresholdMinutes: Int = 5,
 		copyToClipboard: Bool = false,
 		superFastModeEnabled: Bool = true,
-		useDoubleTapOnly: Bool = false,
+		useDoubleTapOnly: Bool = true,
 		allowLongPressForOnDemand: Bool = true,
 		doubleTapLockEnabled: Bool = true,
 		outputLanguage: String? = nil,
