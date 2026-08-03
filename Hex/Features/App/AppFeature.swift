@@ -383,7 +383,20 @@ struct AppFeature {
         // App became active - re-check permissions
         return .send(.checkPermissions)
 
-      case .modelStatusEvaluated:
+      case let .modelStatusEvaluated(isReady):
+        let selectedModel = state.hexSettings.selectedModel
+        state.$modelBootstrapState.withLock { bootstrap in
+          // `ensureSelectedModelReadiness` completes off the reducer, then
+          // sends this action. Mirror that result through the store so the
+          // hotkey sees the model that was successfully activated.
+          guard bootstrap.modelIdentifier == selectedModel else { return }
+          bootstrap.isModelReady = isReady
+          if isReady {
+            bootstrap.preparationPhase = nil
+            bootstrap.progress = 1
+            bootstrap.lastError = nil
+          }
+        }
         return .none
       }
     }

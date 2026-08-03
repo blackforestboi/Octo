@@ -2158,15 +2158,29 @@ private extension TranscriptionFeature {
 		  for channel in transcriptionChannels {
 			  do {
 				  var output = try await transcription.transcribe(channel.audioURL, model, decodeOptions) { _ in }
-				  var introducedSpeakerIDs = Set<String>()
 
 				  if speakerIdentificationEnabled, !output.words.isEmpty, output.speakerAttribution == nil {
 					  do {
+						  @Shared(.speakerVoiceLibrary) var voiceLibrary: SpeakerVoiceLibrary
+						  let enrollmentProfiles = $voiceLibrary.withLock { $0.profiles }
 						  let diarization: SpeakerDiarizationOutput
 						  if let suppliedDiarization = output.diarization {
 							  diarization = suppliedDiarization
 						  } else {
-							  diarization = try await speakerDiarization.analyze(channel.audioURL, speakerDiarizationProvider)
+							  diarization = try await speakerDiarization.analyze(
+								  channel.audioURL,
+								  speakerDiarizationProvider,
+								  enrollmentProfiles
+							  )
+						  }
+						  transcriptionFeatureLogger.notice(
+							  "Speaker diarization completed source=\(channel.source.rawValue, privacy: .public) provider=\(speakerDiarizationProvider.rawValue, privacy: .public) segments=\(diarization.segments.count) speakers=\(Set(diarization.segments.map(\.speakerID)).count)"
+						  )
+						  for segment in diarization.segments {
+							  let profileID = segment.profileID?.uuidString ?? "unassigned"
+							  transcriptionFeatureLogger.info(
+								  "Speaker diarization segment source=\(channel.source.rawValue, privacy: .public) speaker=\(segment.speakerID, privacy: .public) profile=\(profileID, privacy: .public) start=\(String(format: "%.3f", segment.startTime), privacy: .public) end=\(String(format: "%.3f", segment.endTime), privacy: .public) duration=\(String(format: "%.3f", segment.endTime - segment.startTime), privacy: .public) activity=\(String(format: "%.4f", segment.qualityScore), privacy: .public)"
+							  )
 						  }
 						  let introductionContexts = SpeakerIdentification.introductionContexts(
 							  transcription: output,
@@ -2179,16 +2193,6 @@ private extension TranscriptionFeature {
 							  transcriptionFeatureLogger.warning("Speaker introduction classification failed: \(error.localizedDescription, privacy: .private)")
 							  introductions = []
 						  }
-						  introducedSpeakerIDs = Set(introductions.map(\.speakerID))
-						  @Shared(.speakerVoiceLibrary) var voiceLibrary: SpeakerVoiceLibrary
-						  let savedLibrary = $voiceLibrary.withLock { $0 }
-						  let verifiedProfileIDs = await verifyKnownSpeakerMatches(
-							  diarization: diarization,
-							  library: savedLibrary,
-							  sourceURL: channel.audioURL,
-							  provider: speakerDiarizationProvider,
-							  analyze: speakerDiarization.analyze
-						  )
 						  output.speakerAttribution = $voiceLibrary.withLock { library in
 							  SpeakerIdentification.attribute(
 								  transcription: output,
@@ -2196,7 +2200,7 @@ private extension TranscriptionFeature {
 								  library: &library,
 								  now: Date(),
 								  introductions: introductions,
-								  verifiedProfileIDs: verifiedProfileIDs
+								  audioSource: channel.source
 							  )
 						  }
 					  } catch {
@@ -2209,7 +2213,7 @@ private extension TranscriptionFeature {
 					  await storeSpeakerVoiceSamples(
 						  from: attribution,
 						  sourceURL: channel.audioURL,
-						  replacingSamplesForSpeakerIDs: introducedSpeakerIDs
+						  audioSource: channel.source
 					  )
 				  }
 
@@ -2236,12 +2240,12 @@ private extension TranscriptionFeature {
   }
 }
 
-/// Retain one local clip for each saved profile. This runs after attribution so unnamed
-/// profiles receive a recognition sample, and legacy clips refresh after their next match.
+/// Retain the first usable local clip for each saved profile. Voice fingerprints are
+/// write-once: later matches never replace or merge the embedding or reference clip.
 private func storeSpeakerVoiceSamples(
 	from attribution: SpeakerAttributedTranscript,
 	sourceURL: URL,
-	replacingSamplesForSpeakerIDs: Set<String>
+	audioSource: TranscriptAudioSource
 ) async {
 	var candidates = [UUID: SpeakerAttributedSegment]()
 	for segment in attribution.segments {
@@ -2252,36 +2256,20 @@ private func storeSpeakerVoiceSamples(
 		}
 	}
 	@Shared(.speakerVoiceLibrary) var voiceLibrary: SpeakerVoiceLibrary
-	var samplesToDelete = [SpeakerVoiceSample]()
-	let sampleState = $voiceLibrary.withLock { library -> (missing: Set<UUID>, legacy: Set<UUID>) in
-		var missingProfileIDs = Set<UUID>()
-		var legacyProfileIDs = Set<UUID>()
-		for index in library.profiles.indices {
-			let storedSamples = library.profiles[index].audioSamples ?? []
-			let usableSamples = storedSamples.filter { FileManager.default.fileExists(atPath: $0.audioURL.path) }
-			samplesToDelete.append(contentsOf: storedSamples.filter { !FileManager.default.fileExists(atPath: $0.audioURL.path) })
-			if let firstSample = usableSamples.first {
-				library.profiles[index].audioSamples = [firstSample]
-				samplesToDelete.append(contentsOf: usableSamples.dropFirst())
-				if firstSample.extractionVersion != SpeakerVoiceSampleStore.currentExtractionVersion {
-					legacyProfileIDs.insert(library.profiles[index].id)
-				}
-			} else {
-				library.profiles[index].audioSamples = []
-				missingProfileIDs.insert(library.profiles[index].id)
-			}
-		}
-		return (missingProfileIDs, legacyProfileIDs)
+	let profilesWithoutSamples = $voiceLibrary.withLock { library in
+		Set(library.profiles.compactMap { profile in
+			(profile.audioSamples ?? []).isEmpty ? profile.id : nil
+		})
 	}
-	SpeakerVoiceSampleStore.delete(samplesToDelete)
-	let profileIDsReplacingSample = Set(attribution.segments.compactMap { segment -> UUID? in
-		guard replacingSamplesForSpeakerIDs.contains(segment.speakerID) else { return nil }
-		return segment.profileID
-	}).union(sampleState.legacy)
 
 	var captured = [(profileID: UUID, sample: SpeakerVoiceSample)]()
 	for (profileID, segment) in candidates {
-		guard sampleState.missing.contains(profileID) || profileIDsReplacingSample.contains(profileID) else { continue }
+		guard profilesWithoutSamples.contains(profileID) else {
+			transcriptionFeatureLogger.info(
+				"Speaker reference sample unchanged source=\(audioSource.rawValue, privacy: .public) profile=\(profileID.uuidString, privacy: .public) profileUpdated=false fingerprintUpdated=false"
+			)
+			continue
+		}
 		do {
 			guard let sample = try await SpeakerVoiceSampleStore.capture(
 				from: sourceURL,
@@ -2290,25 +2278,26 @@ private func storeSpeakerVoiceSamples(
 				endTime: segment.endTime
 			) else { continue }
 			captured.append((profileID, sample))
+			let extractionVersion = sample.extractionVersion.map(String.init) ?? "legacy"
+			transcriptionFeatureLogger.notice(
+				"Speaker reference sample created source=\(audioSource.rawValue, privacy: .public) speaker=\(segment.speakerID, privacy: .public) profile=\(profileID.uuidString, privacy: .public) extractionVersion=\(extractionVersion, privacy: .public)"
+			)
 		} catch {
-			transcriptionFeatureLogger.warning("Could not retain speaker audio sample: \(error.localizedDescription, privacy: .private)")
+			transcriptionFeatureLogger.warning(
+				"Speaker reference sample capture failed source=\(audioSource.rawValue, privacy: .public) speaker=\(segment.speakerID, privacy: .public) profile=\(profileID.uuidString, privacy: .public) error=\(error.localizedDescription, privacy: .private)"
+			)
 		}
 	}
 
 	guard !captured.isEmpty else { return }
-	samplesToDelete = []
+	var samplesToDelete = [SpeakerVoiceSample]()
 	$voiceLibrary.withLock { library in
 		for (profileID, sample) in captured {
 			guard let index = library.profiles.firstIndex(where: { $0.id == profileID }) else {
 				samplesToDelete.append(sample)
 				continue
 			}
-			let hasSavedSample = (library.profiles[index].audioSamples ?? [])
-				.contains { FileManager.default.fileExists(atPath: $0.audioURL.path) }
-			if profileIDsReplacingSample.contains(profileID) {
-				samplesToDelete.append(contentsOf: library.profiles[index].audioSamples ?? [])
-				library.profiles[index].audioSamples = [sample]
-			} else if hasSavedSample {
+			if !(library.profiles[index].audioSamples ?? []).isEmpty {
 				samplesToDelete.append(sample)
 			} else {
 				library.profiles[index].audioSamples = [sample]
@@ -2316,83 +2305,6 @@ private func storeSpeakerVoiceSamples(
 		}
 	}
 	SpeakerVoiceSampleStore.delete(samplesToDelete)
-}
-
-/// Verifies the most likely saved voices in a single diarization run. Cluster IDs
-/// are local to one run, so placing a retained sample next to the new turn gives a
-/// much stronger signal than comparing embeddings produced in separate runs.
-private func verifyKnownSpeakerMatches(
-	diarization: SpeakerDiarizationOutput,
-	library: SpeakerVoiceLibrary,
-	sourceURL: URL,
-	provider: SpeakerDiarizationProvider,
-	analyze: @escaping @Sendable (URL, SpeakerDiarizationProvider) async throws -> SpeakerDiarizationOutput
-) async -> [String: UUID] {
-	let candidates = SpeakerIdentification.rankedVoiceMatchCandidates(
-		diarization: diarization,
-		library: library
-	)
-	guard !candidates.isEmpty else { return [:] }
-
-	var verified = [String: UUID]()
-	for (speakerID, speakerCandidates) in Dictionary(grouping: candidates, by: \.speakerID) {
-		guard let candidateSegment = diarization.segments
-			.filter({ $0.speakerID == speakerID })
-			.max(by: { ($0.endTime - $0.startTime) < ($1.endTime - $1.startTime) })
-		else { continue }
-
-		let references = speakerCandidates.compactMap { candidate -> SpeakerVoiceComparisonReference? in
-			guard let profile = library.profiles.first(where: { $0.id == candidate.profileID }),
-				let sample = (profile.audioSamples ?? [])
-					.first(where: { FileManager.default.fileExists(atPath: $0.audioURL.path) })
-			else { return nil }
-			return .init(profileID: profile.id, audioURL: sample.audioURL)
-		}
-		guard let input = try? await SpeakerVoiceSampleStore.comparisonInput(
-			references: references,
-			candidateURL: sourceURL,
-			candidateStartTime: candidateSegment.startTime,
-			candidateEndTime: candidateSegment.endTime
-		) else { continue }
-		defer { FileManager.default.removeItemIfExists(at: input.audioURL) }
-
-		do {
-			let jointDiarization = try await analyze(input.audioURL, provider)
-			guard let candidateCluster = dominantCluster(
-				in: jointDiarization,
-				startTime: input.candidateStartTime,
-				endTime: input.candidateEndTime
-			) else { continue }
-			let matchedProfiles = input.referenceRanges.compactMap { range -> UUID? in
-				dominantCluster(in: jointDiarization, startTime: range.startTime, endTime: range.endTime) == candidateCluster
-					? range.profileID
-					: nil
-			}
-			if matchedProfiles.count == 1, let profileID = matchedProfiles.first {
-				verified[speakerID] = profileID
-			}
-		} catch {
-			transcriptionFeatureLogger.warning("Speaker reference comparison failed: \(error.localizedDescription, privacy: .private)")
-		}
-	}
-	return verified
-}
-
-private func dominantCluster(
-	in diarization: SpeakerDiarizationOutput,
-	startTime: TimeInterval,
-	endTime: TimeInterval
-) -> String? {
-	guard endTime > startTime else { return nil }
-	let overlapBySpeaker = diarization.segments.reduce(into: [String: TimeInterval]()) { result, segment in
-		let overlap = max(0, min(endTime, segment.endTime) - max(startTime, segment.startTime))
-		guard overlap > 0 else { return }
-		result[segment.speakerID, default: 0] += overlap
-	}
-	guard let dominant = overlapBySpeaker.max(by: { $0.value < $1.value }),
-		dominant.value >= min(0.5, (endTime - startTime) * 0.25)
-	else { return nil }
-	return dominant.key
 }
 
 // MARK: - Transcription Handlers

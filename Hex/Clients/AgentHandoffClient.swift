@@ -471,6 +471,185 @@ enum CodexProjectCatalogLocation {
 	}
 }
 
+/// A bounded, project-scoped view of local Codex threads that can safely receive
+/// a new turn. Octo only supplies this catalogue; the coordinator chooses whether
+/// a handoff should continue one of these threads.
+enum CodexThreadCatalog {
+	struct Thread: Codable, Equatable, Sendable {
+		let id: String
+		let title: String
+		let preview: String
+		let projectPath: String
+		let updatedAt: TimeInterval?
+	}
+
+	struct AppServerThread: Decodable {
+		struct Status: Decodable {
+			let type: String?
+		}
+
+		let id: String
+		let name: String?
+		let preview: String?
+		let cwd: String?
+		let updatedAt: TimeInterval?
+		let status: Status?
+	}
+
+	private struct ListResult: Decodable {
+		let data: [AppServerThread]
+	}
+
+	static func list(projects: [CodexProjectCatalog.Project]) async throws -> [Thread] {
+		let executable = try executable(named: "codex", fallback: "/Applications/ChatGPT.app/Contents/Resources/codex")
+		let result = try await requestList(executableURL: executable, projectPaths: projects.map(\.path))
+		let data = try JSONSerialization.data(withJSONObject: result)
+		let records = try JSONDecoder().decode(ListResult.self, from: data).data
+		return eligibleThreads(from: records, projects: projects)
+	}
+
+	static func eligibleThreads(
+		from records: [AppServerThread],
+		projects: [CodexProjectCatalog.Project]
+	) -> [Thread] {
+		let projectPaths = Set(projects.map(\.path))
+		return records.compactMap { record in
+			guard record.status?.type != "active",
+				let cwd = record.cwd,
+				let projectPath = normalizedPath(cwd),
+				projectPaths.contains(projectPath)
+			else { return nil }
+			let title = (record.name ?? record.preview ?? "Untitled Codex task")
+				.trimmingCharacters(in: .whitespacesAndNewlines)
+			guard !title.isEmpty else { return nil }
+			return .init(
+				id: record.id,
+				title: title,
+				preview: record.preview?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "",
+				projectPath: projectPath,
+				updatedAt: record.updatedAt
+			)
+		}
+	}
+
+	private static func normalizedPath(_ rawPath: String) -> String? {
+		if let url = URL(string: rawPath), url.isFileURL {
+			return url.standardizedFileURL.path
+		}
+		guard rawPath.hasPrefix("/") else { return nil }
+		return URL(fileURLWithPath: rawPath, isDirectory: true).standardizedFileURL.path
+	}
+
+	private static func requestList(
+		executableURL: URL,
+		projectPaths: [String]
+	) async throws -> [String: Any] {
+		let process = Process()
+		let input = Pipe()
+		let output = Pipe()
+		let standardError = Pipe()
+		process.executableURL = executableURL
+		process.arguments = ["app-server"]
+		process.currentDirectoryURL = FileManager.default.temporaryDirectory
+		process.environment = ProcessInfo.processInfo.environment
+		process.standardInput = input
+		process.standardOutput = output
+		process.standardError = standardError
+
+		return try await withTaskCancellationHandler(operation: {
+			try await withCheckedThrowingContinuation { continuation in
+				let lock = NSLock()
+				var finished = false
+				let lineBuffer = JSONLineBuffer()
+
+				func finish(_ result: Result<[String: Any], Error>) {
+					lock.lock()
+					guard !finished else {
+						lock.unlock()
+						return
+					}
+					finished = true
+					lock.unlock()
+					output.fileHandleForReading.readabilityHandler = nil
+					continuation.resume(with: result)
+					if process.isRunning { process.terminate() }
+				}
+
+				func send(_ value: [String: Any]) {
+					guard let data = try? JSONSerialization.data(withJSONObject: value) else { return }
+					try? input.fileHandleForWriting.write(contentsOf: data + Data([0x0A]))
+				}
+
+				output.fileHandleForReading.readabilityHandler = { handle in
+					let data = handle.availableData
+					guard !data.isEmpty else { return }
+					for line in lineBuffer.append(data) {
+						guard let message = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { continue }
+						if let error = message["error"] as? [String: Any] {
+							finish(.failure(AgentHandoffError.launchFailed(
+								(error["message"] as? String) ?? "Codex thread catalogue"
+							)))
+							continue
+						}
+						switch message["id"] as? Int {
+						case 1:
+							send(["method": "initialized", "params": [:]])
+							send([
+								"id": 2,
+								"method": "thread/list",
+								"params": [
+									"limit": 50,
+									"sortKey": "recency_at",
+									"sortDirection": "desc",
+									"cwd": projectPaths,
+									"sourceKinds": ["cli", "vscode", "exec", "appServer", "unknown"],
+								],
+							])
+						case 2:
+							guard let result = message["result"] as? [String: Any] else {
+								finish(.failure(AgentHandoffError.launchFailed("Codex thread catalogue")))
+								continue
+							}
+							finish(.success(result))
+						default:
+							continue
+						}
+					}
+				}
+				process.terminationHandler = { completed in
+					let diagnostic = String(decoding: standardError.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+					guard completed.terminationStatus == 0 else {
+						finish(.failure(AgentHandoffError.launchFailed(
+							"Codex thread catalogue",
+							diagnostic: conciseProcessDiagnostic(diagnostic)
+						)))
+						return
+					}
+					finish(.failure(AgentHandoffError.launchFailed(
+						"Codex thread catalogue",
+						diagnostic: conciseProcessDiagnostic(diagnostic)
+					)))
+				}
+				do {
+					try process.run()
+					send([
+						"id": 1,
+						"method": "initialize",
+						"params": [
+							"clientInfo": ["name": "Octo", "version": "1.0.0"],
+							"capabilities": [:],
+						],
+					])
+				} catch {
+					finish(.failure(error))
+				}
+			}
+		}, onCancel: {
+			if process.isRunning { process.terminate() }
+		})
+	}
+}
+
 /// Settings uses this small surface to verify that Codex Desktop's read-only project
 /// catalogue is available from the home reported by the resolved Codex runtime.
 enum CodexProjectCatalogAccess {
@@ -614,9 +793,15 @@ private enum CodexHandoffCoordinator {
 		let eligibleProjects = projectCatalog.projects
 		guard !eligibleProjects.isEmpty else { throw AgentHandoffError.projectCatalogEmpty }
 		let allowedProjectPaths = Set(eligibleProjects.map(\.path))
+		// Thread discovery is deliberately best-effort. A Codex update that cannot
+		// enumerate its local history must not stop the existing new-task handoff flow.
+		let eligibleThreads = (try? await CodexThreadCatalog.list(
+			projects: eligibleProjects
+		)) ?? []
 		let packages = try await plan(
 			request,
 			projectCatalog: eligibleProjects,
+			threadCatalog: eligibleThreads,
 			journal: journal,
 			onSubmitted: { yield(.coordinatorSubmitted) }
 		)
@@ -661,6 +846,7 @@ private enum CodexHandoffCoordinator {
 	private static func plan(
 		_ request: AgentHandoffRequest,
 		projectCatalog: [CodexProjectCatalog.Project],
+		threadCatalog: [CodexThreadCatalog.Thread],
 		journal: AgentHandoffJournal,
 		onSubmitted: @escaping @Sendable () -> Void
 	) async throws -> [AgentHandoffPackage] {
@@ -680,7 +866,8 @@ private enum CodexHandoffCoordinator {
 			"--output-last-message", resultURL.path,
 			HandoffPrompt.codexPlannerRequest(
 				request,
-				projectCatalog: projectCatalog
+				projectCatalog: projectCatalog,
+				threadCatalog: threadCatalog
 			),
 		]
 		if let imageURL {
@@ -715,7 +902,8 @@ private enum CodexHandoffCoordinator {
 		}
 		return try AgentHandoffManifest.decode(
 			output,
-			allowedProjectPaths: Set(projectCatalog.map(\.path))
+			allowedProjectPaths: Set(projectCatalog.map(\.path)),
+			threadCatalog: threadCatalog
 		).packages
 	}
 
@@ -742,12 +930,13 @@ private enum CodexHandoffCoordinator {
 	}
 }
 
-private struct AgentHandoffManifest: Codable, Sendable {
+struct AgentHandoffManifest: Codable, Sendable {
 	let packages: [AgentHandoffPackage]
 
 	static func decode(
 		_ output: String,
-		allowedProjectPaths: Set<String>
+		allowedProjectPaths: Set<String>,
+		threadCatalog: [CodexThreadCatalog.Thread] = []
 	) throws -> AgentHandoffManifest {
 		let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
 		let json = trimmed
@@ -765,11 +954,15 @@ private struct AgentHandoffManifest: Codable, Sendable {
 		}
 		guard !manifest.packages.isEmpty,
 			manifest.packages.allSatisfy({
-				!$0.title.isEmpty && !$0.objective.isEmpty
+				let package = $0
+				return !package.title.isEmpty && !package.objective.isEmpty
 					&& CodexHandoffCoordinator.validatedProjectRoot(
-						at: $0.projectPath,
+						at: package.projectPath,
 						allowedProjectPaths: allowedProjectPaths
 					) != nil
+					&& (package.existingThreadID == nil || threadCatalog.contains { candidate in
+						candidate.id == package.existingThreadID && candidate.projectPath == package.projectPath
+					})
 			})
 		else {
 			throw AgentHandoffError.launchFailed(
@@ -781,28 +974,33 @@ private struct AgentHandoffManifest: Codable, Sendable {
 	}
 }
 
-private struct AgentHandoffPackage: Codable, Equatable, Identifiable, Sendable {
+struct AgentHandoffPackage: Codable, Equatable, Identifiable, Sendable {
 	var id: UUID = UUID()
 	let title: String
 	let objective: String
 	let context: String
 	let projectPath: String?
+	/// A coordinator-selected thread from the catalogue supplied by Octo. Nil
+	/// preserves the ordinary create-a-new-task behavior.
+	let existingThreadID: String?
 
 	init(
 		id: UUID = UUID(),
 		title: String,
 		objective: String,
 		context: String = "",
-		projectPath: String? = nil
+		projectPath: String? = nil,
+		existingThreadID: String? = nil
 	) {
 		self.id = id
 		self.title = title.trimmingCharacters(in: .whitespacesAndNewlines)
 		self.objective = objective.trimmingCharacters(in: .whitespacesAndNewlines)
 		self.context = context.trimmingCharacters(in: .whitespacesAndNewlines)
 		self.projectPath = projectPath?.trimmingCharacters(in: .whitespacesAndNewlines)
+		self.existingThreadID = existingThreadID?.trimmingCharacters(in: .whitespacesAndNewlines)
 	}
 
-	private enum CodingKeys: String, CodingKey { case title, objective, context, projectPath }
+	private enum CodingKeys: String, CodingKey { case title, objective, context, projectPath, existingThreadID }
 }
 
 private enum AgentHandoffPackageState: String, Codable, Sendable {
@@ -837,6 +1035,7 @@ private struct StoredAgentHandoffPackage: Codable, Identifiable, Sendable {
 	/// The actual local project selected for this handoff. Optional preserves
 	/// compatibility with handoffs written before project-bound threads existed.
 	var projectPath: String?
+	var existingThreadID: String?
 	var threadID: String?
 	var state: AgentHandoffPackageState
 	var failure: String?
@@ -850,11 +1049,19 @@ private struct StoredAgentHandoffPackage: Codable, Identifiable, Sendable {
 		objective = package.objective
 		context = package.context
 		projectPath = package.projectPath
+		existingThreadID = package.existingThreadID
 		state = .pending
 	}
 
 	var package: AgentHandoffPackage {
-		.init(id: id, title: title, objective: objective, context: context, projectPath: projectPath)
+		.init(
+			id: id,
+			title: title,
+			objective: objective,
+			context: context,
+			projectPath: projectPath,
+			existingThreadID: existingThreadID
+		)
 	}
 }
 
@@ -1176,12 +1383,13 @@ private final class AgentHandoffJournal: @unchecked Sendable {
 					"items": [
 						"type": "object",
 						"additionalProperties": false,
-						"required": ["title", "objective", "context", "projectPath"],
+						"required": ["title", "objective", "context", "projectPath", "existingThreadID"],
 						"properties": [
 							"title": ["type": "string"],
 							"objective": ["type": "string"],
 							"context": ["type": "string"],
 							"projectPath": ["type": "string"],
+							"existingThreadID": ["type": ["string", "null"]],
 						],
 					],
 				],
@@ -1454,6 +1662,14 @@ private enum CodexChildRunner {
 				}
 
 				@Sendable func startThread() {
+					if let existingThreadID = package.existingThreadID {
+						send([
+							"id": 2,
+							"method": "thread/resume",
+							"params": ["threadId": existingThreadID],
+						])
+						return
+					}
 					var params: [String: Any] = [
 						"cwd": project.path,
 						"runtimeWorkspaceRoots": [project.path],
@@ -1828,16 +2044,25 @@ enum HandoffPrompt {
 
 	static func codexPlannerRequest(
 		_ request: AgentHandoffRequest,
-		projectCatalog: [CodexProjectCatalog.Project]
+		projectCatalog: [CodexProjectCatalog.Project],
+		threadCatalog: [CodexThreadCatalog.Thread] = []
 	) -> String {
 		let encodedCatalog = (try? JSONEncoder().encode(projectCatalog))
 			.flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
+		let encodedThreads = (try? JSONEncoder().encode(threadCatalog))
+			.flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
 		return """
-		You are an ephemeral Agent Handoff planner. First use the current Codex project catalogue below to select the relevant existing project for each bounded work package. Then split the user's request into independently executable, bounded work packages. Do not inspect or choose tools, skills, plugins, or MCP servers. Do not execute package work and do not create tasks. Return only JSON matching the supplied schema. Each package needs a short title, an objective that can be completed by one agent, only the user context required for that objective, and the exact absolute projectPath from one catalogue entry. Never invent a path or select another directory. The full handoff input below, including any attached screenshot, is the same user context that each child task will receive.
+		You are an ephemeral Agent Handoff planner. First use the current Codex project catalogue below to select the relevant existing project for each bounded work package. Then split the user's request into independently executable, bounded work packages. Do not inspect or choose tools, skills, plugins, or MCP servers. Do not execute package work and do not create tasks. Return only JSON matching the supplied schema. Each package needs a short title, an objective that can be completed by one agent, only the user context required for that objective, and the exact absolute projectPath from one catalogue entry. Never invent a path or select another directory.
+
+		The supplied Codex thread catalogue contains only inactive threads safe to resume. Decide whether the user explicitly asks to continue a specific existing task. Only then set that package's existingThreadID to the exact matching catalogue ID, and keep its projectPath equal to the selected thread's projectPath. Otherwise set existingThreadID to null and create a new task. Never infer a target thread from a vague similarity, and never invent an ID. The full handoff input below, including any attached screenshot, is the same user context that each child task will receive.
 
 		<codex_project_catalog>
 		\(encodedCatalog)
 		</codex_project_catalog>
+
+		<codex_thread_catalog>
+		\(encodedThreads)
+		</codex_thread_catalog>
 
 		\(workPackagePlanningGuidance)
 

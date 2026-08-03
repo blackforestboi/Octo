@@ -687,10 +687,10 @@
 		};
 		47E16A602EC6C9D300885CF7 /* XCRemoteSwiftPackageReference "FluidAudio" */ = {
 			isa = XCRemoteSwiftPackageReference;
-			repositoryURL = "https://github.com/FluidInference/FluidAudio";
+			repositoryURL = "https://github.com/blackforestboi/FluidAudio";
 			requirement = {
-				kind = exactVersion;
-				version = 0.15.5;
+				kind = revision;
+				revision = 5fe6950cd14f1de30a8e7f8add9bbf211b4cd2f4;
 			};
 		};
 		4F0D6A062F1A000100000001 /* XCRemoteSwiftPackageReference "swift-sharing" */ = {

@@ -141,8 +141,8 @@ final class SpeakerIdentificationTests: XCTestCase {
 			]
 		)
 		let laterDiarization = SpeakerDiarizationOutput(segments: [
-			.init(speakerID: "new-first", embedding: [0.99, 0.01], startTime: 0, endTime: 0.8, qualityScore: 1),
-			.init(speakerID: "new-second", embedding: [0.01, 0.99], startTime: 1, endTime: 1.8, qualityScore: 1),
+			.init(speakerID: "new-first", embedding: [], startTime: 0, endTime: 0.8, qualityScore: 1, profileID: library.profiles[0].id),
+			.init(speakerID: "new-second", embedding: [], startTime: 1, endTime: 1.8, qualityScore: 1, profileID: library.profiles[1].id),
 		])
 
 		let laterAttribution = SpeakerIdentification.attribute(
@@ -172,6 +172,7 @@ final class SpeakerIdentificationTests: XCTestCase {
 	}
 
 	func testKnownVoiceLabelsFutureRecordingWithoutAnIntroduction() {
+		let savedProfileID = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
 		let output = TranscriptionOutput(
 			text: "Thanks for joining.",
 			words: [
@@ -181,10 +182,10 @@ final class SpeakerIdentificationTests: XCTestCase {
 			]
 		)
 		let diarization = SpeakerDiarizationOutput(segments: [
-			.init(speakerID: "speaker-7", embedding: [0.99, 0.01], startTime: 0, endTime: 1, qualityScore: 1),
+			.init(speakerID: "speaker-7", embedding: [], startTime: 0, endTime: 1, qualityScore: 1, profileID: savedProfileID),
 		])
 		var library = SpeakerVoiceLibrary(profiles: [
-			.init(id: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!, name: "Natty", embedding: [1, 0], createdAt: .distantPast, lastSeenAt: .distantPast),
+			.init(id: savedProfileID, name: "Natty", embedding: [1, 0], createdAt: .distantPast, lastSeenAt: .distantPast),
 		])
 
 		let attributed = SpeakerIdentification.attribute(
@@ -195,11 +196,12 @@ final class SpeakerIdentificationTests: XCTestCase {
 		)
 
 		XCTAssertEqual(attributed?.segments.map(\.speakerName), ["Natty"])
-		XCTAssertEqual(library.profiles[0].lastSeenAt, Date(timeIntervalSince1970: 2))
+		XCTAssertEqual(library.profiles[0].lastSeenAt, .distantPast)
+		XCTAssertEqual(library.profiles[0].embedding, [1, 0])
 		XCTAssertEqual(attributed?.segments.first?.profileID, library.profiles[0].id)
 	}
 
-	func testModerateVoiceSimilarityMatchesAStoredProfile() {
+	func testPostHocEmbeddingSimilarityDoesNotMatchAStoredProfile() {
 		let output = TranscriptionOutput(
 			text: "Thanks for joining.",
 			words: [
@@ -222,7 +224,145 @@ final class SpeakerIdentificationTests: XCTestCase {
 			now: .now
 		)
 
-		XCTAssertEqual(attributed?.segments.map(\.speakerName), ["Natty"])
+		XCTAssertEqual(attributed?.segments.map(\.speakerName), ["Unknown Speaker 1"])
+		XCTAssertEqual(library.profiles.count, 2)
+	}
+
+	func testOnlyTheEnrolledDiarizerSlotReceivesTheSavedProfile() {
+		let output = TranscriptionOutput(
+			text: "First voice. Second voice.",
+			words: [
+				.init(word: "First", startTime: 0, endTime: 0.3),
+				.init(word: "voice.", startTime: 0.3, endTime: 0.8),
+				.init(word: "Second", startTime: 1, endTime: 1.3),
+				.init(word: "voice.", startTime: 1.3, endTime: 1.8),
+			]
+		)
+		let savedProfileID = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
+		let diarization = SpeakerDiarizationOutput(segments: [
+			.init(speakerID: "closest", embedding: [], startTime: 0, endTime: 0.8, qualityScore: 1, profileID: savedProfileID),
+			.init(speakerID: "unassigned", embedding: [0.8, 0.6], startTime: 1, endTime: 1.8, qualityScore: 1),
+		])
+		var library = SpeakerVoiceLibrary(profiles: [
+			.init(id: savedProfileID, name: "Oliver", embedding: [1, 0]),
+		])
+
+		let attributed = SpeakerIdentification.attribute(
+			transcription: output,
+			diarization: diarization,
+			library: &library,
+			now: Date(timeIntervalSince1970: 2)
+		)
+
+		XCTAssertEqual(attributed?.segments.map(\.speakerName), ["Oliver", "Unknown Speaker 2"])
+		XCTAssertEqual(attributed?.segments.first?.profileID, savedProfileID)
+		XCTAssertEqual(library.profiles.count, 2)
+		XCTAssertEqual(library.profiles[0].embedding, [1, 0])
+	}
+
+	func testUnenrolledEmbeddingNeverMatchesTheOnlySavedProfile() {
+		let output = TranscriptionOutput(
+			text: "Different voice.",
+			words: [.init(word: "Different voice.", startTime: 0, endTime: 1)]
+		)
+		let diarization = SpeakerDiarizationOutput(segments: [
+			.init(speakerID: "different", embedding: [0, 1], startTime: 0, endTime: 1, qualityScore: 1),
+		])
+		let savedProfileID = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
+		var library = SpeakerVoiceLibrary(profiles: [
+			.init(id: savedProfileID, name: "Oliver", embedding: [1, 0]),
+		])
+
+		let attributed = SpeakerIdentification.attribute(
+			transcription: output,
+			diarization: diarization,
+			library: &library,
+			now: .now
+		)
+
+		XCTAssertEqual(attributed?.segments.map(\.speakerName), ["Unknown Speaker 1"])
+		XCTAssertNotEqual(attributed?.segments.first?.profileID, savedProfileID)
+		XCTAssertEqual(library.profiles.count, 2)
+		XCTAssertEqual(library.profiles[0].embedding, [1, 0])
+	}
+
+	func testPostHocEmbeddingCannotCrossAnyLegacySimilarityThreshold() {
+		let output = TranscriptionOutput(
+			text: "Borderline voice.",
+			words: [.init(word: "Borderline voice.", startTime: 0, endTime: 1)]
+		)
+		let diarization = SpeakerDiarizationOutput(segments: [
+			.init(speakerID: "borderline", embedding: [0.7674, 0.6412], startTime: 0, endTime: 1, qualityScore: 1),
+		])
+		let savedProfileID = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
+		var library = SpeakerVoiceLibrary(profiles: [
+			.init(id: savedProfileID, name: "Oliver", embedding: [1, 0]),
+		])
+
+		let attributed = SpeakerIdentification.attribute(
+			transcription: output,
+			diarization: diarization,
+			library: &library,
+			now: .now
+		)
+
+		XCTAssertEqual(attributed?.segments.map(\.speakerName), ["Unknown Speaker 1"])
+		XCTAssertNotEqual(attributed?.segments.first?.profileID, savedProfileID)
+		XCTAssertEqual(library.profiles.count, 2)
+		XCTAssertEqual(library.profiles[0].embedding, [1, 0])
+	}
+
+	func testSystemAudioDoesNotReuseAProfileWithoutDiarizerEnrollment() {
+		let output = TranscriptionOutput(
+			text: "System voice.",
+			words: [.init(word: "System voice.", startTime: 0, endTime: 1)]
+		)
+		let diarization = SpeakerDiarizationOutput(segments: [
+			.init(speakerID: "system", embedding: [0.8, 0.6], startTime: 0, endTime: 1, qualityScore: 1),
+		])
+		let savedProfileID = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
+		var library = SpeakerVoiceLibrary(profiles: [
+			.init(id: savedProfileID, name: "Oliver", embedding: [1, 0]),
+		])
+
+		let attributed = SpeakerIdentification.attribute(
+			transcription: output,
+			diarization: diarization,
+			library: &library,
+			now: .now,
+			audioSource: .systemAudio
+		)
+
+		XCTAssertEqual(attributed?.segments.map(\.speakerName), ["Unknown Speaker 1"])
+		XCTAssertNotEqual(attributed?.segments.first?.profileID, savedProfileID)
+		XCTAssertEqual(library.profiles[0].embedding, [1, 0])
+	}
+
+	func testSystemAudioCanUseAProfileExplicitlyAssignedByEnrollment() {
+		let output = TranscriptionOutput(
+			text: "Recorded Oliver voice.",
+			words: [.init(word: "Recorded Oliver voice.", startTime: 0, endTime: 1)]
+		)
+		let savedProfileID = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
+		let diarization = SpeakerDiarizationOutput(segments: [
+			.init(speakerID: "recording", embedding: [], startTime: 0, endTime: 1, qualityScore: 1, profileID: savedProfileID),
+		])
+		var library = SpeakerVoiceLibrary(profiles: [
+			.init(id: savedProfileID, name: "Oliver", embedding: [1, 0]),
+		])
+
+		let attributed = SpeakerIdentification.attribute(
+			transcription: output,
+			diarization: diarization,
+			library: &library,
+			now: .now,
+			audioSource: .systemAudio
+		)
+
+		XCTAssertEqual(attributed?.segments.map(\.speakerName), ["Oliver"])
+		XCTAssertEqual(attributed?.segments.first?.profileID, savedProfileID)
+		XCTAssertEqual(library.profiles.count, 1)
+		XCTAssertEqual(library.profiles[0].embedding, [1, 0])
 	}
 
 	func testMatchedTurnsCarryProfileIDForAudioSamples() {
@@ -274,7 +414,7 @@ final class SpeakerIdentificationTests: XCTestCase {
 		XCTAssertEqual(Set(nattyProfileIDs ?? []), Set([library.profiles[0].id]))
 	}
 
-	func testExistingVoiceMatchWinsOverAnIntroduction() {
+	func testEnrolledVoiceWinsOverAnIntroductionWithoutUpdatingProfile() {
 		let output = TranscriptionOutput(
 			text: "My name is Natty.",
 			words: [
@@ -284,11 +424,12 @@ final class SpeakerIdentificationTests: XCTestCase {
 				.init(word: "Natty.", startTime: 0.6, endTime: 0.8),
 			]
 		)
+		let savedProfileID = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
 		let diarization = SpeakerDiarizationOutput(segments: [
-			.init(speakerID: "speaker-0", embedding: [1, 0], startTime: 0, endTime: 1, qualityScore: 1),
+			.init(speakerID: "speaker-0", embedding: [], startTime: 0, endTime: 1, qualityScore: 1, profileID: savedProfileID),
 		])
 		var library = SpeakerVoiceLibrary(profiles: [
-			.init(name: "Richard", embedding: [1, 0]),
+			.init(id: savedProfileID, name: "Richard", embedding: [1, 0]),
 		])
 
 		let attributed = SpeakerIdentification.attribute(

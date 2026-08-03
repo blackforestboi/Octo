@@ -583,36 +583,129 @@ private struct AudioWaveformView: View {
 	let audioURL: URL
 	let progress: TimeInterval
 	let duration: TimeInterval
+	let startOffset: TimeInterval
+	let trackDuration: TimeInterval
 	let onSeek: (TimeInterval) -> Void
+	let showsSeekControl: Bool
 	@State private var samples: [CGFloat] = []
+
+	init(
+		audioURL: URL,
+		progress: TimeInterval,
+		duration: TimeInterval,
+		startOffset: TimeInterval = 0,
+		trackDuration: TimeInterval? = nil,
+		showsSeekControl: Bool = true,
+		onSeek: @escaping (TimeInterval) -> Void
+	) {
+		self.audioURL = audioURL
+		self.progress = progress
+		self.duration = duration
+		self.startOffset = startOffset
+		self.trackDuration = trackDuration ?? duration
+		self.showsSeekControl = showsSeekControl
+		self.onSeek = onSeek
+	}
 
 	var body: some View {
 		VStack(spacing: 4) {
 			Canvas { context, size in
 				let bars = samples.isEmpty ? Array(repeating: CGFloat(0.22), count: 48) : samples
-				let spacing: CGFloat = 2
-				let width = max(1, (size.width - spacing * CGFloat(bars.count - 1)) / CGFloat(bars.count))
-				let completed = duration > 0 ? progress / duration : 0
+				let channelDuration = min(max(0.01, trackDuration), max(0.01, duration - startOffset))
+				let channelStart = min(1, max(0, startOffset / max(0.01, duration)))
+				let channelWidth = min(1 - channelStart, channelDuration / max(0.01, duration))
+				let availableWidth = max(0.01, size.width * channelWidth)
+				let spacing = min(CGFloat(2), availableWidth / CGFloat(max(1, bars.count - 1)) / 2)
+				let barWidth = max(0.01, (availableWidth - spacing * CGFloat(bars.count - 1)) / CGFloat(bars.count))
 				for (index, sample) in bars.enumerated() {
 					let height = max(3, size.height * sample)
-					let x = CGFloat(index) * (width + spacing)
-					let rect = CGRect(x: x, y: (size.height - height) / 2, width: width, height: height)
-					let color: Color = CGFloat(index) / CGFloat(bars.count) <= completed ? .accentColor : .secondary.opacity(0.28)
-					context.fill(Path(roundedRect: rect, cornerRadius: width / 2), with: .color(color))
+					let x = size.width * channelStart + CGFloat(index) * (barWidth + spacing)
+					let rect = CGRect(x: x, y: (size.height - height) / 2, width: barWidth, height: height)
+					let sampleTime = startOffset + channelDuration * Double(index) / Double(max(1, bars.count - 1))
+					let color: Color = sampleTime <= progress ? .accentColor : .secondary.opacity(0.28)
+					context.fill(Path(roundedRect: rect, cornerRadius: barWidth / 2), with: .color(color))
 				}
 			}
 			.frame(height: 34)
 
-			Slider(
-				value: Binding(get: { min(progress, max(0.01, duration)) }, set: onSeek),
-				in: 0...max(0.01, duration)
-			)
-			.controlSize(.small)
+			if showsSeekControl {
+				AudioSeekBar(value: progress, duration: duration, onSeek: onSeek)
+			}
 		}
 		.task(id: audioURL) {
 			samples = await Task.detached(priority: .utility) {
 				AudioWaveformSamples.load(from: audioURL)
 			}.value
+		}
+	}
+}
+
+/// A SwiftUI-only playback scrubber. The native macOS `Slider` can recursively
+/// re-enter AppKit sizing when many history rows are mounted, freezing the app.
+private struct AudioSeekBar: View {
+	let value: TimeInterval
+	let duration: TimeInterval
+	let onSeek: (TimeInterval) -> Void
+
+	private var safeDuration: TimeInterval {
+		duration.isFinite ? max(0.01, duration) : 0.01
+	}
+
+	private var safeValue: TimeInterval {
+		guard value.isFinite else { return 0 }
+		return min(max(0, value), safeDuration)
+	}
+
+	private var fraction: CGFloat {
+		CGFloat(safeValue / safeDuration)
+	}
+
+	var body: some View {
+		GeometryReader { geometry in
+			let thumbDiameter: CGFloat = 12
+			let trackWidth = max(1, geometry.size.width - thumbDiameter)
+
+			ZStack(alignment: .leading) {
+				Capsule()
+					.fill(.secondary.opacity(0.28))
+					.frame(height: 4)
+					.padding(.horizontal, thumbDiameter / 2)
+
+				Capsule()
+					.fill(Color.accentColor)
+					.frame(width: max(0.5, trackWidth * fraction), height: 4)
+					.offset(x: thumbDiameter / 2)
+
+				Circle()
+					.fill(Color.accentColor)
+					.frame(width: thumbDiameter, height: thumbDiameter)
+					.offset(x: trackWidth * fraction)
+			}
+			.frame(maxHeight: .infinity)
+			.contentShape(Rectangle())
+			.gesture(
+				DragGesture(minimumDistance: 0)
+					.onChanged { gesture in
+						let proposedFraction = (gesture.location.x - thumbDiameter / 2) / trackWidth
+						let clampedFraction = min(max(0, proposedFraction), 1)
+						onSeek(safeDuration * TimeInterval(clampedFraction))
+					}
+			)
+		}
+		.frame(height: 16)
+		.accessibilityElement()
+		.accessibilityLabel("Playback position")
+		.accessibilityValue("\(Int((safeValue / safeDuration) * 100)) percent")
+		.accessibilityAdjustableAction { direction in
+			let step = max(1, safeDuration / 20)
+			switch direction {
+			case .increment:
+				onSeek(min(safeDuration, safeValue + step))
+			case .decrement:
+				onSeek(max(0, safeValue - step))
+			@unknown default:
+				break
+			}
 		}
 	}
 }
@@ -669,13 +762,40 @@ private struct RunHistoryItemView: View {
 		if let screenshotByteCount = transcript.screenshotByteCount { return screenshotByteCount }
 		return try? transcript.screenshotPath?.resourceValues(forKeys: [.fileSizeKey]).fileSize
 	}
+	private var audioChannels: [TranscriptAudioChannel] {
+		let channels = transcript.audioChannels ?? []
+		guard channels.count > 1 else { return [] }
+		return channels.sorted { $0.source == .microphone && $1.source != .microphone }
+	}
 
 	var body: some View {
 		VStack(alignment: .leading, spacing: 0) {
 			section("Audio", systemImage: "waveform") {
 				let audioProgress = isPlaying || isPlaybackPaused ? playbackProgress : 0
 				let audioDuration = isPlaying || isPlaybackPaused ? playbackDuration : transcript.duration
-				AudioWaveformView(audioURL: transcript.audioPath, progress: audioProgress, duration: audioDuration, onSeek: onSeek)
+				if audioChannels.isEmpty {
+					AudioWaveformView(audioURL: transcript.audioPath, progress: audioProgress, duration: audioDuration, onSeek: onSeek)
+				} else {
+					VStack(alignment: .leading, spacing: 7) {
+						ForEach(audioChannels) { channel in
+							VStack(alignment: .leading, spacing: 3) {
+								Label(channel.source.displayName, systemImage: channel.source == .microphone ? "mic.fill" : "speaker.wave.2.fill")
+									.font(.caption.weight(.medium))
+									.foregroundStyle(.secondary)
+								AudioWaveformView(
+									audioURL: channel.audioPath,
+									progress: audioProgress,
+									duration: audioDuration,
+									startOffset: channel.startOffset,
+									trackDuration: channel.duration,
+									showsSeekControl: false,
+									onSeek: onSeek
+								)
+							}
+						}
+						AudioSeekBar(value: audioProgress, duration: audioDuration, onSeek: onSeek)
+					}
+				}
 				HStack(spacing: 8) {
 					Button(action: onPlay) {
 						Image(systemName: isPlaying ? "pause.fill" : "play.fill")
