@@ -127,6 +127,17 @@ actor ParakeetClient {
     guard let asr else { throw NSError(domain: "Parakeet", code: -1, userInfo: [NSLocalizedDescriptionKey: "Parakeet not initialized"]) }
     let t0 = Date()
     logger.notice("Transcribing with Parakeet file=\(url.lastPathComponent)")
+
+    if currentVariant == .englishV2,
+      let endAligned = try await ParakeetV2LongFormTranscriber.transcribe(url, using: asr)
+    {
+      logger.notice(
+        "Parakeet v2 end-aligned transcription windows=\(endAligned.windowCount) mergeFallbacks=\(endAligned.fallbackMergeCount) audioDuration=\(String(format: "%.3f", endAligned.audioDuration))s finalTokenEnd=\(String(format: "%.3f", endAligned.finalTokenEnd ?? 0))s"
+      )
+      logger.info("Parakeet transcription finished in \(String(format: "%.2f", Date().timeIntervalSince(t0)))s")
+      return endAligned.output
+    }
+
     var decoderState = TdtDecoderState.make(decoderLayers: await asr.decoderLayerCount)
     let result = try await asr.transcribe(url, decoderState: &decoderState)
     logger.info("Parakeet transcription finished in \(String(format: "%.2f", Date().timeIntervalSince(t0)))s")
