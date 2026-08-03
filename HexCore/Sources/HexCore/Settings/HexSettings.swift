@@ -286,7 +286,7 @@ public struct HexSettings: Codable, Equatable, Sendable {
 		recordingAudioBehavior: RecordingAudioBehavior = .doNothing,
 		minimumKeyTime: Double = HexCoreConstants.defaultMinimumKeyTime,
 		stopDelayMilliseconds: Int = 0,
-		longRecordingConfirmationThresholdMinutes: Int = 5,
+		longRecordingConfirmationThresholdMinutes: Int = 1,
 		copyToClipboard: Bool = false,
 		superFastModeEnabled: Bool = true,
 		useDoubleTapOnly: Bool = true,

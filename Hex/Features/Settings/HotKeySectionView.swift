@@ -125,17 +125,18 @@ struct HotKeySectionView: View {
             }
 
 			LabeledContent {
-				Stepper(
+				TextField(
+					"",
 					value: Binding(
 						get: { store.hexSettings.longRecordingConfirmationThresholdMinutes },
 						set: { store.send(.setLongRecordingConfirmationThresholdMinutes($0)) }
 					),
-					in: 1 ... 60
-				) {
-					Text("\(store.hexSettings.longRecordingConfirmationThresholdMinutes) min")
-						.monospacedDigit()
-				}
+					format: .number
+				)
 				.labelsHidden()
+				.accessibilityLabel("Long recording confirmation threshold in minutes")
+				.frame(width: 64)
+				.multilineTextAlignment(.trailing)
 			} label: {
 				Label {
 					VStack(alignment: .leading, spacing: 2) {
