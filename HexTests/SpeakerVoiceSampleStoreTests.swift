@@ -48,6 +48,14 @@ final class SpeakerVoiceSampleStoreTests: XCTestCase {
 		))
 	}
 
+	func testSampleRangeRejectsTurnTooShortForCleanEnrollment() {
+		XCTAssertNil(SpeakerVoiceSampleStore.sampleRange(
+			sourceDuration: 5,
+			startTime: 2,
+			endTime: 2.5
+		))
+	}
+
 	func testLegacySamplesDecodeWithoutExtractionVersion() throws {
 		let sample = SpeakerVoiceSample(
 			audioURL: URL(fileURLWithPath: "/tmp/voice.m4a"),

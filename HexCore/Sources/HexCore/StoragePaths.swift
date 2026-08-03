@@ -3,9 +3,9 @@ import Foundation
 public extension URL {
 	/// The Application Support root used by this installation.
 	///
-	/// Existing installations keep using their former sandbox container so an update that removes
-	/// App Sandbox does not make settings, history, recordings, or downloaded models disappear.
-	/// Fresh installations use the standard unsandboxed Application Support directory.
+	/// Existing sandbox-only installations keep using their former container so an update that
+	/// removes App Sandbox does not make data disappear. Once the standard unsandboxed directory
+	/// contains production data, it remains authoritative even if the old container still exists.
 	static var hexApplicationSupportRoot: URL {
 		get throws {
 			let fm = FileManager.default
@@ -15,6 +15,24 @@ public extension URL {
 				appropriateFor: nil,
 				create: true
 			)
+			let standardDataDirectory = standardRoot
+				.appendingPathComponent("io.github.blackforestboi.Octo", isDirectory: true)
+			let standardDataFiles = [
+				"hex_settings.json",
+				"transcription_history.json",
+				"speaker_voice_library.json",
+			]
+			let standardInstallationHasData = standardDataFiles.contains { fileName in
+				let fileURL = standardDataDirectory.appendingPathComponent(fileName)
+				guard let values = try? fileURL.resourceValues(forKeys: [.fileSizeKey]) else { return false }
+				return (values.fileSize ?? 0) > 0
+			}
+
+			// Once an unsandboxed installation has written real production data, it is
+			// authoritative even if an older sandbox container still exists on disk.
+			if standardInstallationHasData {
+				return standardRoot
+			}
 
 			if let bundleIdentifier = Bundle.main.bundleIdentifier {
 				let legacySandboxRoot = fm.homeDirectoryForCurrentUser

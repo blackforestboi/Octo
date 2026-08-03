@@ -7,6 +7,29 @@ import XCTest
 
 @MainActor
 final class AppFeatureTests: XCTestCase {
+	func testModelReadinessCompletionOpensTheRecordingGate() async {
+		var state = AppFeature.State()
+		state.$hexSettings.withLock { $0.selectedModel = ParakeetModel.englishV2.identifier }
+		state.$modelBootstrapState.withLock {
+			$0.modelIdentifier = ParakeetModel.englishV2.identifier
+			$0.isModelReady = false
+			$0.preparationPhase = .activating
+		}
+		let store = TestStore(initialState: state) {
+			AppFeature()
+		}
+
+		await store.send(.modelStatusEvaluated(true)) {
+			$0.$modelBootstrapState.withLock {
+				$0.isModelReady = true
+				$0.preparationPhase = nil
+				$0.progress = 1
+				$0.lastError = nil
+			}
+		}
+		await store.finish()
+	}
+
 	func testSpeakersTabCanBeSelected() async {
 		let store = TestStore(initialState: AppFeature.State()) {
 			AppFeature()

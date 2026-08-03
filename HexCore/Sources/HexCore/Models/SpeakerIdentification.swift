@@ -1,5 +1,7 @@
 import Foundation
 
+private let speakerIdentificationLogger = HexLog.transcription
+
 /// The engine that turns an audio recording into anonymous, timed speaker turns.
 ///
 /// Keep this separate from the transcription model: an ASR provider can supply
@@ -151,26 +153,31 @@ public struct TranscriptionOutput: Codable, Equatable, Sendable {
 	}
 }
 
-/// A contiguous portion of audio associated with one anonymous diarization cluster.
+/// A contiguous portion of audio associated with one diarizer speaker track.
 public struct SpeakerDiarizationSegment: Codable, Equatable, Sendable {
 	public var speakerID: String
 	public var embedding: [Float]
 	public var startTime: TimeInterval
 	public var endTime: TimeInterval
 	public var qualityScore: Float
+	/// A saved profile enrolled directly into the diarizer for this speaker slot.
+	/// This is stronger evidence than comparing post-hoc cluster centroids.
+	public var profileID: UUID?
 
 	public init(
 		speakerID: String,
 		embedding: [Float],
 		startTime: TimeInterval,
 		endTime: TimeInterval,
-		qualityScore: Float
+		qualityScore: Float,
+		profileID: UUID? = nil
 	) {
 		self.speakerID = speakerID
 		self.embedding = embedding
 		self.startTime = startTime
 		self.endTime = endTime
 		self.qualityScore = qualityScore
+		self.profileID = profileID
 	}
 }
 
@@ -306,20 +313,6 @@ public struct SpeakerIntroductionContext: Equatable, Sendable {
 	}
 }
 
-/// A likely existing voice-profile match ranked by the diarizer's embedding space.
-/// These are candidates for audio-based verification, not labels on their own.
-public struct SpeakerVoiceMatchCandidate: Equatable, Sendable {
-	public var speakerID: String
-	public var profileID: UUID
-	public var similarity: Float
-
-	public init(speakerID: String, profileID: UUID, similarity: Float) {
-		self.speakerID = speakerID
-		self.profileID = profileID
-		self.similarity = similarity
-	}
-}
-
 /// A speaker-labelled transcript turn retained with History and used for rendering.
 public struct SpeakerAttributedSegment: Codable, Equatable, Sendable, Identifiable {
 	public var id: UUID
@@ -367,10 +360,6 @@ public struct SpeakerAttributedTranscript: Codable, Equatable, Sendable {
 
 /// Pure, provider-independent speaker recognition and transcript attribution.
 public enum SpeakerIdentification {
-	/// A moderately conservative cosine-similarity threshold for reusing a saved
-	/// voice profile. Retained audio supplies an additional in-run verification step
-	/// whenever available, so this need not reject ordinary recording variation.
-	public static let defaultVoiceMatchThreshold: Float = 0.78
 	public static let selfIntroductionWindow: TimeInterval = 20
 	public static let maximumAudioSamples = 1
 
@@ -379,9 +368,8 @@ public enum SpeakerIdentification {
 		diarization: SpeakerDiarizationOutput,
 		library: inout SpeakerVoiceLibrary,
 		now: Date,
-		matchThreshold: Float = defaultVoiceMatchThreshold,
 		introductions: [SpeakerIntroduction] = [],
-		verifiedProfileIDs: [String: UUID] = [:]
+		audioSource: TranscriptAudioSource? = nil
 	) -> SpeakerAttributedTranscript? {
 		guard !transcription.words.isEmpty, !diarization.segments.isEmpty else { return nil }
 
@@ -405,28 +393,41 @@ public enum SpeakerIdentification {
 			introductions.map { ($0.speakerID, $0.name) },
 			uniquingKeysWith: { first, _ in first }
 		)
-		for (index, speakerID) in orderedSpeakerIDs.enumerated() {
+		let embeddingsBySpeaker = Dictionary(uniqueKeysWithValues: orderedSpeakerIDs.map { speakerID in
 			let speakerSegments = diarization.segments.filter { $0.speakerID == speakerID }
-			let embedding = averageEmbedding(from: speakerSegments.map(\.embedding))
+			return (speakerID, averageEmbedding(from: speakerSegments.map(\.embedding)))
+		})
+		let savedProfiles = library
+		let enrolledProfileIDs: [String: UUID] = Dictionary(
+			uniqueKeysWithValues: orderedSpeakerIDs.compactMap { speakerID -> (String, UUID)? in
+			let profileIDs = Set(diarization.segments
+				.filter { $0.speakerID == speakerID }
+				.compactMap(\.profileID))
+			guard profileIDs.count == 1, let profileID = profileIDs.first else { return nil }
+			return (speakerID, profileID)
+			}
+		)
+		for (index, speakerID) in orderedSpeakerIDs.enumerated() {
+			let embedding = embeddingsBySpeaker[speakerID, default: []]
 
-			// A strong voice match always wins. Spoken introductions can provide the
-			// initial name, but must never rename an existing profile because transcription
-			// can easily turn ordinary speech into a plausible name.
-			if let profileID = verifiedProfileIDs[speakerID],
-				let profile = library.profiles.first(where: { $0.id == profileID })
+			// Known identities come only from immutable audio enrolled into the diarizer.
+			// Never merge profiles or mutate a saved fingerprint after its first capture.
+			if let profileID = enrolledProfileIDs[speakerID],
+				let profile = savedProfiles.profiles.first(where: { $0.id == profileID })
 			{
 				displayNames[speakerID] = profile.name
 				profileIDs[speakerID] = profile.id
-				markSeen(profileID: profile.id, in: &library, at: now, embedding: embedding)
-			} else if let profile = matchingProfile(for: embedding, in: library, threshold: matchThreshold) {
-				displayNames[speakerID] = profile.name
-				profileIDs[speakerID] = profile.id
-				markSeen(profileID: profile.id, in: &library, at: now, embedding: embedding)
+				speakerIdentificationLogger.notice(
+					"Speaker profile assigned source=\(audioSource?.rawValue ?? "unspecified", privacy: .public) speaker=\(speakerID, privacy: .public) profile=\(profile.id.uuidString, privacy: .public) method=sortformerEnrollment profileUpdated=false fingerprintUpdated=false"
+				)
 			} else {
 				let name = introducedNames[speakerID] ?? "Unknown Speaker \(index + 1)"
 				let profile = createProfile(named: name, embedding: embedding, library: &library, now: now)
 				displayNames[speakerID] = profile.name
 				profileIDs[speakerID] = profile.id
+				speakerIdentificationLogger.notice(
+					"Speaker profile created source=\(audioSource?.rawValue ?? "unspecified", privacy: .public) speaker=\(speakerID, privacy: .public) profile=\(profile.id.uuidString, privacy: .public) introduced=\(introducedNames[speakerID] != nil) embeddingDimensions=\(embedding.count)"
+				)
 			}
 		}
 
@@ -496,26 +497,6 @@ public enum SpeakerIdentification {
 		}
 	}
 
-	public static func rankedVoiceMatchCandidates(
-		diarization: SpeakerDiarizationOutput,
-		library: SpeakerVoiceLibrary,
-		maximumProfilesPerSpeaker: Int = 3
-	) -> [SpeakerVoiceMatchCandidate] {
-		guard maximumProfilesPerSpeaker > 0 else { return [] }
-		let profilesWithSamples = library.profiles.filter { !($0.audioSamples ?? []).isEmpty }
-		return Dictionary(grouping: diarization.segments, by: \.speakerID).flatMap { speakerID, segments in
-			let embedding = averageEmbedding(from: segments.map(\.embedding))
-			guard !embedding.isEmpty else { return [SpeakerVoiceMatchCandidate]() }
-			let ranked = profilesWithSamples.compactMap { profile -> SpeakerVoiceMatchCandidate? in
-				guard let similarity = cosineSimilarity(embedding, profile.embedding) else { return nil }
-				return .init(speakerID: speakerID, profileID: profile.id, similarity: similarity)
-			}
-			.sorted { $0.similarity > $1.similarity }
-			.prefix(maximumProfilesPerSpeaker)
-			return Array(ranked)
-		}
-	}
-
 	private static func speakerID(
 		for word: TimedTranscriptWord,
 		segments: [SpeakerDiarizationSegment]
@@ -546,32 +527,6 @@ public enum SpeakerIdentification {
 		return profile
 	}
 
-	private static func markSeen(
-		profileID: UUID,
-		in library: inout SpeakerVoiceLibrary,
-		at date: Date,
-		embedding: [Float]
-	) {
-		guard let index = library.profiles.firstIndex(where: { $0.id == profileID }) else { return }
-		library.profiles[index].embedding = averageEmbedding(from: [library.profiles[index].embedding, embedding])
-		library.profiles[index].lastSeenAt = date
-	}
-
-	private static func matchingProfile(
-		for embedding: [Float],
-		in library: SpeakerVoiceLibrary,
-		threshold: Float
-	) -> SpeakerVoiceProfile? {
-		library.profiles
-			.compactMap { profile -> (profile: SpeakerVoiceProfile, similarity: Float)? in
-				guard let similarity = cosineSimilarity(embedding, profile.embedding) else { return nil }
-				return (profile, similarity)
-			}
-			.filter { $0.similarity >= threshold }
-			.max { $0.similarity < $1.similarity }?
-			.profile
-	}
-
 	private static func averageEmbedding(from embeddings: [[Float]]) -> [Float] {
 		guard let first = embeddings.first, !first.isEmpty else { return [] }
 		let compatible = embeddings
@@ -587,20 +542,6 @@ public enum SpeakerIdentification {
 		}
 		guard average.allSatisfy(\.isFinite) else { return [] }
 		return average
-	}
-
-	private static func cosineSimilarity(_ lhs: [Float], _ rhs: [Float]) -> Float? {
-		guard lhs.count == rhs.count, !lhs.isEmpty else { return nil }
-		var dot: Float = 0
-		var lhsMagnitude: Float = 0
-		var rhsMagnitude: Float = 0
-		for index in lhs.indices {
-			dot += lhs[index] * rhs[index]
-			lhsMagnitude += lhs[index] * lhs[index]
-			rhsMagnitude += rhs[index] * rhs[index]
-		}
-		guard lhsMagnitude > 0, rhsMagnitude > 0 else { return nil }
-		return dot / (lhsMagnitude.squareRoot() * rhsMagnitude.squareRoot())
 	}
 
 	private static func renderedText(from words: [TimedTranscriptWord]) -> String {

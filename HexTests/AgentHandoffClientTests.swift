@@ -218,6 +218,104 @@ final class AgentHandoffClientTests: XCTestCase {
 		XCTAssertTrue(HandoffPrompt.claudeCoordinatorInstruction(token: "test").contains(guidance))
 	}
 
+	func testCodexThreadCatalogueExcludesActiveAndOutOfProjectThreads() {
+		let projects = [
+			CodexProjectCatalog.Project(id: "octo", name: "Octo", path: "/tmp")
+		]
+		let records = [
+			CodexThreadCatalog.AppServerThread(
+				id: "resume-me",
+				name: "Investigate hotkey",
+				preview: "Follow up on the delayed activation.",
+				cwd: "/tmp",
+				updatedAt: 10,
+				status: .init(type: "idle")
+			),
+			CodexThreadCatalog.AppServerThread(
+				id: "still-running",
+				name: "Active task",
+				preview: nil,
+				cwd: "/tmp",
+				updatedAt: 20,
+				status: .init(type: "active")
+			),
+			CodexThreadCatalog.AppServerThread(
+				id: "other-project",
+				name: "Elsewhere",
+				preview: nil,
+				cwd: "/usr",
+				updatedAt: 30,
+				status: .init(type: "idle")
+			),
+		]
+
+		XCTAssertEqual(
+			CodexThreadCatalog.eligibleThreads(from: records, projects: projects),
+			[.init(
+				id: "resume-me",
+				title: "Investigate hotkey",
+				preview: "Follow up on the delayed activation.",
+				projectPath: "/tmp",
+				updatedAt: 10
+			)]
+		)
+	}
+
+	func testCoordinatorCanSelectOnlyAThreadFromItsSuppliedCatalogue() throws {
+		let thread = CodexThreadCatalog.Thread(
+			id: "resume-me",
+			title: "Investigate hotkey",
+			preview: "Follow up on the delayed activation.",
+			projectPath: "/tmp",
+			updatedAt: 10
+		)
+		let validOutput = #"""
+		{"packages":[{"title":"Continue hotkey investigation","objective":"Investigate the reported delay.","context":"","projectPath":"/tmp","existingThreadID":"resume-me"}]}
+		""#
+		let invalidOutput = #"""
+		{"packages":[{"title":"Continue another task","objective":"Investigate the reported delay.","context":"","projectPath":"/tmp","existingThreadID":"invented"}]}
+		""#
+
+		let manifest = try AgentHandoffManifest.decode(
+			validOutput,
+			allowedProjectPaths: ["/tmp"],
+			threadCatalog: [thread]
+		)
+		XCTAssertEqual(manifest.packages.first?.existingThreadID, "resume-me")
+		XCTAssertThrowsError(try AgentHandoffManifest.decode(
+			invalidOutput,
+			allowedProjectPaths: ["/tmp"],
+			threadCatalog: [thread]
+		))
+	}
+
+	func testCodexPlannerReceivesThreadCatalogueAndConservativeResumeGuidance() {
+		let request = AgentHandoffRequest(
+			provider: .codex,
+			modelID: nil,
+			transcript: "Continue my hotkey task",
+			selectedText: nil,
+			screenContext: nil,
+			screenAwareInputSource: .localOCR
+		)
+		let plannerRequest = HandoffPrompt.codexPlannerRequest(
+			request,
+			projectCatalog: [.init(id: "octo", name: "Octo", path: "/tmp")],
+			threadCatalog: [.init(
+				id: "resume-me",
+				title: "Investigate hotkey",
+				preview: "Follow up on the delayed activation.",
+				projectPath: "/tmp",
+				updatedAt: 10
+			)]
+		)
+
+		XCTAssertTrue(plannerRequest.contains("<codex_thread_catalog>"))
+		XCTAssertTrue(plannerRequest.contains("resume-me"))
+		XCTAssertTrue(plannerRequest.contains("Only then set that package's existingThreadID"))
+		XCTAssertTrue(plannerRequest.contains("Never infer a target thread from a vague similarity"))
+	}
+
 	func testSourceContextExtractsProtocolAndBareURLsForChildResearch() {
 		let context = HandoffPrompt.sourceContext(
 			transcript: "Compare https://api.example.com/v1?limit=1, then check docs.example.org/guide.",

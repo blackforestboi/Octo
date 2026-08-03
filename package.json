@@ -8,6 +8,7 @@
   "scripts": {
     "release": "cd tools && bun run build",
     "release:local": "bash release/local-release.sh",
+    "install:local-release": "bash release/fast-install.sh",
     "changeset": "changeset",
     "changeset:add": "changeset",
     "changeset:add-ai": "bun run tools/scripts/add-changeset.ts",
