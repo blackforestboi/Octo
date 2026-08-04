@@ -77,6 +77,18 @@ final class AppFeatureTests: XCTestCase {
 		await store.finish()
 	}
 
+	func testSelectingNewSessionDoesNotStartRecording() async {
+		let store = TestStore(initialState: AppFeature.State()) {
+			AppFeature()
+		}
+
+		await store.send(.setActiveTab(.session)) {
+			$0.activeTab = .session
+		}
+		XCTAssertNil(store.state.transcription.recordingSession)
+		XCTAssertFalse(store.state.transcription.isRecording)
+	}
+
 	func testLeavingRecordingSessionKeepsItAvailableToResume() async {
 		let sessionID = UUID(uuidString: "00000000-0000-0000-0000-0000000000B1")!
 		var state = AppFeature.State()
@@ -97,6 +109,52 @@ final class AppFeatureTests: XCTestCase {
 		}
 		XCTAssertEqual(store.state.transcription.recordingSession?.id, sessionID)
 		XCTAssertEqual(store.state.transcription.recordingSession?.phase, .paused)
+	}
+
+	func testBackFromActiveRecordingSessionRequestsConfirmation() async {
+		var state = AppFeature.State()
+		state.activeTab = .session
+		state.transcription.recordingSession = .init(
+			id: UUID(),
+			title: "Session",
+			phase: .paused,
+			speakerIdentificationEnabled: false,
+			systemAudioEnabled: false
+		)
+		let store = TestStore(initialState: state) {
+			AppFeature()
+		}
+
+		await store.send(.requestEndRecordingSession) {
+			$0.isEndRecordingSessionConfirmationPresented = true
+		}
+		await store.send(.cancelEndRecordingSession) {
+			$0.isEndRecordingSessionConfirmationPresented = false
+		}
+	}
+
+	func testConfirmingBackEndsSessionAndReturnsToHistory() async {
+		var state = AppFeature.State()
+		state.activeTab = .session
+		state.isEndRecordingSessionConfirmationPresented = true
+		state.transcription.recordingSession = .init(
+			id: UUID(),
+			title: "Session",
+			phase: .paused,
+			speakerIdentificationEnabled: false,
+			systemAudioEnabled: false
+		)
+		let store = TestStore(initialState: state) {
+			AppFeature()
+		}
+
+		await store.send(.confirmEndRecordingSession) {
+			$0.isEndRecordingSessionConfirmationPresented = false
+			$0.activeTab = .history
+		}
+		await store.receive(\.transcription.stopRecordingSession) {
+			$0.transcription.recordingSession?.phase = .ended
+		}
 	}
 
 	func testSupportTabCanBeSelected() async {

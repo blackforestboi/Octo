@@ -31,6 +31,7 @@ struct SystemAudioCaptureClient {
 	var startCapture: @Sendable (_ parentRecordingSessionID: UUID) async -> SystemAudioCaptureStartResult = { _ in .failed }
 	var stopCapture: @Sendable () async -> SystemAudioCaptureStopResult = { .ignored(.noActiveCapture) }
 	var observeAudioLevel: @Sendable () async -> AsyncStream<Meter> = { AsyncStream { _ in } }
+	var observeAudioChunks: @Sendable () async -> AsyncStream<CapturedAudioChunk> = { AsyncStream { _ in } }
 	var recoverInterruptedRecordings: @Sendable () async -> [RecoveredSystemAudioRecording] = { [] }
 	var cleanup: @Sendable () async -> Void = {}
 }
@@ -42,6 +43,7 @@ extension SystemAudioCaptureClient: DependencyKey {
 			startCapture: { await live.startCapture(parentRecordingSessionID: $0) },
 			stopCapture: { await live.stopCapture() },
 			observeAudioLevel: { await live.observeAudioLevel() },
+			observeAudioChunks: { await live.observeAudioChunks() },
 			recoverInterruptedRecordings: { await live.recoverInterruptedRecordings() },
 			cleanup: { await live.cleanup() }
 		)
@@ -59,11 +61,24 @@ private final class SystemAudioCaptureWriter: NSObject, SCStreamOutput, @uncheck
 	private let lock = NSLock()
 	private let session: SystemAudioRecoverySession
 	private let meterContinuation: AsyncStream<Meter>.Continuation
+	private let audioChunkRelay: CapturedAudioChunkRelay
+	private let takeGeneration: UUID
+	private var nextChunkSequence = 0
+	private var nextSample: Int64 = 0
 	private var appendError: Swift.Error?
 
-	init(session: SystemAudioRecoverySession, meterContinuation: AsyncStream<Meter>.Continuation) {
+	init(
+		session: SystemAudioRecoverySession,
+		meterContinuation: AsyncStream<Meter>.Continuation,
+		audioChunkRelay: CapturedAudioChunkRelay,
+		takeGeneration: UUID,
+		startOffset: TimeInterval
+	) {
 		self.session = session
 		self.meterContinuation = meterContinuation
+		self.audioChunkRelay = audioChunkRelay
+		self.takeGeneration = takeGeneration
+		self.nextSample = Int64((max(0, startOffset) * 16_000).rounded(.down))
 	}
 
 	func stream(
@@ -80,6 +95,29 @@ private final class SystemAudioCaptureWriter: NSObject, SCStreamOutput, @uncheck
 			let (pcm, frameCount) = try Self.interleavedFloat32PCM(from: sampleBuffer)
 			meterContinuation.yield(Self.meter(for: pcm))
 			try session.appendInterleavedPCM(pcm, frameCount: frameCount)
+			let monoSamples = Self.mono16kSamples(from: pcm)
+			if !monoSamples.isEmpty {
+				let chunk = CapturedAudioChunk(
+					source: .systemAudio,
+					takeGeneration: takeGeneration,
+					sequence: nextChunkSequence,
+					startSample: nextSample,
+					samples: monoSamples
+				)
+				if audioChunkRelay.yield(chunk) {
+					audioChunkRelay.yield(.init(
+						source: .systemAudio,
+						takeGeneration: takeGeneration,
+						sequence: nextChunkSequence + 1,
+						startSample: nextSample + Int64(monoSamples.count),
+						samples: [],
+						discontinuityBefore: true
+					))
+					nextChunkSequence += 1
+				}
+				nextChunkSequence += 1
+				nextSample += Int64(monoSamples.count)
+			}
 		} catch {
 			appendError = error
 			systemAudioCaptureLogger.error("Failed to append system audio PCM: \(error.localizedDescription, privacy: .private)")
@@ -100,6 +138,24 @@ private final class SystemAudioCaptureWriter: NSObject, SCStreamOutput, @uncheck
 				averagePower: Double(sqrt(sumOfSquares / Float(samples.count))),
 				peakPower: Double(peak)
 			)
+		}
+	}
+
+	private static func mono16kSamples(from pcm: Data) -> [Float] {
+		pcm.withUnsafeBytes { rawBuffer in
+			let interleaved = rawBuffer.bindMemory(to: Float.self)
+			guard interleaved.count >= 6 else { return [] }
+			var result = [Float]()
+			result.reserveCapacity(interleaved.count / 6)
+			var index = 0
+			while index + 5 < interleaved.count {
+				let frame0 = (interleaved[index] + interleaved[index + 1]) * 0.5
+				let frame1 = (interleaved[index + 2] + interleaved[index + 3]) * 0.5
+				let frame2 = (interleaved[index + 4] + interleaved[index + 5]) * 0.5
+				result.append((frame0 + frame1 + frame2) / 3)
+				index += 6
+			}
+			return result
 		}
 	}
 
@@ -189,6 +245,7 @@ private actor SystemAudioCaptureClientLive {
 
 	private let recoveryStore = SystemAudioRecoveryStore()
 	private let (meterStream, meterContinuation) = AsyncStream<Meter>.makeStream()
+	private let audioChunkRelay = CapturedAudioChunkRelay()
 	private var pendingStartID: UUID?
 	private var capturePhase: CapturePhase?
 
@@ -246,12 +303,22 @@ private actor SystemAudioCaptureClientLive {
 			configuration.height = 2
 
 			let startedAt = Date()
+			let startOffset = RecordingRecoveryStore.createdAt(for: parentRecordingSessionID)
+				.map { max(0, startedAt.timeIntervalSince($0)) }
+				?? 0
 			let session = try recoveryStore.begin(
 				parentRecordingSessionID: parentRecordingSessionID,
 				createdAt: startedAt
 			)
 			recoverySession = session
-			let writer = SystemAudioCaptureWriter(session: session, meterContinuation: meterContinuation)
+			audioChunkRelay.beginTake(parentRecordingSessionID)
+			let writer = SystemAudioCaptureWriter(
+				session: session,
+				meterContinuation: meterContinuation,
+				audioChunkRelay: audioChunkRelay,
+				takeGeneration: parentRecordingSessionID,
+				startOffset: startOffset
+			)
 			let stream = SCStream(filter: filter, configuration: configuration, delegate: nil)
 			try stream.addStreamOutput(
 				writer,
@@ -355,6 +422,10 @@ private actor SystemAudioCaptureClientLive {
 
 	func observeAudioLevel() -> AsyncStream<Meter> {
 		meterStream
+	}
+
+	func observeAudioChunks() -> AsyncStream<CapturedAudioChunk> {
+		audioChunkRelay.stream()
 	}
 
 	func cleanup() async {

@@ -64,6 +64,7 @@ private struct SpeakerProfileCard: View {
 	let profile: SpeakerVoiceProfile
 	let shouldFocusName: Bool
 	@Shared(.speakerVoiceLibrary) private var speakerVoiceLibrary: SpeakerVoiceLibrary
+	@Shared(.transcriptionHistory) private var transcriptionHistory: TranscriptionHistory
 	@State private var draftName: String
 	@FocusState private var isEditingName: Bool
 	@State private var audioPlayer: AVAudioPlayer?
@@ -174,6 +175,32 @@ private struct SpeakerProfileCard: View {
 			library.profiles[index].name = trimmedDraftName
 			library.profiles[index].isNameUserEdited = true
 		}
+		$transcriptionHistory.withLock { history in
+			for transcriptIndex in history.history.indices {
+				if var speakers = history.history[transcriptIndex].sessionSpeakers {
+					for index in speakers.indices where speakers[index].profileID == profile.id {
+						speakers[index].lastKnownProfileName = trimmedDraftName
+					}
+					history.history[transcriptIndex].sessionSpeakers = speakers
+				}
+				if var segments = history.history[transcriptIndex].speakerSegments {
+					for index in segments.indices where segments[index].profileID == profile.id {
+						segments[index].speakerName = trimmedDraftName
+					}
+					history.history[transcriptIndex].speakerSegments = segments
+				}
+				if var channels = history.history[transcriptIndex].audioChannels {
+					for channelIndex in channels.indices {
+						guard var segments = channels[channelIndex].speakerSegments else { continue }
+						for index in segments.indices where segments[index].profileID == profile.id {
+							segments[index].speakerName = trimmedDraftName
+						}
+						channels[channelIndex].speakerSegments = segments
+					}
+					history.history[transcriptIndex].audioChannels = channels
+				}
+			}
+		}
 		isEditingName = false
 	}
 
@@ -181,6 +208,35 @@ private struct SpeakerProfileCard: View {
 		let samples = profile.audioSamples ?? []
 		$speakerVoiceLibrary.withLock { library in
 			library.profiles.removeAll { $0.id == profile.id }
+		}
+		$transcriptionHistory.withLock { history in
+			for transcriptIndex in history.history.indices {
+				if var speakers = history.history[transcriptIndex].sessionSpeakers {
+					for index in speakers.indices where speakers[index].profileID == profile.id {
+						speakers[index].lastKnownProfileName = speakers[index].lastKnownProfileName ?? profile.name
+						speakers[index].profileID = nil
+					}
+					history.history[transcriptIndex].sessionSpeakers = speakers
+				}
+				if var segments = history.history[transcriptIndex].speakerSegments {
+					for index in segments.indices where segments[index].profileID == profile.id {
+						segments[index].profileID = nil
+						if segments[index].speakerName.isEmpty { segments[index].speakerName = profile.name }
+					}
+					history.history[transcriptIndex].speakerSegments = segments
+				}
+				if var channels = history.history[transcriptIndex].audioChannels {
+					for channelIndex in channels.indices {
+						guard var segments = channels[channelIndex].speakerSegments else { continue }
+						for index in segments.indices where segments[index].profileID == profile.id {
+							segments[index].profileID = nil
+							if segments[index].speakerName.isEmpty { segments[index].speakerName = profile.name }
+						}
+						channels[channelIndex].speakerSegments = segments
+					}
+					history.history[transcriptIndex].audioChannels = channels
+				}
+			}
 		}
 		SpeakerVoiceSampleStore.delete(samples)
 	}

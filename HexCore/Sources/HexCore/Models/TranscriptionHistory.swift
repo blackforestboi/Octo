@@ -20,7 +20,7 @@ public enum TranscriptProcessingStage: String, Codable, CaseIterable, Equatable,
 /// A recording can include both the user's microphone and system playback. Keeping
 /// the source alongside the channel lets History preserve each recording and still
 /// render their timed sections as one conversation.
-public enum TranscriptAudioSource: String, Codable, CaseIterable, Equatable, Sendable, Identifiable {
+public enum TranscriptAudioSource: String, Codable, CaseIterable, Equatable, Hashable, Sendable, Identifiable {
 	case microphone
 	case systemAudio
 
@@ -44,6 +44,7 @@ public struct TranscriptAudioChannel: Codable, Equatable, Identifiable, Sendable
 	public var text: String
 	public var timestampedSections: [TimestampedTranscriptSection]?
 	public var speakerSegments: [SpeakerAttributedSegment]?
+	public var liveCheckpoint: SourceLiveTranscriptCheckpoint?
 
 	public var id: TranscriptAudioSource { source }
 
@@ -54,7 +55,8 @@ public struct TranscriptAudioChannel: Codable, Equatable, Identifiable, Sendable
 		startOffset: TimeInterval = 0,
 		text: String = "",
 		timestampedSections: [TimestampedTranscriptSection]? = nil,
-		speakerSegments: [SpeakerAttributedSegment]? = nil
+		speakerSegments: [SpeakerAttributedSegment]? = nil,
+		liveCheckpoint: SourceLiveTranscriptCheckpoint? = nil
 	) {
 		self.source = source
 		self.audioPath = audioPath
@@ -63,6 +65,7 @@ public struct TranscriptAudioChannel: Codable, Equatable, Identifiable, Sendable
 		self.text = text
 		self.timestampedSections = timestampedSections
 		self.speakerSegments = speakerSegments
+		self.liveCheckpoint = liveCheckpoint
 	}
 }
 
@@ -128,6 +131,13 @@ public struct Transcript: Codable, Equatable, Identifiable, Sendable {
 	/// The title the user sees for a recording session. It is repeated on each take so
 	/// a future History grouping can recover the session without another storage file.
 	public var recordingSessionTitle: String?
+	/// Stable identities referenced by committed live transcript sections.
+	public var sessionSpeakers: [SessionSpeaker]?
+	/// Monotonic live-transcription state. The provisional tail is intentionally absent.
+	public var liveTranscriptCheckpoint: LiveTranscriptCheckpoint?
+	/// Snapshotted live speaker settings used to drain a recovered tail consistently.
+	public var liveSpeakerIdentificationEnabled: Bool?
+	public var liveSpeakerDiarizationMode: SpeakerDiarizationMode?
     
     public init(
         id: UUID = UUID(),
@@ -153,7 +163,11 @@ public struct Transcript: Codable, Equatable, Identifiable, Sendable {
 		screenAwareInputSource: ScreenAwareInputSource? = nil,
 		recoverySessionID: UUID? = nil,
 		recordingSessionID: UUID? = nil,
-		recordingSessionTitle: String? = nil
+		recordingSessionTitle: String? = nil,
+		sessionSpeakers: [SessionSpeaker]? = nil,
+		liveTranscriptCheckpoint: LiveTranscriptCheckpoint? = nil,
+		liveSpeakerIdentificationEnabled: Bool? = nil,
+		liveSpeakerDiarizationMode: SpeakerDiarizationMode? = nil
     ) {
         self.id = id
         self.timestamp = timestamp
@@ -179,6 +193,10 @@ public struct Transcript: Codable, Equatable, Identifiable, Sendable {
 		self.recoverySessionID = recoverySessionID
 		self.recordingSessionID = recordingSessionID
 		self.recordingSessionTitle = recordingSessionTitle
+		self.sessionSpeakers = sessionSpeakers
+		self.liveTranscriptCheckpoint = liveTranscriptCheckpoint
+		self.liveSpeakerIdentificationEnabled = liveSpeakerIdentificationEnabled
+		self.liveSpeakerDiarizationMode = liveSpeakerDiarizationMode
     }
 }
 

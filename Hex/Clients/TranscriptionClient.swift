@@ -77,7 +77,7 @@ actor TranscriptionClientLive {
 
   /// The name of the currently loaded model, if any.
   private var currentModelName: String?
-  private var parakeet: ParakeetClient = ParakeetClient()
+	private var parakeet: ParakeetClient = .shared
 
   /// The base folder under which we store model data (e.g., ~/Library/Application Support/...).
   private lazy var modelsBaseFolder: URL = {

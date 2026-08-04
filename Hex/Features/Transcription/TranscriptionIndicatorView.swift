@@ -84,11 +84,13 @@ struct TranscriptionIndicatorView: View {
 	private enum RecordingCapability: Hashable {
 		case speakerIdentification
 		case systemAudio
+		case liveTranscription
 
 		var systemImage: String {
 			switch self {
 			case .speakerIdentification: "person.2.wave.2"
 			case .systemAudio: "speaker.wave.2"
+			case .liveTranscription: "text.bubble.fill"
 			}
 		}
 
@@ -96,6 +98,7 @@ struct TranscriptionIndicatorView: View {
 			switch self {
 			case .speakerIdentification: "Speaker identification"
 			case .systemAudio: "System audio"
+			case .liveTranscription: "Live transcript is processing"
 			}
 		}
 	}
@@ -105,6 +108,7 @@ struct TranscriptionIndicatorView: View {
 	var size: IndicatorSize
 	var isSpeakerIdentificationActive = false
 	var isSystemAudioActive = false
+	var isLiveTranscriptionBacklogged = false
 	var availableSize: CGSize = .zero
 	var onOpenHistory: () -> Void = {}
 	var onOpenAgentHandoff: () -> Void = {}
@@ -137,6 +141,9 @@ struct TranscriptionIndicatorView: View {
 		}
 		if isSystemAudioActive {
 			capabilities.append(.systemAudio)
+		}
+		if isLiveTranscriptionBacklogged {
+			capabilities.append(.liveTranscription)
 		}
 		return capabilities
 	}
@@ -834,6 +841,7 @@ struct TranscriptionIndicatorOverlayView: View {
 			size: hexSettings.indicatorSize,
 			isSpeakerIdentificationActive: store.activeSpeakerIdentificationEnabled,
 			isSystemAudioActive: store.activeSystemAudioEnabled,
+			isLiveTranscriptionBacklogged: (store.recordingSession?.liveBacklog ?? 0) > 0,
 			onOpenHistory: onOpenHistory,
 			onOpenAgentHandoff: { store.send(.openAgentHandoff) },
 			onDismissAgentHandoff: { store.send(.dismissAgentHandoff) },

@@ -25,17 +25,17 @@ enum SpeakerDiarizationClientError: LocalizedError {
 /// local model happens here rather than through the UI, history, or ASR pipeline.
 @DependencyClient
 struct SpeakerDiarizationClient {
-	var analyze: @Sendable (URL, SpeakerDiarizationProvider, [SpeakerVoiceProfile]) async throws -> SpeakerDiarizationOutput
+	var analyze: @Sendable (URL, SpeakerDiarizationProvider, SpeakerDiarizationMode, [SpeakerVoiceProfile]) async throws -> SpeakerDiarizationOutput
 }
 
 extension SpeakerDiarizationClient: DependencyKey {
 	static var liveValue: Self {
 		let fluidAudioEngine = FluidAudioSortformerEngine()
 		return Self(
-			analyze: { audioURL, provider, profiles in
+			analyze: { audioURL, provider, mode, profiles in
 				switch provider {
 				case .fluidAudio:
-					try await fluidAudioEngine.analyze(audioURL, profiles: profiles)
+					try await fluidAudioEngine.analyze(audioURL, mode: mode, profiles: profiles)
 				}
 			}
 		)
@@ -59,8 +59,12 @@ private actor FluidAudioSortformerEngine {
 
 	func analyze(
 		_ audioURL: URL,
+		mode: SpeakerDiarizationMode,
 		profiles: [SpeakerVoiceProfile]
 	) async throws -> SpeakerDiarizationOutput {
+		if mode == .moreSpeakersTen {
+			return try await analyzeWithLSEEND(audioURL, profiles: profiles)
+		}
 		let startedAt = Date()
 		let loadedModels = try await loadModels()
 		let diarizer = SortformerDiarizer(config: config)
@@ -78,28 +82,28 @@ private actor FluidAudioSortformerEngine {
 					overwritingAssignedSpeakerName: false
 				) else {
 					speakerDiarizationLogger.warning(
-						"Speaker enrollment rejected profile=\(enrollment.profile.id.uuidString, privacy: .public) sampleDuration=\(String(format: "%.2f", enrollment.sample.duration), privacy: .public)"
+						"Speaker enrollment rejected profile=\(enrollment.profile.id.uuidString, privacy: .private) sampleDuration=\(String(format: "%.2f", enrollment.sample.duration), privacy: .public)"
 					)
 					continue
 				}
 				profileIDBySpeakerIndex[speaker.index] = enrollment.profile.id
 				speakerDiarizationLogger.notice(
-					"Speaker enrollment accepted profile=\(enrollment.profile.id.uuidString, privacy: .public) slot=\(speaker.index) sampleDuration=\(String(format: "%.2f", enrollment.sample.duration), privacy: .public) profileUpdated=false"
+					"Speaker enrollment accepted profile=\(enrollment.profile.id.uuidString, privacy: .private) slot=\(speaker.index) sampleDuration=\(String(format: "%.2f", enrollment.sample.duration), privacy: .public) profileUpdated=false"
 				)
 			} catch {
 				speakerDiarizationLogger.warning(
-					"Speaker enrollment failed profile=\(enrollment.profile.id.uuidString, privacy: .public) error=\(error.localizedDescription, privacy: .private)"
+					"Speaker enrollment failed profile=\(enrollment.profile.id.uuidString, privacy: .private) error=\(error.localizedDescription, privacy: .private)"
 				)
 			}
 		}
 		for profile in enrollments.withoutUsableSamples {
 			speakerDiarizationLogger.info(
-				"Speaker enrollment skipped profile=\(profile.id.uuidString, privacy: .public) reason=noUsableImmutableSample"
+				"Speaker enrollment skipped profile=\(profile.id.uuidString, privacy: .private) reason=noUsableImmutableSample"
 			)
 		}
 		for profile in enrollments.overCapacity {
 			speakerDiarizationLogger.info(
-				"Speaker enrollment skipped profile=\(profile.id.uuidString, privacy: .public) reason=reservedUnknownSpeakerSlot"
+				"Speaker enrollment skipped profile=\(profile.id.uuidString, privacy: .private) reason=reservedUnknownSpeakerSlot"
 			)
 		}
 
@@ -128,6 +132,72 @@ private actor FluidAudioSortformerEngine {
 		speakerDiarizationLogger.notice(
 			"Speaker diarization finished mode=sortformerBalancedV2_1 elapsedSeconds=\(String(format: "%.2f", Date().timeIntervalSince(startedAt)), privacy: .public) segments=\(segments.count) speakers=\(Set(segments.map(\.speakerID)).count) enrolledProfiles=\(profileIDBySpeakerIndex.count) profileUpdates=0"
 		)
+		return .init(segments: segments)
+	}
+
+	private func analyzeWithLSEEND(
+		_ audioURL: URL,
+		profiles: [SpeakerVoiceProfile]
+	) async throws -> SpeakerDiarizationOutput {
+		let converter = AudioConverter(sampleRate: 16_000)
+		let samples = try converter.resampleAudioFile(audioURL)
+		let model = try await LSEENDModel.loadFromHuggingFace(
+			variant: .dihard3,
+			stepSize: .step100ms,
+			computeUnits: .cpuOnly
+		)
+		let diarizer = try LSEENDDiarizer(model: model)
+		var profileIDBySpeakerIndex = [Int: UUID]()
+		for profile in profiles.prefix(SpeakerDiarizationMode.moreSpeakersTen.speakerCapacity - 1) {
+			let samples = (profile.audioSamples ?? []).filter {
+				$0.duration >= SpeakerVoiceSampleStore.minimumEnrollmentDuration
+					&& FileManager.default.fileExists(atPath: $0.audioURL.path)
+			}
+			// Require repeated immutable samples before a ten-speaker run may expose
+			// a saved name. Anonymous attribution remains available with less evidence.
+			guard samples.count >= 2 else { continue }
+			do {
+				var enrollmentAudio = [Float]()
+				for sample in samples.prefix(2) {
+					enrollmentAudio.append(contentsOf: try converter.resampleAudioFile(sample.audioURL))
+					enrollmentAudio.append(contentsOf: repeatElement(Float.zero, count: 8_000))
+				}
+				if let enrolled = try diarizer.enrollSpeaker(
+					withAudio: enrollmentAudio,
+					sourceSampleRate: 16_000,
+					named: profile.id.uuidString,
+					overwritingAssignedSpeakerName: false
+				) {
+					profileIDBySpeakerIndex[enrolled.index] = profile.id
+				}
+			} catch {
+				speakerDiarizationLogger.warning(
+					"LS-EEND speaker enrollment failed profile=\(profile.id.uuidString, privacy: .private) error=\(error.localizedDescription, privacy: .private)"
+				)
+			}
+		}
+		let timeline = try diarizer.processComplete(
+			samples,
+			sourceSampleRate: 16_000,
+			keepingEnrolledSpeakers: true,
+			finalizeOnCompletion: true,
+			progressCallback: nil
+		)
+		let segments = timeline.speakers.values.flatMap { speaker in
+			(speaker.finalizedSegments + speaker.tentativeSegments).map { segment in
+				SpeakerDiarizationSegment(
+					speakerID: "lseend-\(segment.speakerIndex)",
+					embedding: [],
+					startTime: TimeInterval(segment.startTime),
+					endTime: TimeInterval(segment.endTime),
+					qualityScore: segment.activity.isFinite ? segment.activity : 0,
+					profileID: profileIDBySpeakerIndex[segment.speakerIndex]
+				)
+			}
+		}.sorted {
+			if $0.startTime != $1.startTime { return $0.startTime < $1.startTime }
+			return $0.speakerID < $1.speakerID
+		}
 		return .init(segments: segments)
 	}
 
@@ -174,6 +244,7 @@ private actor FluidAudioSortformerEngine {
 private actor FluidAudioSortformerEngine {
 	func analyze(
 		_ audioURL: URL,
+		mode _: SpeakerDiarizationMode,
 		profiles: [SpeakerVoiceProfile]
 	) async throws -> SpeakerDiarizationOutput {
 		_ = audioURL

@@ -512,20 +512,21 @@ struct HistoryFeature {
 				guard let transcript = state.transcriptionHistory.history.first(where: { $0.id == id }) else {
 					return .none
 				}
+				let transcriptsToDelete = transcript.recordingSessionID.map { sessionID in
+					state.transcriptionHistory.history.filter { $0.recordingSessionID == sessionID }
+				} ?? [transcript]
+				let idsToDelete = Set(transcriptsToDelete.map(\.id))
 
-				if state.playingTranscriptID == id {
+				if state.playingTranscriptID.map(idsToDelete.contains) == true {
 					state.stopAudioPlayback()
 				}
 
 				_ = state.$transcriptionHistory.withLock { history in
-					history.history.removeAll { $0.audioPath == transcript.audioPath }
+					history.history.removeAll { idsToDelete.contains($0.id) }
 				}
-				let recordingIsStillReferenced = state.transcriptionHistory.history.contains { $0.audioPath == transcript.audioPath }
-
-				guard !recordingIsStillReferenced else { return .none }
 				return .merge(
 					.cancel(id: CancelID.playbackProgress),
-					deleteTranscriptFilesEffect(for: [transcript])
+					deleteTranscriptFilesEffect(for: transcriptsToDelete)
 				)
 
 			case .deleteAllTranscripts:
@@ -746,12 +747,21 @@ private struct RunHistoryItemView: View {
 		}
 		return matchingSegments.count == 1 ? matchingSegments[0] : nil
 	}
+	private func sessionSpeaker(for section: TimestampedTranscriptSection) -> SessionSpeaker? {
+		guard let id = section.sessionSpeakerID else { return nil }
+		return transcript.sessionSpeakers?.first { $0.id == id }
+	}
 	private func speakerProfile(for section: TimestampedTranscriptSection) -> SpeakerVoiceProfile? {
-		guard let profileID = speakerSegment(for: section)?.profileID else { return nil }
+		guard let profileID = sessionSpeaker(for: section)?.profileID
+			?? speakerSegment(for: section)?.profileID
+		else { return nil }
 		return speakerVoiceLibrary.profiles.first { $0.id == profileID }
 	}
 	private func speakerName(for section: TimestampedTranscriptSection) -> String? {
 		if let profile = speakerProfile(for: section) { return profile.name }
+		if let speaker = sessionSpeaker(for: section) {
+			return speaker.lastKnownProfileName ?? speaker.fallbackLabel
+		}
 		if let displayLabel = section.displayLabel { return displayLabel }
 		return speakerSegment(for: section)?.speakerName
 	}
@@ -1129,6 +1139,17 @@ struct RecordingSessionView: View {
 		var speakers = [IdentifiedSpeaker]()
 
 		for take in takes.sorted(by: { $0.timestamp < $1.timestamp }) {
+			for speaker in take.sessionSpeakers ?? [] {
+				let id = speaker.id.uuidString
+				guard seen.insert(id).inserted else { continue }
+				let savedName = speaker.profileID.flatMap { profileID in
+					speakerVoiceLibrary.profiles.first(where: { $0.id == profileID })?.name
+				}
+				speakers.append(.init(
+					id: id,
+					name: savedName ?? speaker.lastKnownProfileName ?? speaker.fallbackLabel
+				))
+			}
 			for segment in take.speakerSegments ?? [] {
 				let id = segment.profileID?.uuidString ?? "\(take.id)-\(segment.speakerID)"
 				guard seen.insert(id).inserted else { continue }
@@ -1145,14 +1166,27 @@ struct RecordingSessionView: View {
 
 		return speakers
 	}
-	private var transcriptText: String {
-		takes
-			.sorted { $0.timestamp < $1.timestamp }
-			.compactMap { transcript in
-				let text = transcript.rawText ?? transcript.text
-				return text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : text
+	private var sortedTakes: [Transcript] {
+		takes.sorted { $0.timestamp < $1.timestamp }
+	}
+	private var hasTranscriptContent: Bool {
+		sortedTakes.contains { take in
+			if let sections = take.timestampedSections, sections.contains(where: {
+				!$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+			}) {
+				return true
 			}
-			.joined(separator: "\n\n")
+			let text = take.rawText ?? take.text
+			return !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+		}
+	}
+	private var isTranscriptProcessing: Bool {
+		if session.liveTranscriptionEnabled,
+			session.isRecording || session.isDraining || session.liveBacklog > 0
+		{
+			return true
+		}
+		return isTranscribing || sortedTakes.contains { $0.status == .processing }
 	}
 
 	var body: some View {
@@ -1184,8 +1218,25 @@ struct RecordingSessionView: View {
 			}
 			.buttonStyle(.borderedProminent)
 			.tint(session.isRecording ? .orange : .red)
-			.disabled(isTranscribing)
+			.disabled(
+				isTranscribing
+					|| session.isPreparingSpeakerMode
+					|| (session.speakerIdentificationEnabled && !session.isSpeakerModeReady)
+					|| session.isDraining
+					|| session.isEnded
+					|| session.phase == .preparing
+			)
 			.help(session.isRecording ? "Pause recording" : "Continue recording")
+
+			Button {
+				send(.stopRecordingSession)
+			} label: {
+				Image(systemName: "stop.fill")
+					.frame(width: 30, height: 30)
+			}
+			.buttonStyle(.bordered)
+			.disabled(session.isDraining || session.isEnded)
+			.help("End recording session")
 
 			if session.speakerIdentificationEnabled, !identifiedSpeakers.isEmpty {
 				ScrollView(.horizontal) {
@@ -1201,6 +1252,18 @@ struct RecordingSessionView: View {
 					}
 				}
 				.scrollIndicators(.hidden)
+			}
+			Spacer(minLength: 8)
+			if session.phase == .preparing || session.isPreparingSpeakerMode {
+				ProgressView("Preparing models…")
+					.controlSize(.small)
+			}
+			if let liveError = session.liveError {
+				Label(liveError, systemImage: "exclamationmark.triangle.fill")
+					.font(.caption)
+					.foregroundStyle(.orange)
+					.lineLimit(1)
+					.help(liveError)
 			}
 		}
 	}
@@ -1242,12 +1305,36 @@ struct RecordingSessionView: View {
 
 	private var tabSwitcher: some View {
 		HStack(spacing: 8) {
-			tabButton("Transcript", tab: .transcript)
+			transcriptTabButton
 			ForEach(session.summaries) { summary in
 				tabButton(summary.title, tab: .summary(summary.promptID))
 			}
 			addSummaryButton
 		}
+	}
+
+	private var transcriptTabButton: some View {
+		Button {
+			selectedTab = .transcript
+		} label: {
+			HStack(spacing: 6) {
+				if isTranscriptProcessing {
+					ProgressView()
+						.controlSize(.mini)
+				}
+				Text(isTranscriptProcessing ? "Transcribing" : "Transcript")
+			}
+			.font(.subheadline.weight(.medium))
+			.padding(.horizontal, 10)
+			.padding(.vertical, 5)
+			.background(
+				selectedTab == .transcript ? Color.accentColor.opacity(0.24) : Color.primary.opacity(0.08),
+				in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+			)
+		}
+		.buttonStyle(.plain)
+		.foregroundStyle(selectedTab == .transcript ? .primary : .secondary)
+		.accessibilityLabel(isTranscriptProcessing ? "Transcript, transcribing" : "Transcript")
 	}
 
 	private var addSummaryButton: some View {
@@ -1267,7 +1354,7 @@ struct RecordingSessionView: View {
 		.padding(.vertical, 5)
 		.background(Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
 		.foregroundStyle(.secondary)
-		.disabled(session.isRecording || session.isGeneratingSummary)
+		.disabled(!session.isEnded || session.isGeneratingSummary)
 		.help("Choose a summary template")
 	}
 
@@ -1290,36 +1377,40 @@ struct RecordingSessionView: View {
 
 	@ViewBuilder
 	private var transcript: some View {
-		if session.isRecording {
+		if !hasTranscriptContent {
 			ContentUnavailableView(
-				"Waiting for pause or stop",
-				systemImage: "waveform",
-				description: Text("The transcript appears after you pause or stop this recording.")
-			)
-		} else if transcriptText.isEmpty {
-			ContentUnavailableView(
-				isTranscribing ? "Transcribing…" : "No transcript yet",
+				"No transcript yet",
 				systemImage: "text.bubble",
-				description: Text(isTranscribing ? "The latest paused take is being transcribed." : "Resume recording to add a take.")
+				description: Text(
+					isTranscriptProcessing
+						? "Committed text appears here after a short stability delay."
+						: "Resume recording to add a take."
+				)
 			)
 		} else {
 			VStack(alignment: .leading, spacing: 10) {
-				ForEach(takes.sorted { $0.timestamp < $1.timestamp }) { take in
+				ForEach(sortedTakes) { take in
 					let takeStartTime = max(0, take.timestamp.timeIntervalSince(session.startedAt))
 					if let sections = take.timestampedSections, !sections.isEmpty {
 						ForEach(sections) { section in
-							timestampedTranscriptLine(
-								start: takeStartTime + section.startTime,
-								end: takeStartTime + section.endTime,
-								text: section.text
-							)
+							if !section.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+								timestampedTranscriptLine(
+									start: takeStartTime + section.startTime,
+									end: takeStartTime + section.endTime,
+									text: section.text,
+									speakerName: sessionSpeakerName(for: section, in: take)
+								)
+							}
 						}
 					} else {
-						timestampedTranscriptLine(
-							start: takeStartTime,
-							end: takeStartTime + take.duration,
-							text: take.rawText ?? take.text
-						)
+						let text = take.rawText ?? take.text
+						if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+							timestampedTranscriptLine(
+								start: takeStartTime,
+								end: takeStartTime + take.duration,
+								text: text
+							)
+						}
 					}
 				}
 			}
@@ -1356,14 +1447,38 @@ struct RecordingSessionView: View {
 		send(.generateRecordingSessionSummary(prompt))
 	}
 
-	private func timestampedTranscriptLine(start: TimeInterval, end: TimeInterval, text: String) -> some View {
+	private func timestampedTranscriptLine(
+		start: TimeInterval,
+		end: TimeInterval,
+		text: String,
+		speakerName: String? = nil
+	) -> some View {
 		HStack(alignment: .firstTextBaseline, spacing: 8) {
 			Text("\(formattedTimestamp(start))–\(formattedTimestamp(end))")
 				.font(.caption.monospacedDigit())
 				.foregroundStyle(.secondary)
 				.frame(width: 76, alignment: .leading)
+			if let speakerName {
+				Text(speakerName)
+					.font(.caption.weight(.semibold))
+					.foregroundStyle(.secondary)
+					.frame(minWidth: 72, alignment: .leading)
+			}
 			Text(text)
 		}
+	}
+
+	private func sessionSpeakerName(
+		for section: TimestampedTranscriptSection,
+		in take: Transcript
+	) -> String? {
+		guard let id = section.sessionSpeakerID,
+			let speaker = take.sessionSpeakers?.first(where: { $0.id == id })
+		else { return section.speakerName }
+		let savedName = speaker.profileID.flatMap { profileID in
+			speakerVoiceLibrary.profiles.first(where: { $0.id == profileID })?.name
+		}
+		return savedName ?? speaker.lastKnownProfileName ?? speaker.fallbackLabel
 	}
 
 	private func formattedTimestamp(_ time: TimeInterval) -> String {
@@ -1376,6 +1491,8 @@ struct RecordingSessionView: View {
 			send(.pauseRecordingSession)
 		case .paused:
 			send(.resumeRecordingSession)
+		case .preparing, .drainingForPause, .drainingForStop, .ended, .endedWithError:
+			break
 		}
 	}
 
@@ -1469,10 +1586,13 @@ struct HistoryView: View {
 		guard let matchingTranscriptIDs else { return runs }
 		return runs.filter { matchingTranscriptIDs.contains($0.id) }
 	}
+	private var hasDurableRecordingSessions: Bool {
+		store.transcriptionHistory.history.contains { $0.recordingSessionID != nil }
+	}
 
 	var body: some View {
       Group {
-		if !hexSettings.saveTranscriptionHistory {
+		if !hexSettings.saveTranscriptionHistory && !hasDurableRecordingSessions {
           ContentUnavailableView {
             Label("History Disabled", systemImage: "clock.arrow.circlepath")
           } description: {

@@ -1477,6 +1477,81 @@ final class RecordingRaceTests: XCTestCase {
 		await store.finish()
 	}
 
+	func testRecordingSessionElapsedDurationFreezesWhilePausedAndResumes() {
+		let firstStart = Date(timeIntervalSince1970: 1_000)
+		var session = TranscriptionFeature.RecordingSession(
+			id: UUID(),
+			title: "Session",
+			phase: .preparing,
+			speakerIdentificationEnabled: false,
+			systemAudioEnabled: false,
+			liveTranscriptionEnabled: false,
+			speakerMode: .highAccuracyFour
+		)
+
+		session.beginRecording(at: firstStart)
+		XCTAssertEqual(session.elapsedDuration(at: firstStart.addingTimeInterval(8)), 8)
+
+		session.pauseRecording(at: firstStart.addingTimeInterval(10))
+		XCTAssertEqual(session.elapsedDuration(at: firstStart.addingTimeInterval(70)), 10)
+
+		session.beginRecording(at: firstStart.addingTimeInterval(100))
+		XCTAssertEqual(session.elapsedDuration(at: firstStart.addingTimeInterval(105)), 15)
+	}
+
+	func testActiveRecordingSessionIgnoresHotkeyEndingActions() async {
+		var state = Self.makeState()
+		state.isRecording = true
+		state.activeRecordingSource = .regular
+		state.recordingSession = .init(
+			id: UUID(),
+			title: "Session",
+			phase: .recording,
+			speakerIdentificationEnabled: false,
+			systemAudioEnabled: false,
+			liveTranscriptionEnabled: false,
+			speakerMode: .highAccuracyFour
+		)
+		let store = TestStore(initialState: state) { TranscriptionFeature() }
+
+		await store.send(.hotKeyPressed)
+		await store.send(.hotKeyReleased(.regular))
+		await store.send(.finishRecordingWithRefinement)
+		await store.send(.finishRecordingWithAgentHandoff)
+		await store.send(.finishScreenAwareRecording)
+		await store.send(.hotKeyCancelled(.regular))
+		await store.send(.hotKeyDiscarded(.regular))
+		await store.send(.cancel)
+		await store.finish()
+
+		XCTAssertEqual(store.state.recordingSession?.phase, .recording)
+		XCTAssertTrue(store.state.isRecording)
+	}
+
+	func testPausedRecordingSessionCannotBeReplacedOrResumedByHotkey() async {
+		let sessionID = UUID()
+		var state = Self.makeState()
+		state.recordingSession = .init(
+			id: sessionID,
+			title: "Session",
+			phase: .paused,
+			speakerIdentificationEnabled: false,
+			systemAudioEnabled: false,
+			liveTranscriptionEnabled: false,
+			speakerMode: .highAccuracyFour
+		)
+		let store = TestStore(initialState: state) { TranscriptionFeature() }
+
+		await store.send(.startRecordingSession)
+		await store.send(.hotKeyPressed)
+		await store.send(.hotKeyReleased(.regular))
+		await store.finish()
+
+		XCTAssertEqual(store.state.recordingSession?.id, sessionID)
+		XCTAssertEqual(store.state.recordingSession?.phase, .paused)
+		XCTAssertFalse(store.state.isRecording)
+	}
+
 	func testAgentHandoffFinishClearsScreenAwareModeBeforePresentationDeparts() async {
 		var state = Self.makeState()
 		state.$hexSettings.withLock { $0.agentHandoffEnabled = true }

@@ -35,6 +35,7 @@ struct AppFeature {
 		var settings: SettingsFeature.State = .init()
 		var history: HistoryFeature.State = .init()
 		var activeTab: ActiveTab = .settings
+		var isEndRecordingSessionConfirmationPresented = false
 		var speakerProfileIDToFocus: UUID?
 		@Shared(.hexSettings) var hexSettings: HexSettings
 		@Shared(.modelBootstrapState) var modelBootstrapState: ModelBootstrapState
@@ -52,6 +53,9 @@ struct AppFeature {
     case settings(SettingsFeature.Action)
     case history(HistoryFeature.Action)
     case setActiveTab(ActiveTab)
+		case requestEndRecordingSession
+		case cancelEndRecordingSession
+		case confirmEndRecordingSession
 		case focusSpeakerProfile(UUID)
     case task
     case pasteLastTranscript
@@ -145,25 +149,42 @@ struct AppFeature {
         }
 
       case let .interruptedRecordingsRecovered(recordings, systemAudioRecordings):
-		guard !recordings.isEmpty || !systemAudioRecordings.isEmpty else { return .none }
-        state.history.$transcriptionHistory.withLock { history in
+		let liveRecoveryIDs = state.history.$transcriptionHistory.withLock { history -> [UUID] in
+			var recoveredLiveIDs = Set<UUID>()
           for recovered in recordings {
             let error = TranscriptProcessingError(
               stage: .audio,
               message: "Octo restarted before this recording was transcribed. The recovered audio is available here."
             )
             if let index = history.history.firstIndex(where: { $0.recoverySessionID == recovered.sessionID }) {
+			  let shouldDrainLiveTail = history.history[index].liveTranscriptCheckpoint.map {
+				[.active, .drainingForPause, .drainingForStop].contains($0.drainState)
+			  } ?? false
               history.history[index].audioPath = recovered.audioURL
               history.history[index].duration = recovered.duration
-              history.history[index].status = .failed
-              history.history[index].processingErrors = [error]
+			  history.history[index].status = shouldDrainLiveTail ? .processing : .failed
+			  if shouldDrainLiveTail {
+				recoveredLiveIDs.insert(history.history[index].id)
+			  } else {
+				history.history[index].processingErrors = [error]
+			  }
 			  var channels = history.history[index].audioChannels ?? []
-			  channels.removeAll { $0.source == .microphone }
-			  channels.insert(.init(source: .microphone, audioPath: recovered.audioURL, duration: recovered.duration), at: 0)
+			  if let channelIndex = channels.firstIndex(where: { $0.source == .microphone }) {
+				channels[channelIndex].audioPath = recovered.audioURL
+				channels[channelIndex].duration = recovered.duration
+			  } else {
+				channels.insert(.init(source: .microphone, audioPath: recovered.audioURL, duration: recovered.duration), at: 0)
+			  }
 			  history.history[index].audioChannels = channels
-            } else if history.history.contains(where: { $0.audioPath == recovered.audioURL }) {
+            } else if let index = history.history.firstIndex(where: { $0.audioPath == recovered.audioURL }) {
               // The final WAV may have been checkpointed just before a crash but its raw
               // source had not been released yet. It is already represented in History.
+			  if let drainState = history.history[index].liveTranscriptCheckpoint?.drainState,
+				[.active, .drainingForPause, .drainingForStop].contains(drainState)
+			  {
+				history.history[index].status = .processing
+				recoveredLiveIDs.insert(history.history[index].id)
+			  }
               continue
             } else {
               history.history.insert(
@@ -205,6 +226,9 @@ struct AppFeature {
 				}) == true
 			}
 			if let index = matchingIndex {
+				let shouldDrainLiveTail = history.history[index].liveTranscriptCheckpoint.map {
+					[.active, .drainingForPause, .drainingForStop].contains($0.drainState)
+				} ?? false
 				var channels = history.history[index].audioChannels ?? [
 					.init(
 						source: .microphone,
@@ -212,20 +236,31 @@ struct AppFeature {
 						duration: history.history[index].duration
 					)
 				]
-				channels.removeAll { $0.source == .systemAudio }
-				channels.append(.init(
-					source: .systemAudio,
-					audioPath: recovered.audioURL,
-					duration: recovered.duration,
-					startOffset: max(0, recovered.createdAt.timeIntervalSince(history.history[index].timestamp))
-				))
-				history.history[index].audioChannels = channels
-				history.history[index].status = .failed
-				var errors = history.history[index].processingErrors ?? []
-				if !errors.contains(where: { $0.stage == .audio && $0.message == interruptionMessage }) {
-					errors.append(.init(stage: .audio, message: interruptionMessage))
+				let startOffset = max(0, recovered.createdAt.timeIntervalSince(history.history[index].timestamp))
+				if let channelIndex = channels.firstIndex(where: { $0.source == .systemAudio }) {
+					channels[channelIndex].audioPath = recovered.audioURL
+					channels[channelIndex].duration = recovered.duration
+					channels[channelIndex].startOffset = startOffset
+				} else {
+					channels.append(.init(
+						source: .systemAudio,
+						audioPath: recovered.audioURL,
+						duration: recovered.duration,
+						startOffset: startOffset,
+						liveCheckpoint: history.history[index].liveTranscriptCheckpoint?.sources[.systemAudio]
+					))
 				}
-				history.history[index].processingErrors = errors
+				history.history[index].audioChannels = channels
+				history.history[index].status = shouldDrainLiveTail ? .processing : .failed
+				if shouldDrainLiveTail {
+					recoveredLiveIDs.insert(history.history[index].id)
+				} else {
+					var errors = history.history[index].processingErrors ?? []
+					if !errors.contains(where: { $0.stage == .audio && $0.message == interruptionMessage }) {
+						errors.append(.init(stage: .audio, message: interruptionMessage))
+					}
+					history.history[index].processingErrors = errors
+				}
 			} else {
 				let error = TranscriptProcessingError(stage: .audio, message: interruptionMessage)
 				history.history.insert(
@@ -245,12 +280,29 @@ struct AppFeature {
 				)
 			}
 		  }
+			for transcript in history.history {
+				guard let drainState = transcript.liveTranscriptCheckpoint?.drainState,
+					[.active, .drainingForPause, .drainingForStop].contains(drainState)
+				else { continue }
+				let channels = transcript.audioChannels ?? [
+					.init(source: .microphone, audioPath: transcript.audioPath, duration: transcript.duration)
+				]
+				if channels.contains(where: { FileManager.default.fileExists(atPath: $0.audioPath.path) }) {
+					recoveredLiveIDs.insert(transcript.id)
+				}
+			}
+			return Array(recoveredLiveIDs)
         }
-        return .run { [recording] _ in
-          for recovered in recordings {
-            await recording.releaseRecordingSource(recovered.audioURL)
-          }
-        }
+		return .merge(
+			.run { [recording] _ in
+				for recovered in recordings {
+					await recording.releaseRecordingSource(recovered.audioURL)
+				}
+			},
+			liveRecoveryIDs.isEmpty
+				? .none
+				: .send(.transcription(.recoverLiveTranscriptTails(liveRecoveryIDs)))
+		)
 
       case let .preferredSubscriptionProviderDetected(provider):
         guard !state.hexSettings.hasCompletedRefinementProviderDetection else {
@@ -352,6 +404,20 @@ struct AppFeature {
 				state.speakerProfileIDToFocus = nil
 			}
 			return .none
+		case .requestEndRecordingSession:
+			guard let session = state.transcription.recordingSession, !session.isEnded else {
+				state.activeTab = .history
+				return .none
+			}
+			state.isEndRecordingSessionConfirmationPresented = true
+			return .none
+		case .cancelEndRecordingSession:
+			state.isEndRecordingSessionConfirmationPresented = false
+			return .none
+		case .confirmEndRecordingSession:
+			state.isEndRecordingSessionConfirmationPresented = false
+			state.activeTab = .history
+			return .send(.transcription(.stopRecordingSession))
 		case let .focusSpeakerProfile(profileID):
 			state.activeTab = .speakers
 			state.speakerProfileIDToFocus = profileID
@@ -539,15 +605,19 @@ struct AppView: View {
   var body: some View {
     NavigationSplitView(columnVisibility: $columnVisibility) {
       List(selection: $store.activeTab) {
-		if let session = store.transcription.recordingSession {
-			Button {
-				store.send(.setActiveTab(.session))
-			} label: {
+		Button {
+			store.send(.setActiveTab(.session))
+		} label: {
+			if let session = store.transcription.recordingSession,
+				store.transcription.hasActiveRecordingSession
+			{
 				SessionSidebarLabel(session: session)
+			} else {
+				Label("New Session", systemImage: "waveform")
 			}
-			.buttonStyle(.plain)
-			.tag(AppFeature.ActiveTab.session)
 		}
+		.buttonStyle(.plain)
+		.tag(AppFeature.ActiveTab.session)
 
         Button {
           store.send(.setActiveTab(.history))
@@ -631,7 +701,7 @@ struct AppView: View {
 		)
 		  .navigationTitle("History")
 		case .session:
-			if let session = store.transcription.recordingSession {
+			if let session = store.transcription.recordingSession, !session.isEnded {
 				RecordingSessionView(
 					session: session,
 					takes: store.history.transcriptionHistory.history.filter { $0.recordingSessionID == session.id },
@@ -640,15 +710,14 @@ struct AppView: View {
 					systemAudioMeter: store.transcription.systemAudioMeter,
 					isTranscribing: store.transcription.isTranscribing,
 					send: { store.send(.transcription($0)) },
-					onBack: { store.send(.setActiveTab(.history)) }
+					onBack: { store.send(.requestEndRecordingSession) }
 				)
 				.navigationTitle(session.title)
 			} else {
-				HistoryView(
-					store: store.scope(state: \.history, action: \.history),
-					onOpenSpeaker: { store.send(.focusSpeakerProfile($0)) }
-				)
-				.navigationTitle("History")
+				NewRecordingSessionView {
+					store.send(.transcription(.startRecordingSession))
+				}
+				.navigationTitle("New Session")
 			}
       case .about:
         AboutView(store: store.scope(state: \.settings, action: \.settings))
@@ -659,15 +728,67 @@ struct AppView: View {
       }
     }
     .enableInjection()
+		.alert(
+			"End Session",
+			isPresented: Binding(
+				get: { store.isEndRecordingSessionConfirmationPresented },
+				set: { if !$0 { store.send(.cancelEndRecordingSession) } }
+			)
+		) {
+			Button("End Session", role: .destructive) {
+				store.send(.confirmEndRecordingSession)
+			}
+			Button("Cancel", role: .cancel) {
+				store.send(.cancelEndRecordingSession)
+			}
+		} message: {
+			Text("Your session will be available via the history.")
+		}
   }
+}
+
+private struct NewRecordingSessionView: View {
+	let onRecord: () -> Void
+
+	var body: some View {
+		VStack(spacing: 16) {
+			Image(systemName: "waveform")
+				.font(.system(size: 36, weight: .medium))
+				.foregroundStyle(.secondary)
+			Text("New Session")
+				.font(.title2.weight(.semibold))
+			Text("Press Record when you’re ready to begin.")
+				.foregroundStyle(.secondary)
+			Button(action: onRecord) {
+				Label("Record", systemImage: "record.circle")
+					.frame(minWidth: 90)
+			}
+			.buttonStyle(.borderedProminent)
+			.tint(.red)
+			.controlSize(.large)
+		}
+		.frame(maxWidth: .infinity, maxHeight: .infinity)
+		.padding(40)
+	}
 }
 
 struct RecordingSessionTitlebarControls: View {
 	@Bindable var store: StoreOf<AppFeature>
 
 	var body: some View {
-		if store.activeTab == .session, let session = store.transcription.recordingSession {
-			HStack(spacing: 18) {
+		if store.activeTab == .session,
+			store.transcription.hasActiveRecordingSession,
+			let session = store.transcription.recordingSession
+		{
+			HStack(spacing: 14) {
+				captureToggle(
+					"Live Transcript",
+					isOn: Binding(
+						get: { store.transcription.recordingSession?.liveTranscriptionEnabled ?? false },
+						set: { store.send(.transcription(.recordingSessionLiveTranscriptionChanged($0))) }
+					)
+				)
+				.disabled(session.phase != .paused)
 				captureToggle(
 					"Speaker ID",
 					isOn: Binding(
@@ -675,6 +796,7 @@ struct RecordingSessionTitlebarControls: View {
 						set: { store.send(.transcription(.recordingSessionSpeakerIdentificationChanged($0))) }
 					)
 				)
+				.disabled(session.isRecording || session.isDraining || session.isEnded || session.phase == .preparing)
 				captureToggle(
 					"System Audio",
 					isOn: Binding(
@@ -682,12 +804,26 @@ struct RecordingSessionTitlebarControls: View {
 						set: { store.send(.transcription(.recordingSessionSystemAudioChanged($0))) }
 					)
 				)
+				.disabled(session.isRecording || session.isDraining || session.isEnded || session.phase == .preparing)
+
+				if session.speakerIdentificationEnabled {
+					Picker("Speaker mode", selection: Binding(
+						get: { store.transcription.recordingSession?.speakerMode ?? .highAccuracyFour },
+						set: { store.send(.transcription(.recordingSessionSpeakerModeChanged($0))) }
+					)) {
+						ForEach(SpeakerDiarizationMode.allCases) { mode in
+							Text("\(mode.displayName) · \(mode.detail)").tag(mode)
+						}
+					}
+					.pickerStyle(.menu)
+					.fixedSize()
+					.disabled(session.hasCommittedLiveTranscript || session.isPreparingSpeakerMode || session.isRecording || session.isDraining || session.isEnded || session.phase == .preparing)
+				}
 			}
 			.fixedSize()
 			.padding(.trailing, 8)
 			.accessibilityElement(children: .contain)
 			.accessibilityLabel("Recording options")
-			.disabled(session.isRecording)
 		}
 	}
 

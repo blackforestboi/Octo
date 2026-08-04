@@ -31,6 +31,7 @@ struct RecordingClient {
   var requestStopBoundary: @Sendable (UInt64?) async -> Void = { _ in }
   var stopRecording: @Sendable () async -> RecordingStopResult = { .ignored(.noActiveRecording) }
   var observeAudioLevel: @Sendable () async -> AsyncStream<Meter> = { AsyncStream { _ in } }
+	var observeAudioChunks: @Sendable () async -> AsyncStream<CapturedAudioChunk> = { AsyncStream { _ in } }
   var getAvailableInputDevices: @Sendable () async -> [AudioInputDevice] = { [] }
   var getDefaultInputDeviceName: @Sendable () async -> String? = { nil }
   var warmUpRecorder: @Sendable () async -> Void = {}
@@ -50,6 +51,7 @@ extension RecordingClient: DependencyKey {
       requestStopBoundary: { await live.requestStopBoundary(eventTimestampNanoseconds: $0) },
       stopRecording: { await live.stopRecording() },
       observeAudioLevel: { await live.observeAudioLevel() },
+	  observeAudioChunks: { await live.observeAudioChunks() },
       getAvailableInputDevices: { await live.getAvailableInputDevices() },
       getDefaultInputDeviceName: { await live.getDefaultInputDeviceName() },
       warmUpRecorder: { await live.warmUpRecorder() },
@@ -421,9 +423,11 @@ actor RecordingClientLive {
     AVLinearPCMIsNonInterleaved: false,
   ]
   private let (meterStream, meterContinuation) = AsyncStream<Meter>.makeStream()
+	private let audioChunkRelay = CapturedAudioChunkRelay()
   private var meterTask: Task<Void, Never>?
   private lazy var captureController = SuperFastCaptureController(
     meterContinuation: meterContinuation,
+	audioChunkRelay: audioChunkRelay,
     onEngineConfigurationChange: { [weak self] generation in
       Task {
         await self?.enqueueCaptureEnvironmentChange(
@@ -1130,6 +1134,7 @@ actor RecordingClientLive {
     }
     let controller = SuperFastCaptureController(
       meterContinuation: meterContinuation,
+	  audioChunkRelay: audioChunkRelay,
       onEngineConfigurationChange: { _ in }
     )
     fallbackCaptureController = controller
@@ -1372,6 +1377,7 @@ actor RecordingClientLive {
       try ensureCaptureControllerReadyAfterDeferredRestart(for: activeInputDevice, reason: "startRecording")
       let session = try RecordingRecoveryStore.begin()
       recoverySession = session
+	  audioChunkRelay.beginTake(session.id)
       try captureController.beginRecording(
         recoverySession: session,
         requestedAt: startRequestAt,
@@ -1421,6 +1427,7 @@ actor RecordingClientLive {
       let controller = fallbackController()
       let session = try RecordingRecoveryStore.begin()
       fallbackRecoverySession = session
+	  audioChunkRelay.beginTake(session.id)
       try controller.beginRecording(
         recoverySession: session,
         requestedAt: startRequestAt,
@@ -1617,6 +1624,10 @@ actor RecordingClientLive {
       )
     }
   }
+
+	func observeAudioChunks() -> AsyncStream<CapturedAudioChunk> {
+		audioChunkRelay.stream()
+	}
 
   private func resumeMediaIfNeeded() async {
     let playersToResume = pausedPlayers

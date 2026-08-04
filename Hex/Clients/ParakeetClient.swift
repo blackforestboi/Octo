@@ -4,10 +4,43 @@ import HexCore
 #if canImport(FluidAudio)
 import FluidAudio
 
+actor CoalescingAsyncCache<Key: Hashable & Sendable, Value: Sendable> {
+  private var values: [Key: Value] = [:]
+  private var tasks: [Key: Task<Value, Error>] = [:]
+
+  func value(
+    for key: Key,
+    load: @escaping @Sendable () async throws -> Value
+  ) async throws -> Value {
+    if let value = values[key] { return value }
+    if let task = tasks[key] { return try await task.value }
+
+    let task = Task { try await load() }
+    tasks[key] = task
+    do {
+      let value = try await task.value
+      values[key] = value
+      tasks[key] = nil
+      return value
+    } catch {
+      tasks[key] = nil
+      throw error
+    }
+  }
+
+  func removeValue(for key: Key) {
+    tasks[key]?.cancel()
+    tasks[key] = nil
+    values[key] = nil
+  }
+}
+
 actor ParakeetClient {
+  static let shared = ParakeetClient()
   private var asr: AsrManager?
   private var models: AsrModels?
   private var currentVariant: ParakeetModel?
+  private let modelCache = CoalescingAsyncCache<ParakeetModel, AsrModels>()
   private let logger = HexLog.parakeet
   private let vendorDirs = [
     // Our app-specific cache path convention (under XDG or io.github.blackforestboi.Octo/cache)
@@ -49,46 +82,52 @@ actor ParakeetClient {
       )
     }
     if currentVariant == variant, asr != nil { return }
-    if currentVariant != variant {
-      asr = nil
-      models = nil
-    }
-    migrateLegacyCacheIfNeeded(
-      variant,
-      to: AsrModels.defaultCacheDirectory(for: variant.asrVersion)
-    )
     let t0 = Date()
-    logger.notice("Starting Parakeet load variant=\(variant.identifier)")
+    let models = try await loadModelAssets(for: variant, progress: progress)
+    self.models = models
+    preparationPhase(.activating)
+    let manager = AsrManager(config: .init(), models: models)
+    self.asr = manager
+    self.currentVariant = variant
+    let p = Progress(totalUnitCount: 100)
+    p.completedUnitCount = 100
+    progress(p)
+    logger.notice("Parakeet ensureLoaded completed in \(String(format: "%.2f", Date().timeIntervalSince(t0)))s")
+  }
+
+  private func loadModelAssets(
+    for variant: ParakeetModel,
+    progress: @escaping (Progress) -> Void
+  ) async throws -> AsrModels {
+    let t0 = Date()
     let p = Progress(totalUnitCount: 100)
     p.completedUnitCount = 1
     progress(p)
-
-    // Best-effort progress polling while FluidAudio downloads
-    let faDir = AsrModels.defaultCacheDirectory(for: variant.asrVersion)
+    let directory = AsrModels.defaultCacheDirectory(for: variant.asrVersion)
+    migrateLegacyCacheIfNeeded(variant, to: directory)
+    logger.notice("Requesting Parakeet assets variant=\(variant.identifier)")
     let pollTask = Task {
       while p.completedUnitCount < 95 {
         try? await Task.sleep(nanoseconds: 250_000_000)
-        if let size = directorySize(faDir) {
-          let target: Double = 650 * 1024 * 1024 // ~650MB
-          let frac = max(0.0, min(1.0, Double(size) / target))
-          p.completedUnitCount = Int64(5 + frac * 90)
+        if let size = directorySize(directory) {
+          let target: Double = 650 * 1024 * 1024
+          let fraction = max(0.0, min(1.0, Double(size) / target))
+          p.completedUnitCount = Int64(5 + fraction * 90)
           progress(p)
         }
         if Task.isCancelled { break }
       }
     }
     defer { pollTask.cancel() }
-
-    // Download + load the requested variant (returns when all assets are present)
-    let models = try await AsrModels.downloadAndLoad(version: variant.asrVersion)
-    self.models = models
-    preparationPhase(.activating)
-    let manager = AsrManager(config: .init(), models: models)
-    self.asr = manager
-    self.currentVariant = variant
+    let models = try await modelCache.value(for: variant) {
+      try await AsrModels.downloadAndLoad(version: variant.asrVersion)
+    }
     p.completedUnitCount = 100
     progress(p)
-    logger.notice("Parakeet ensureLoaded completed in \(String(format: "%.2f", Date().timeIntervalSince(t0)))s")
+    logger.notice(
+      "Parakeet assets ready variant=\(variant.identifier) elapsedSeconds=\(String(format: "%.2f", Date().timeIntervalSince(t0)))"
+    )
+    return models
   }
 
   private func directorySize(_ dir: URL) -> UInt64? {
@@ -149,6 +188,20 @@ actor ParakeetClient {
     )
   }
 
+  func loadedModels(
+    modelName: String,
+    progress: @escaping (Progress) -> Void = { _ in }
+  ) async throws -> AsrModels {
+    guard let variant = ParakeetModel(rawValue: modelName) else {
+      throw NSError(
+        domain: "Parakeet",
+        code: -4,
+        userInfo: [NSLocalizedDescriptionKey: "Unsupported Parakeet variant: \(modelName)"]
+      )
+    }
+    return try await loadModelAssets(for: variant, progress: progress)
+  }
+
   // Delete cached Parakeet models from known locations and reset state
   func deleteCaches(modelName: String) async throws {
     guard let variant = ParakeetModel(rawValue: modelName) else { return }
@@ -164,9 +217,10 @@ actor ParakeetClient {
 
     // Reset live objects so a future download can proceed cleanly
     if removedAny {
-      self.asr = nil
-      self.models = nil
+      await modelCache.removeValue(for: variant)
       if currentVariant == variant {
+        self.asr = nil
+        self.models = nil
         currentVariant = nil
       }
     }
@@ -219,6 +273,7 @@ private extension ParakeetModel {
 #else
 
 actor ParakeetClient {
+  static let shared = ParakeetClient()
   func isModelAvailable(_ modelName: String) async -> Bool { false }
   func ensureLoaded(modelName: String, progress: @escaping (Progress) -> Void) async throws {
     throw NSError(

@@ -13,6 +13,58 @@ struct TranscriptionHistoryTests {
 
 		#expect(transcript.timestampedSections == nil)
 		#expect(transcript.audioChannels == nil)
+		#expect(transcript.liveTranscriptCheckpoint == nil)
+		#expect(transcript.sessionSpeakers == nil)
+	}
+
+	@Test
+	func liveCheckpointAndStableSessionSpeakersRoundTrip() throws {
+		let takeGeneration = UUID()
+		let profileID = UUID()
+		let speaker = SessionSpeaker(
+			fallbackLabel: "Speaker A",
+			profileID: profileID,
+			lastKnownProfileName: "Oliver"
+		)
+		let checkpoint = LiveTranscriptCheckpoint(
+			sources: [
+				.microphone: .init(committedThroughSample: 32_000, observedThroughSample: 48_000),
+				.systemAudio: .init(committedThroughSample: 31_000, observedThroughSample: 47_000),
+			],
+			globalDisplayThroughSample: 31_000,
+			lastCommitSequence: 3,
+			takeGeneration: takeGeneration,
+			drainState: .drainingForPause
+		)
+		let section = TimestampedTranscriptSection(
+			text: "Durable text.",
+			startTime: 0,
+			endTime: 2,
+			audioSource: .microphone,
+			speakerName: "Speaker A",
+			sessionSpeakerID: speaker.id,
+			commitSequence: 3,
+			fragmentKind: .speech
+		)
+		let transcript = Transcript(
+			timestamp: .now,
+			text: section.text,
+			audioPath: URL(fileURLWithPath: "/live.wav"),
+			duration: 3,
+			timestampedSections: [section],
+			sessionSpeakers: [speaker],
+			liveTranscriptCheckpoint: checkpoint,
+			liveSpeakerIdentificationEnabled: true,
+			liveSpeakerDiarizationMode: .moreSpeakersTen
+		)
+
+		let decoded = try JSONDecoder().decode(Transcript.self, from: JSONEncoder().encode(transcript))
+
+		#expect(decoded.timestampedSections == [section])
+		#expect(decoded.sessionSpeakers == [speaker])
+		#expect(decoded.liveTranscriptCheckpoint == checkpoint)
+		#expect(decoded.liveSpeakerIdentificationEnabled == true)
+		#expect(decoded.liveSpeakerDiarizationMode == .moreSpeakersTen)
 	}
 
 	@Test

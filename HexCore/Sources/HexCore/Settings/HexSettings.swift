@@ -128,6 +128,10 @@ public struct HexSettings: Codable, Equatable, Sendable {
 	public var removePunctuation: Bool
 	/// Enables a second, local pass that assigns speaker labels to timed transcript words.
 	public var speakerIdentificationEnabled: Bool
+	/// Default for delayed, durable transcription in newly-created Recording Sessions.
+	public var liveTranscriptionEnabled: Bool
+	/// Capacity/accuracy mode snapshotted for a Recording Session.
+	public var speakerDiarizationMode: SpeakerDiarizationMode
 	/// Captures system playback as a second, independently transcribed audio stream.
 	public var includeSystemAudio: Bool
 	/// The local diarization implementation. Keeping this preference explicit makes
@@ -305,6 +309,8 @@ public struct HexSettings: Codable, Equatable, Sendable {
 		lowercaseTranscripts: Bool = false,
 		removePunctuation: Bool = false,
 		speakerIdentificationEnabled: Bool = false,
+		liveTranscriptionEnabled: Bool = true,
+		speakerDiarizationMode: SpeakerDiarizationMode = .highAccuracyFour,
 		includeSystemAudio: Bool = false,
 		speakerDiarizationProvider: SpeakerDiarizationProvider = .fluidAudio,
 		refinementMode: RefinementMode = .raw,
@@ -361,6 +367,8 @@ public struct HexSettings: Codable, Equatable, Sendable {
 		self.lowercaseTranscripts = lowercaseTranscripts
 		self.removePunctuation = removePunctuation
 		self.speakerIdentificationEnabled = speakerIdentificationEnabled
+		self.liveTranscriptionEnabled = liveTranscriptionEnabled
+		self.speakerDiarizationMode = speakerDiarizationMode
 		self.includeSystemAudio = includeSystemAudio
 		self.speakerDiarizationProvider = speakerDiarizationProvider
 		self.refinementMode = refinementMode
@@ -490,6 +498,8 @@ private enum HexSettingKey: String, CodingKey, CaseIterable {
 	case lowercaseTranscripts
 	case removePunctuation
 	case speakerIdentificationEnabled
+	case liveTranscriptionEnabled
+	case speakerDiarizationMode
 	case includeSystemAudio
 	case speakerDiarizationProvider
 	case refinementMode
@@ -658,6 +668,8 @@ private enum HexSettingsSchema {
 		SettingsField(.lowercaseTranscripts, keyPath: \.lowercaseTranscripts, default: defaults.lowercaseTranscripts).eraseToAny(),
 		SettingsField(.removePunctuation, keyPath: \.removePunctuation, default: defaults.removePunctuation).eraseToAny(),
 		SettingsField(.speakerIdentificationEnabled, keyPath: \.speakerIdentificationEnabled, default: defaults.speakerIdentificationEnabled).eraseToAny(),
+		SettingsField(.liveTranscriptionEnabled, keyPath: \.liveTranscriptionEnabled, default: defaults.liveTranscriptionEnabled).eraseToAny(),
+		SettingsField(.speakerDiarizationMode, keyPath: \.speakerDiarizationMode, default: defaults.speakerDiarizationMode).eraseToAny(),
 		SettingsField(.includeSystemAudio, keyPath: \.includeSystemAudio, default: defaults.includeSystemAudio).eraseToAny(),
 		SettingsField(.speakerDiarizationProvider, keyPath: \.speakerDiarizationProvider, default: defaults.speakerDiarizationProvider).eraseToAny(),
 		SettingsField(.refinementMode, keyPath: \.refinementMode, default: defaults.refinementMode).eraseToAny(),

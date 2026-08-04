@@ -17,6 +17,81 @@ import WhisperKit
 
 private let transcriptionFeatureLogger = HexLog.transcription
 
+private enum HistoryLogicalEntryID: Hashable {
+	case session(UUID)
+	case transcript(UUID)
+}
+
+private func pruneHistoryToLogicalLimit(
+	_ transcripts: inout [Transcript],
+	maximumEntries: Int
+) -> [Transcript] {
+	guard maximumEntries > 0 else { return [] }
+	func logicalID(for transcript: Transcript) -> HistoryLogicalEntryID {
+		transcript.recordingSessionID.map(HistoryLogicalEntryID.session) ?? .transcript(transcript.id)
+	}
+	var removed = [Transcript]()
+	while Set(transcripts.filter { $0.recoverySessionID == nil }.map(logicalID)).count > maximumEntries {
+		guard let oldest = transcripts
+			.filter({ $0.recoverySessionID == nil })
+			.min(by: { $0.timestamp < $1.timestamp })
+		else { break }
+		let target = logicalID(for: oldest)
+		let matching = transcripts.filter { $0.recoverySessionID == nil && logicalID(for: $0) == target }
+		transcripts.removeAll { $0.recoverySessionID == nil && logicalID(for: $0) == target }
+		removed.append(contentsOf: matching)
+	}
+	return removed
+}
+
+private func appendUniqueSpeakerSegments(
+	_ newSegments: [SpeakerAttributedSegment],
+	to existingSegments: [SpeakerAttributedSegment]
+) -> [SpeakerAttributedSegment] {
+	var result = existingSegments
+	for segment in newSegments where !result.contains(where: {
+		$0.speakerID == segment.speakerID
+			&& abs($0.startTime - segment.startTime) < 0.001
+			&& abs($0.endTime - segment.endTime) < 0.001
+			&& $0.text == segment.text
+	}) {
+		result.append(segment)
+	}
+	return result
+}
+
+private func mergeSessionSpeakers(
+	_ updates: [SessionSpeaker],
+	into existing: [SessionSpeaker]
+) -> [SessionSpeaker] {
+	var result = existing
+	for update in updates {
+		guard let index = result.firstIndex(where: { $0.id == update.id }) else {
+			result.append(update)
+			continue
+		}
+		if result[index].profileID == nil, result[index].lastKnownProfileName == nil {
+			result[index].profileID = update.profileID
+		}
+		if let lastKnownProfileName = update.lastKnownProfileName {
+			result[index].lastKnownProfileName = lastKnownProfileName
+		}
+	}
+	return result
+}
+
+private func durablyMutateHistory<Result>(
+	_ sharedHistory: Shared<TranscriptionHistory>,
+	persistence: LiveHistoryPersistenceClient,
+	mutation: (inout TranscriptionHistory) -> Result
+) throws -> Result {
+	var updatedHistory = sharedHistory.withLock { $0 }
+	let result = mutation(&updatedHistory)
+	try persistence.persist(updatedHistory)
+	sharedHistory.withLock { $0 = updatedHistory }
+	return result
+}
+
 /// Tracks a held number while the global event tap decides whether it is ordinary
 /// input or a rewrite-prompt shortcut. Access is synchronized because the timer
 /// task and the event-tap callback can complete at nearly the same instant.
@@ -243,8 +318,13 @@ struct TranscriptionFeature {
   }
 
 	enum RecordingSessionPhase: Equatable {
+		case preparing
 		case recording
+		case drainingForPause
 		case paused
+		case drainingForStop
+		case ended
+		case endedWithError
 	}
 
 	struct RecordingSession: Equatable {
@@ -260,8 +340,19 @@ struct TranscriptionFeature {
 		let title: String
 		let startedAt: Date = .now
 		var phase: RecordingSessionPhase
+		var accumulatedRecordingDuration: TimeInterval = 0
+		var currentRecordingStartedAt: Date?
 		var speakerIdentificationEnabled: Bool
 		var systemAudioEnabled: Bool
+		var liveTranscriptionEnabled: Bool
+		var speakerMode: SpeakerDiarizationMode
+		var sessionSpeakers: [SessionSpeaker] = []
+		var engineSpeakerIDs: [TranscriptAudioSource: [String: UUID]] = [:]
+		var hasCommittedLiveTranscript = false
+		var liveBacklog: TimeInterval = 0
+		var liveError: String?
+		var isPreparingSpeakerMode = false
+		var isSpeakerModeReady = true
 		var summaries: [Summary] = []
 		var generatingSummaryPromptID: RewritePrompt.ID?
 		var summaryError: String?
@@ -269,9 +360,23 @@ struct TranscriptionFeature {
 		var isGeneratingSummary: Bool { generatingSummaryPromptID != nil }
 
 		var isRecording: Bool { phase == .recording }
+		var isDraining: Bool { phase == .drainingForPause || phase == .drainingForStop }
+		var isEnded: Bool { phase == .ended || phase == .endedWithError }
+
+		mutating func beginRecording(at date: Date) {
+			guard currentRecordingStartedAt == nil else { return }
+			currentRecordingStartedAt = date
+		}
+
+		mutating func pauseRecording(at date: Date) {
+			guard let currentRecordingStartedAt else { return }
+			accumulatedRecordingDuration += max(0, date.timeIntervalSince(currentRecordingStartedAt))
+			self.currentRecordingStartedAt = nil
+		}
 
 		func elapsedDuration(at date: Date) -> TimeInterval {
-			max(0, date.timeIntervalSince(startedAt))
+			accumulatedRecordingDuration
+				+ (currentRecordingStartedAt.map { max(0, date.timeIntervalSince($0)) } ?? 0)
 		}
 	}
 
@@ -418,10 +523,16 @@ struct TranscriptionFeature {
 		var activeSpeakerIdentificationEnabled = false
 		/// Captured at recording start for the same in-flight consistency guarantee as speaker ID.
 		var activeSystemAudioEnabled = false
+		var activeLiveTranscriptionEnabled = false
+		var activeSpeakerDiarizationMode: SpeakerDiarizationMode = .highAccuracyFour
+		var liveTranscriptCoordinator: LiveTranscriptCommitCoordinator?
+		var liveTakeGeneration: UUID?
+		var liveSourcesNeedingFileRecovery: Set<TranscriptAudioSource> = []
 		var activeSystemAudioStartOffset: TimeInterval = 0
 		/// A persistent user-managed recording page. Individual takes retain the
 		/// same identifier in History so this state can aggregate them live.
 		var recordingSession: RecordingSession?
+		var hasActiveRecordingSession: Bool { recordingSession?.isEnded == false }
 	var error: String?
 	var isMicrophonePermissionRequired = false
 	var recordingStartTime: Date?
@@ -466,6 +577,13 @@ struct TranscriptionFeature {
 		case resumeRecordingSession
 		case recordingSessionSpeakerIdentificationChanged(Bool)
 		case recordingSessionSystemAudioChanged(Bool)
+		case recordingSessionLiveTranscriptionChanged(Bool)
+		case recordingSessionSpeakerModeChanged(SpeakerDiarizationMode)
+		case recordingSessionSpeakerModePrepared(SpeakerDiarizationMode)
+		case recordingSessionSpeakerModePreparationFailed(SpeakerDiarizationMode, String)
+		case recordingSessionModelsReady
+		case recordingSessionModelPreparationFailed(String)
+		case stopRecordingSession
 		case generateRecordingSessionSummary(RewritePrompt)
 		case recordingSessionSummaryGenerated(RewritePrompt, String)
 		case recordingSessionSummaryFailed(RewritePrompt.ID, String)
@@ -509,7 +627,16 @@ struct TranscriptionFeature {
     // Transcription result flow
 	case transcriptionAudioCaptured(URL, TimeInterval)
 	case systemAudioCaptureStarted(Date)
+	case systemAudioCaptureFailed
+	case systemAudioCaptureEndedWithError(String)
 	case systemAudioCaptured(URL, TimeInterval, startOffset: TimeInterval)
+	case startLiveTranscription(RecordingCheckpoint)
+	case liveTranscriptionEvent(LiveTranscriptionEvent)
+	case recoverLiveTranscriptTails([UUID])
+	case liveRecoveryCommit(UUID, LiveTranscriptCommit)
+	case liveRecoveryCompleted(UUID)
+	case liveRecoveryWarning(UUID, String)
+	case liveRecoveryFailed(UUID, String)
 	case transcriptionCheckpointPersisted(Transcript)
 	case transcriptionResult([TranscribedAudioChannel], microphoneAudioURL: URL)
 	case refinementResult(String, URL, TimeInterval)
@@ -541,6 +668,10 @@ struct TranscriptionFeature {
   enum CancelID: Hashable {
 		case metering
 		case systemAudioMetering
+		case liveTranscription
+		case liveRecovery
+		case liveMicrophoneAudio
+		case liveSystemAudio
     case recordingStart
     /// Trivial cleanup work that owns no temp WAV (the discard path's removeItem call).
     /// Safe to cancel when a new recording starts.
@@ -573,6 +704,8 @@ struct TranscriptionFeature {
 	@Dependency(\.recording) var recording
 	@Dependency(\.permissions) var permissions
 	@Dependency(\.systemAudioCapture) var systemAudioCapture
+	@Dependency(\.liveTranscription) var liveTranscription
+	@Dependency(\.liveHistoryPersistence) var liveHistoryPersistence
   @Dependency(\.pasteboard) var pasteboard
   @Dependency(\.keyEventMonitor) var keyEventMonitor
   @Dependency(\.soundEffects) var soundEffect
@@ -612,22 +745,27 @@ struct TranscriptionFeature {
 		// MARK: - Recording Session
 
 		case .startRecordingSession:
+			guard !state.hasActiveRecordingSession else { return .none }
 			guard !state.isRecording, !state.isTranscribing, !state.isRefining else { return .none }
 			state.recordingSession = RecordingSession(
 				id: uuid(),
 				title: "Recording: \(now.formatted(date: .abbreviated, time: .shortened))",
-				phase: .recording,
+				phase: .preparing,
 				speakerIdentificationEnabled: state.hexSettings.speakerIdentificationEnabled,
-				systemAudioEnabled: state.hexSettings.includeSystemAudio
+				systemAudioEnabled: state.hexSettings.includeSystemAudio,
+				liveTranscriptionEnabled: state.hexSettings.liveTranscriptionEnabled,
+				speakerMode: state.hexSettings.speakerDiarizationMode,
+				isSpeakerModeReady: !state.hexSettings.speakerIdentificationEnabled
 			)
-			return .merge(.send(.recordingSessionOpened), .send(.startRecording))
+			return .merge(.send(.recordingSessionOpened), prepareRecordingSessionEffect(state.recordingSession))
 
 		case .recordingSessionOpened:
 			return .none
 
 		case .pauseRecordingSession:
 			guard var session = state.recordingSession, session.phase == .recording else { return .none }
-			session.phase = .paused
+			session.pauseRecording(at: now)
+			session.phase = state.activeLiveTranscriptionEnabled ? .drainingForPause : .paused
 			session.summaries = []
 			session.summaryError = nil
 			session.generatingSummaryPromptID = nil
@@ -637,31 +775,120 @@ struct TranscriptionFeature {
 		case .resumeRecordingSession:
 			guard var session = state.recordingSession,
 				session.phase == .paused,
+				!session.isPreparingSpeakerMode,
+				(!session.speakerIdentificationEnabled || session.isSpeakerModeReady),
 				!state.isRecording,
 				!state.isTranscribing,
 				!state.isRefining
 			else { return .none }
-			session.phase = .recording
+			session.phase = .preparing
 			session.summaries = []
 			session.summaryError = nil
 			session.generatingSummaryPromptID = nil
 			state.recordingSession = session
+			return prepareRecordingSessionEffect(session)
+
+		case .recordingSessionModelsReady:
+			guard var session = state.recordingSession, session.phase == .preparing else { return .none }
+			session.beginRecording(at: now)
+			session.phase = .recording
+			session.liveError = nil
+			session.isSpeakerModeReady = true
+			state.recordingSession = session
 			return .send(.startRecording)
 
-		case let .recordingSessionSpeakerIdentificationChanged(isEnabled):
-			guard var session = state.recordingSession, !state.isRecording else { return .none }
-			session.speakerIdentificationEnabled = isEnabled
+		case let .recordingSessionModelPreparationFailed(message):
+			guard var session = state.recordingSession, session.phase == .preparing else { return .none }
+			session.phase = .paused
+			session.liveError = message
+			if session.speakerIdentificationEnabled {
+				session.isSpeakerModeReady = false
+			}
 			state.recordingSession = session
-			return .none
+			return .send(.showError(message))
+
+		case let .recordingSessionSpeakerIdentificationChanged(isEnabled):
+			guard var session = state.recordingSession, session.phase == .paused else { return .none }
+			session.speakerIdentificationEnabled = isEnabled
+			session.liveError = nil
+			session.isSpeakerModeReady = !isEnabled
+			session.isPreparingSpeakerMode = isEnabled
+			state.recordingSession = session
+			return isEnabled ? prepareSpeakerDiarizationModeEffect(session.speakerMode) : .none
 
 		case let .recordingSessionSystemAudioChanged(isEnabled):
-			guard var session = state.recordingSession, !state.isRecording else { return .none }
+			guard var session = state.recordingSession, session.phase == .paused else { return .none }
 			session.systemAudioEnabled = isEnabled
 			state.recordingSession = session
 			return .none
 
-		case let .generateRecordingSessionSummary(template):
+		case let .recordingSessionLiveTranscriptionChanged(isEnabled):
+			guard var session = state.recordingSession, session.phase == .paused else { return .none }
+			session.liveTranscriptionEnabled = isEnabled
+			session.liveError = nil
+			state.recordingSession = session
+			return .none
+
+		case let .recordingSessionSpeakerModeChanged(mode):
+			guard var session = state.recordingSession,
+				!session.hasCommittedLiveTranscript,
+				session.phase == .paused
+			else { return .none }
+			session.speakerMode = mode
+			session.sessionSpeakers = []
+			session.engineSpeakerIDs = [:]
+			session.liveError = nil
+			session.isPreparingSpeakerMode = true
+			session.isSpeakerModeReady = false
+			state.recordingSession = session
+			return prepareSpeakerDiarizationModeEffect(mode)
+
+		case let .recordingSessionSpeakerModePrepared(mode):
+			guard var session = state.recordingSession,
+				session.phase == .paused,
+				session.speakerMode == mode
+			else { return .none }
+			session.isPreparingSpeakerMode = false
+			session.isSpeakerModeReady = true
+			session.liveError = nil
+			state.recordingSession = session
+			return .none
+
+		case let .recordingSessionSpeakerModePreparationFailed(mode, message):
+			guard var session = state.recordingSession,
+				session.phase == .paused,
+				session.speakerMode == mode
+			else { return .none }
+			session.isPreparingSpeakerMode = false
+			session.isSpeakerModeReady = false
+			session.liveError = message
+			state.recordingSession = session
+			return .none
+
+		case .stopRecordingSession:
 			guard var session = state.recordingSession else { return .none }
+			switch session.phase {
+			case .recording:
+				session.pauseRecording(at: now)
+				session.phase = state.activeLiveTranscriptionEnabled ? .drainingForStop : .ended
+				state.recordingSession = session
+				return .send(.stopRecording)
+			case .paused:
+				let wasPreparingSpeakerMode = session.isPreparingSpeakerMode
+				session.isPreparingSpeakerMode = false
+				session.phase = .ended
+				state.recordingSession = session
+				return wasPreparingSpeakerMode ? .cancel(id: CancelID.liveTranscription) : .none
+			case .preparing:
+				session.phase = .ended
+				state.recordingSession = session
+				return .cancel(id: CancelID.liveTranscription)
+			case .drainingForPause, .drainingForStop, .ended, .endedWithError:
+				return .none
+			}
+
+		case let .generateRecordingSessionSummary(template):
+			guard var session = state.recordingSession, session.isEnded else { return .none }
 			let transcript = state.transcriptionHistory.history
 				.filter { $0.recordingSessionID == session.id }
 				.sorted { $0.timestamp < $1.timestamp }
@@ -787,6 +1014,9 @@ struct TranscriptionFeature {
 
       case .hotKeyPressed:
 		state.pendingPressAndHoldActivationID = nil
+		guard !state.hasActiveRecordingSession else {
+			return .cancel(id: CancelID.pendingPressAndHold)
+		}
 		// Start recording immediately. Selection detection is deliberately parallel:
 		// a missing selection must never delay dictation or trigger a synthetic Copy
 		// command's system error sound.
@@ -813,6 +1043,13 @@ struct TranscriptionFeature {
         // the delayed "startRecording" effect if we never actually started.
 		state.pendingPressAndHoldActivationID = nil
 		state.pendingTerminalRefinementID = nil
+		guard !state.hasActiveRecordingSession else {
+			return .merge(
+				.cancel(id: CancelID.pendingPressAndHold),
+				.cancel(id: CancelID.terminalRefinementHold),
+				.cancel(id: CancelID.screenAwareActivation)
+			)
+		}
 		if state.isScreenAwareModeActive {
 			return .merge(
 				.cancel(id: CancelID.pendingPressAndHold),
@@ -900,6 +1137,7 @@ struct TranscriptionFeature {
 					return .merge(cancelScreenAwareActivation, captureScreen)
 
 				case .finishRecordingWithRefinement:
+					guard !state.hasActiveRecordingSession else { return .none }
 				// A held terminal activation selects refinement while the regular hotkey
 				// still owns the recording. Preserve the original session's timing rules.
 				guard state.isRecording, state.activeRecordingSource == .regular else { return .none }
@@ -911,7 +1149,8 @@ struct TranscriptionFeature {
 					)
 
 				case .finishRecordingWithAgentHandoff:
-					guard state.hexSettings.agentHandoffEnabled,
+					guard !state.hasActiveRecordingSession,
+						state.hexSettings.agentHandoffEnabled,
 						state.isRecording,
 						state.activeRecordingSource == .regular
 					else { return .none }
@@ -929,7 +1168,8 @@ struct TranscriptionFeature {
 					)
 
 				case let .finishRecordingWithRewritePrompt(promptNumber):
-					guard state.isRecording,
+					guard !state.hasActiveRecordingSession,
+						state.isRecording,
 						state.activeRecordingSource == .regular,
 						let prompt = state.hexSettings.rewritePrompt(at: promptNumber)
 					else { return .none }
@@ -1007,6 +1247,7 @@ struct TranscriptionFeature {
 					return .send(.showError(message))
 
 				case .finishScreenAwareRecording:
+					guard !state.hasActiveRecordingSession else { return .none }
 					if state.isCapturingSelectedTextForRefinement {
 						deactivateScreenAwareMode(&state)
 						state.refinedHotKeyReleasedWhileCapturingSelection = true
@@ -1186,6 +1427,7 @@ struct TranscriptionFeature {
 		case .recordingStartFailed:
 			guard state.isRecording else { return .none }
 			if var session = state.recordingSession, session.phase == .recording {
+				session.pauseRecording(at: now)
 				session.phase = .paused
 				state.recordingSession = session
 			}
@@ -1200,6 +1442,7 @@ struct TranscriptionFeature {
 		case .recordingPermissionRequired:
 			guard state.isRecording else { return .none }
 			if var session = state.recordingSession, session.phase == .recording {
+				session.pauseRecording(at: now)
 				session.phase = .paused
 				state.recordingSession = session
 			}
@@ -1235,11 +1478,20 @@ struct TranscriptionFeature {
 			return .none
 
 		case let .recordingCheckpointStarted(checkpoint):
-			guard state.isRecording, state.hexSettings.saveTranscriptionHistory else { return .none }
+			guard state.isRecording else { return .none }
+			let isRecordingSession = state.recordingSession?.isRecording == true
+			guard state.hexSettings.saveTranscriptionHistory || isRecordingSession else { return .none }
 			guard state.activeHistoryTranscriptID == nil else { return .none }
-			let recordingSession = state.recordingSession?.isRecording == true
+			let recordingSession = isRecordingSession
 				? state.recordingSession
 				: nil
+			let liveSources: Set<TranscriptAudioSource> = state.activeSystemAudioEnabled
+				? [.microphone, .systemAudio]
+				: [.microphone]
+			let liveCheckpoint = LiveTranscriptCheckpoint(
+				sources: Dictionary(uniqueKeysWithValues: liveSources.map { ($0, .init()) }),
+				takeGeneration: checkpoint.sessionID
+			)
 			let transcript = Transcript(
 				timestamp: checkpoint.createdAt,
 				text: "",
@@ -1257,35 +1509,72 @@ struct TranscriptionFeature {
 				],
 				recoverySessionID: checkpoint.sessionID,
 				recordingSessionID: recordingSession?.id,
-				recordingSessionTitle: recordingSession?.title
+				recordingSessionTitle: recordingSession?.title,
+				sessionSpeakers: state.activeLiveTranscriptionEnabled ? [] : nil,
+				liveTranscriptCheckpoint: state.activeLiveTranscriptionEnabled ? liveCheckpoint : nil,
+				liveSpeakerIdentificationEnabled: state.activeLiveTranscriptionEnabled
+					? state.activeSpeakerIdentificationEnabled
+					: nil,
+				liveSpeakerDiarizationMode: state.activeLiveTranscriptionEnabled
+					? state.activeSpeakerDiarizationMode
+					: nil
 			)
 			state.activeHistoryTranscriptID = transcript.id
-			let artifactsToDelete = state.$transcriptionHistory.withLock { history -> [Transcript] in
-				var artifactsToDelete: [Transcript] = []
-				history.history.insert(transcript, at: 0)
-				if let maximumEntries = state.hexSettings.maxHistoryEntries, maximumEntries > 0 {
-					while history.history.count > maximumEntries,
-						  let index = history.history.lastIndex(where: { $0.recoverySessionID == nil }) {
-						let removedTranscript = history.history.remove(at: index)
-						if !history.history.contains(where: { $0.audioPath == removedTranscript.audioPath }) {
-							artifactsToDelete.append(removedTranscript)
-						}
-					}
-				}
-				return artifactsToDelete
+			if state.activeLiveTranscriptionEnabled {
+				state.liveTakeGeneration = checkpoint.sessionID
+				state.liveTranscriptCoordinator = LiveTranscriptCommitCoordinator(
+					mode: state.activeSpeakerDiarizationMode,
+					takeGeneration: checkpoint.sessionID,
+					checkpoint: liveCheckpoint,
+					sessionSpeakers: recordingSession?.sessionSpeakers ?? [],
+					engineSpeakerIDs: recordingSession?.engineSpeakerIDs ?? [:]
+				)
 			}
-			return .run { _ in
+			let artifactsToDelete: [Transcript]
+			do {
+				artifactsToDelete = try durablyMutateHistory(
+					state.$transcriptionHistory,
+					persistence: liveHistoryPersistence
+				) { history in
+					history.history.insert(transcript, at: 0)
+					if let maximumEntries = state.hexSettings.maxHistoryEntries, maximumEntries > 0 {
+						return pruneHistoryToLogicalLimit(&history.history, maximumEntries: maximumEntries)
+					}
+					return []
+				}
+			} catch {
+				state.activeHistoryTranscriptID = nil
+				state.activeLiveTranscriptionEnabled = false
+				state.liveTakeGeneration = nil
+				state.liveTranscriptCoordinator = nil
+				return .merge(
+					.cancel(id: CancelID.liveTranscription),
+					.send(.showError("Recording history could not be saved: \(error.localizedDescription)")),
+					.send(.pauseRecordingSession)
+				)
+			}
+			let cleanup = Effect<Action>.run { _ in
 				for transcript in artifactsToDelete {
 					try? await transcriptPersistence.deleteArtifacts(transcript)
 				}
 			}
+			return state.activeLiveTranscriptionEnabled
+				? .merge(cleanup, .send(.startLiveTranscription(checkpoint)))
+				: cleanup
 
 		case let .recordingCheckpointFinalized(audioURL, duration, status):
 			guard let historyID = state.activeHistoryTranscriptID else { return .none }
 			let minimumDuration = max(state.hexSettings.minimumKeyTime, 1.0)
 			if status == .cancelled, duration < minimumDuration {
-				state.$transcriptionHistory.withLock { history in
-					history.history.removeAll { $0.id == historyID }
+				do {
+					try durablyMutateHistory(
+						state.$transcriptionHistory,
+						persistence: liveHistoryPersistence
+					) { history in
+						history.history.removeAll { $0.id == historyID }
+					}
+				} catch {
+					return .send(.showError("Recording history could not be saved: \(error.localizedDescription)"))
 				}
 				state.activeHistoryTranscriptID = nil
 				return .run { [recording] _ in
@@ -1294,7 +1583,11 @@ struct TranscriptionFeature {
 				}
 			}
 
-			state.$transcriptionHistory.withLock { history in
+			do {
+				try durablyMutateHistory(
+					state.$transcriptionHistory,
+					persistence: liveHistoryPersistence
+				) { history in
 				guard let index = history.history.firstIndex(where: { $0.id == historyID }) else { return }
 				history.history[index].audioPath = audioURL
 				history.history[index].duration = duration
@@ -1306,6 +1599,13 @@ struct TranscriptionFeature {
 				// The final WAV is durable now, so this ordinary run can participate in
 				// regular retention instead of being treated as an unresolved crash recovery.
 				history.history[index].recoverySessionID = nil
+				}
+			} catch {
+				let message = "Recording history could not be saved: \(error.localizedDescription)"
+				if let takeGeneration = state.liveTakeGeneration {
+					return .send(.liveTranscriptionEvent(.failed(takeGeneration, message)))
+				}
+				return .send(.showError(message))
 			}
 			if status != .processing {
 				state.activeHistoryTranscriptID = nil
@@ -1328,6 +1628,50 @@ struct TranscriptionFeature {
 			)
 			return .none
 
+		case .systemAudioCaptureFailed:
+			state.activeSystemAudioEnabled = false
+			state.liveTranscriptCoordinator?.removeSource(.systemAudio)
+			if let historyID = state.activeHistoryTranscriptID {
+				do {
+					try durablyMutateHistory(
+						state.$transcriptionHistory,
+						persistence: liveHistoryPersistence
+					) { history in
+						guard let index = history.history.firstIndex(where: { $0.id == historyID }) else { return }
+						history.history[index].liveTranscriptCheckpoint?.sources.removeValue(forKey: .systemAudio)
+					}
+				} catch {
+					let message = "Recording history could not be saved: \(error.localizedDescription)"
+					if let takeGeneration = state.liveTakeGeneration {
+						return .send(.liveTranscriptionEvent(.failed(takeGeneration, message)))
+					}
+					return .send(.showError(message))
+				}
+			}
+			return .none
+
+		case let .systemAudioCaptureEndedWithError(message):
+			if let historyID = state.activeHistoryTranscriptID {
+				do {
+					try durablyMutateHistory(
+						state.$transcriptionHistory,
+						persistence: liveHistoryPersistence
+					) { history in
+						guard let index = history.history.firstIndex(where: { $0.id == historyID }) else { return }
+						history.history[index].processingErrors = (history.history[index].processingErrors ?? []) + [
+							.init(stage: .audio, message: message)
+						]
+					}
+				} catch {
+					return .send(.showError("Recording history could not be saved: \(error.localizedDescription)"))
+				}
+			}
+			if var session = state.recordingSession {
+				session.liveError = message
+				state.recordingSession = session
+			}
+			return .none
+
 		case let .systemAudioCaptured(audioURL, duration, startOffset):
 			guard let historyID = state.activeHistoryTranscriptID else { return .none }
 			state.$transcriptionHistory.withLock { history in
@@ -1343,8 +1687,517 @@ struct TranscriptionFeature {
 					)
 				]
 				channels.removeAll { $0.source == .systemAudio }
-				channels.append(.init(source: .systemAudio, audioPath: audioURL, duration: duration, startOffset: startOffset))
+				let systemSections = history.history[index].timestampedSections?.filter { $0.audioSource == .systemAudio }
+				channels.append(.init(
+					source: .systemAudio,
+					audioPath: audioURL,
+					duration: duration,
+					startOffset: startOffset,
+					text: TimestampedTranscriptSectionBuilder.renderedText(from: systemSections ?? []),
+					timestampedSections: systemSections,
+					liveCheckpoint: history.history[index].liveTranscriptCheckpoint?.sources[.systemAudio]
+				))
 				history.history[index].audioChannels = channels
+			}
+			return .none
+
+		case let .startLiveTranscription(checkpoint):
+			guard let session = state.recordingSession,
+				state.activeLiveTranscriptionEnabled,
+				state.liveTakeGeneration == checkpoint.sessionID
+			else { return .none }
+			@Shared(.speakerVoiceLibrary) var voiceLibrary: SpeakerVoiceLibrary
+			let profiles = $voiceLibrary.withLock { $0.profiles }
+			let sources: Set<TranscriptAudioSource> = state.activeSystemAudioEnabled
+				? [.microphone, .systemAudio]
+				: [.microphone]
+			let configuration = LiveTranscriptionConfiguration(
+				modelName: LiveTranscriptionConfiguration.defaultModelName,
+				sessionID: session.id,
+				takeGeneration: checkpoint.sessionID,
+				sources: sources,
+				speakerIdentificationEnabled: state.activeSpeakerIdentificationEnabled,
+				speakerMode: state.activeSpeakerDiarizationMode,
+				profiles: profiles
+			)
+			return .run { [liveTranscription, recording, systemAudioCapture] send in
+				do {
+					let events = try await liveTranscription.start(configuration)
+					await withTaskGroup(of: Void.self) { group in
+						group.addTask {
+							let chunks = await recording.observeAudioChunks()
+							for await chunk in chunks where chunk.takeGeneration == checkpoint.sessionID {
+								guard !Task.isCancelled else { return }
+								do { try await liveTranscription.sendAudio(chunk) }
+								catch { await send(.liveTranscriptionEvent(.failed(checkpoint.sessionID, error.localizedDescription))) }
+							}
+						}
+						if sources.contains(.systemAudio) {
+							group.addTask {
+								let chunks = await systemAudioCapture.observeAudioChunks()
+								for await chunk in chunks where chunk.takeGeneration == checkpoint.sessionID {
+									guard !Task.isCancelled else { return }
+									do { try await liveTranscription.sendAudio(chunk) }
+									catch { await send(.liveTranscriptionEvent(.failed(checkpoint.sessionID, error.localizedDescription))) }
+								}
+							}
+						}
+						for await event in events {
+							await send(.liveTranscriptionEvent(event))
+						}
+						group.cancelAll()
+					}
+				} catch is CancellationError {
+					return
+				} catch {
+					await send(.liveTranscriptionEvent(.failed(checkpoint.sessionID, error.localizedDescription)))
+				}
+			}
+			.cancellable(id: CancelID.liveTranscription, cancelInFlight: true)
+
+		case let .liveTranscriptionEvent(event):
+			switch event {
+			case let .backlog(backlog):
+				guard var session = state.recordingSession, state.liveTakeGeneration != nil else { return .none }
+				session.liveBacklog = backlog
+				state.recordingSession = session
+				return .none
+
+			case let .hypothesis(hypothesis):
+				guard hypothesis.takeGeneration == state.liveTakeGeneration,
+					var coordinator = state.liveTranscriptCoordinator,
+					let historyID = state.activeHistoryTranscriptID
+				else { return .none }
+				let coordinatorBeforeCommit = coordinator
+				let isDraining = state.recordingSession?.isDraining == true
+				guard let commit = coordinator.ingest(hypothesis, isDraining: isDraining) else {
+					state.liveTranscriptCoordinator = coordinator
+					return .none
+				}
+				state.liveTranscriptCoordinator = coordinator
+				@Shared(.speakerVoiceLibrary) var voiceLibrary: SpeakerVoiceLibrary
+				let profileNames = $voiceLibrary.withLock { library in
+					Dictionary(uniqueKeysWithValues: library.profiles.map { ($0.id, $0.name) })
+				}
+				let persistedSpeakerNames = Dictionary(
+					state.transcriptionHistory.history
+						.flatMap { $0.sessionSpeakers ?? [] }
+						.compactMap { speaker in
+							speaker.lastKnownProfileName.map { (speaker.id, $0) }
+						},
+					uniquingKeysWith: { current, _ in current }
+				)
+				let committedSpeakers = commit.sessionSpeakers.map { speaker in
+					var speaker = speaker
+					if let profileID = speaker.profileID, let name = profileNames[profileID] {
+						speaker.lastKnownProfileName = name
+					} else if speaker.profileID != nil {
+						speaker.lastKnownProfileName = speaker.lastKnownProfileName ?? persistedSpeakerNames[speaker.id]
+						speaker.profileID = nil
+					}
+					return speaker
+				}
+				do {
+					try durablyMutateHistory(
+						state.$transcriptionHistory,
+						persistence: liveHistoryPersistence
+					) { history in
+					guard let index = history.history.firstIndex(where: { $0.id == historyID }) else { return }
+					var transcript = history.history[index]
+					var sections = transcript.timestampedSections ?? []
+					let existingSequences = Set(sections.compactMap(\.commitSequence))
+					sections.append(contentsOf: commit.sections.filter {
+						guard let sequence = $0.commitSequence else { return true }
+						return !existingSequences.contains(sequence)
+					})
+					transcript.timestampedSections = sections
+					transcript.rawText = TimestampedTranscriptSectionBuilder.renderedText(from: sections)
+					transcript.text = transcript.rawText ?? ""
+					transcript.sessionSpeakers = committedSpeakers
+					transcript.liveTranscriptCheckpoint = commit.checkpoint
+					let newSpeakerSegments = commit.speakerSegments.values.flatMap { $0 }
+					transcript.speakerSegments = appendUniqueSpeakerSegments(
+						newSpeakerSegments,
+						to: transcript.speakerSegments ?? []
+					)
+					if var channels = transcript.audioChannels {
+						for channelIndex in channels.indices {
+							let source = channels[channelIndex].source
+							let channelSections = sections.filter { $0.audioSource == source }
+							channels[channelIndex].timestampedSections = channelSections
+							channels[channelIndex].text = TimestampedTranscriptSectionBuilder.renderedText(from: channelSections)
+							channels[channelIndex].liveCheckpoint = commit.checkpoint.sources[source]
+							channels[channelIndex].speakerSegments = appendUniqueSpeakerSegments(
+								commit.speakerSegments[source] ?? [],
+								to: channels[channelIndex].speakerSegments ?? []
+							)
+						}
+						transcript.audioChannels = channels
+					}
+					history.history[index] = transcript
+					if let sessionID = transcript.recordingSessionID {
+						for otherIndex in history.history.indices where history.history[otherIndex].recordingSessionID == sessionID {
+							history.history[otherIndex].sessionSpeakers = mergeSessionSpeakers(
+								committedSpeakers,
+								into: history.history[otherIndex].sessionSpeakers ?? []
+							)
+						}
+					}
+					}
+				} catch {
+					state.liveTranscriptCoordinator = coordinatorBeforeCommit
+					state.liveSourcesNeedingFileRecovery.insert(hypothesis.source)
+					return .send(.liveTranscriptionEvent(.failed(
+						hypothesis.takeGeneration,
+						"Recording history could not be saved: \(error.localizedDescription)"
+					)))
+				}
+				if !commit.sections.isEmpty, var session = state.recordingSession {
+					session.hasCommittedLiveTranscript = true
+					session.sessionSpeakers = committedSpeakers
+					session.engineSpeakerIDs = coordinator.engineSpeakerIDs
+					session.liveBacklog = max(0, session.liveBacklog - 1)
+					state.recordingSession = session
+				}
+				return .none
+
+			case let .speakerWarning(takeGeneration, source, message):
+				guard takeGeneration == state.liveTakeGeneration else { return .none }
+				let warning = "Speaker identification stopped for \(source.displayName): \(message)"
+				if let historyID = state.activeHistoryTranscriptID {
+					state.$transcriptionHistory.withLock { history in
+						guard let index = history.history.firstIndex(where: { $0.id == historyID }) else { return }
+						history.history[index].processingErrors = (history.history[index].processingErrors ?? []) + [
+							.init(stage: .processing, message: warning)
+						]
+					}
+				}
+				if var session = state.recordingSession {
+					session.liveError = warning
+					state.recordingSession = session
+				}
+				return .none
+
+			case let .sourceDiscontinuity(takeGeneration, source, _):
+				guard takeGeneration == state.liveTakeGeneration else { return .none }
+				state.liveSourcesNeedingFileRecovery.insert(source)
+				if var session = state.recordingSession {
+					session.liveBacklog = max(session.liveBacklog, 20)
+					session.liveError = "Live processing fell behind on \(source.displayName). The durable audio tail will be recovered when this take pauses."
+					state.recordingSession = session
+				}
+				return .none
+
+			case let .drained(takeGeneration):
+				guard takeGeneration == state.liveTakeGeneration else { return .none }
+				var shouldReleaseLiveSession = false
+				if let historyID = state.activeHistoryTranscriptID {
+					state.$transcriptionHistory.withLock { history in
+						guard let index = history.history.firstIndex(where: { $0.id == historyID }) else { return }
+						history.history[index].status = .completed
+						history.history[index].recoverySessionID = nil
+						history.history[index].liveTranscriptCheckpoint?.drainState = .drained
+					}
+				}
+				state.activeHistoryTranscriptID = nil
+				state.liveTakeGeneration = nil
+				state.liveTranscriptCoordinator = nil
+				state.liveSourcesNeedingFileRecovery = []
+				state.isTranscribing = false
+				if var session = state.recordingSession {
+					switch session.phase {
+					case .drainingForStop:
+						session.phase = .ended
+						shouldReleaseLiveSession = true
+					case .drainingForPause: session.phase = .paused
+					default: break
+					}
+					session.liveBacklog = 0
+					state.recordingSession = session
+				}
+				return shouldReleaseLiveSession
+					? .run { [liveTranscription] _ in await liveTranscription.cancel() }
+					: .none
+
+			case let .failed(takeGeneration, message):
+				guard takeGeneration == state.liveTakeGeneration else { return .none }
+				if let historyID = state.activeHistoryTranscriptID {
+					state.$transcriptionHistory.withLock { history in
+						guard let index = history.history.firstIndex(where: { $0.id == historyID }) else { return }
+						history.history[index].processingErrors = (history.history[index].processingErrors ?? []) + [
+							.init(stage: .transcription, message: message)
+						]
+						history.history[index].liveTranscriptCheckpoint?.drainState = .failed
+					}
+				}
+				if var session = state.recordingSession {
+					session.liveError = message
+					if session.isDraining { session.phase = .endedWithError }
+					state.recordingSession = session
+				}
+				if state.recordingSession?.isEnded == true {
+					state.activeHistoryTranscriptID = nil
+					state.liveTakeGeneration = nil
+					state.liveTranscriptCoordinator = nil
+					state.liveSourcesNeedingFileRecovery = []
+					state.isTranscribing = false
+				}
+				return state.isRecording
+					? .merge(.send(.showError(message)), .send(.pauseRecordingSession))
+					: .send(.showError(message))
+			}
+
+		case let .recoverLiveTranscriptTails(historyIDs):
+			guard !historyIDs.isEmpty else { return .none }
+			return .run { [liveTranscription] send in
+				for historyID in historyIDs {
+					guard !Task.isCancelled else { return }
+					@Shared(.transcriptionHistory) var history: TranscriptionHistory
+					guard let transcript = $history.withLock({ history in
+						history.history.first(where: { $0.id == historyID })
+					}),
+						var checkpoint = transcript.liveTranscriptCheckpoint,
+						[.active, .drainingForPause, .drainingForStop].contains(checkpoint.drainState)
+					else { continue }
+
+					let channels = (transcript.audioChannels ?? [
+						.init(
+							source: .microphone,
+							audioPath: transcript.audioPath,
+							duration: transcript.duration
+						)
+					]).filter { FileManager.default.fileExists(atPath: $0.audioPath.path) }
+					guard !channels.isEmpty else {
+						await send(.liveRecoveryFailed(historyID, "The recovered live-transcription audio is unavailable."))
+						continue
+					}
+					let availableSources = Set(channels.map(\.source))
+					let missingSources = Set(checkpoint.sources.keys).subtracting(availableSources)
+					guard missingSources.isEmpty else {
+						let names = missingSources.map(\.displayName).sorted().joined(separator: ", ")
+						await send(.liveRecoveryFailed(
+							historyID,
+							"The recovered \(names) audio is unavailable, so the live tail could not be committed safely."
+						))
+						continue
+					}
+
+					checkpoint.drainState = .drainingForStop
+					let mode = transcript.liveSpeakerDiarizationMode ?? .highAccuracyFour
+					let speakerIdentificationEnabled = transcript.liveSpeakerIdentificationEnabled ?? false
+					@Shared(.speakerVoiceLibrary) var voiceLibrary: SpeakerVoiceLibrary
+					let profiles = $voiceLibrary.withLock { $0.profiles }
+					let configuration = LiveTranscriptionConfiguration(
+						modelName: LiveTranscriptionConfiguration.defaultModelName,
+						sessionID: transcript.recordingSessionID ?? checkpoint.takeGeneration,
+						takeGeneration: checkpoint.takeGeneration,
+						sources: Set(channels.map(\.source)),
+						speakerIdentificationEnabled: speakerIdentificationEnabled,
+						speakerMode: mode,
+						profiles: profiles,
+						isRecovery: true
+					)
+					var coordinator = LiveTranscriptCommitCoordinator(
+						mode: mode,
+						takeGeneration: checkpoint.takeGeneration,
+						checkpoint: checkpoint,
+						sessionSpeakers: transcript.sessionSpeakers ?? []
+					)
+					coordinator.setDrainState(.drainingForStop)
+
+					do {
+						let events = try await liveTranscription.start(configuration)
+						let feedTask = Task {
+							do {
+								for channel in channels.sorted(by: { $0.source.rawValue < $1.source.rawValue }) {
+									let committed = checkpoint.sources[channel.source]?.committedThroughSample ?? 0
+									try await liveTranscription.sendAudioFileTail(
+										channel.audioPath,
+										channel.source,
+										checkpoint.takeGeneration,
+										channel.startOffset,
+										committed
+									)
+								}
+								await liveTranscription.finish(checkpoint.takeGeneration, true)
+							} catch {
+								await send(.liveRecoveryFailed(historyID, error.localizedDescription))
+								await liveTranscription.cancel()
+								throw error
+							}
+						}
+
+						recoveryEvents: for await event in events {
+							switch event {
+							case let .hypothesis(hypothesis):
+								if let commit = coordinator.ingest(hypothesis, isDraining: true) {
+									await send(.liveRecoveryCommit(historyID, commit))
+								}
+							case .backlog:
+								continue
+							case .sourceDiscontinuity:
+								continue
+							case let .speakerWarning(_, source, message):
+								await send(.liveRecoveryWarning(
+									historyID,
+									"Speaker identification stopped for \(source.displayName): \(message)"
+								))
+							case .drained:
+								await send(.liveRecoveryCompleted(historyID))
+								break recoveryEvents
+							case let .failed(_, message):
+								feedTask.cancel()
+								await send(.liveRecoveryFailed(historyID, message))
+								break recoveryEvents
+							}
+						}
+						_ = try? await feedTask.value
+					} catch is CancellationError {
+						await liveTranscription.cancel()
+						return
+					} catch {
+						await send(.liveRecoveryFailed(historyID, error.localizedDescription))
+					}
+					await liveTranscription.cancel()
+				}
+			}
+			.cancellable(id: CancelID.liveRecovery, cancelInFlight: true)
+
+		case let .liveRecoveryCommit(historyID, commit):
+			@Shared(.speakerVoiceLibrary) var voiceLibrary: SpeakerVoiceLibrary
+			let profileNames = $voiceLibrary.withLock { library in
+				Dictionary(uniqueKeysWithValues: library.profiles.map { ($0.id, $0.name) })
+			}
+			let recoveredSpeakers = commit.sessionSpeakers.map { speaker in
+				var speaker = speaker
+				if let profileID = speaker.profileID, let name = profileNames[profileID] {
+					speaker.lastKnownProfileName = name
+				} else if speaker.profileID != nil {
+					speaker.profileID = nil
+				}
+				return speaker
+			}
+			do {
+				try durablyMutateHistory(
+					state.$transcriptionHistory,
+					persistence: liveHistoryPersistence
+				) { history in
+				guard let index = history.history.firstIndex(where: { $0.id == historyID }) else { return }
+				var transcript = history.history[index]
+				var sections = transcript.timestampedSections ?? []
+				let existingSequences = Set(sections.compactMap(\.commitSequence))
+				sections.append(contentsOf: commit.sections.filter {
+					guard let sequence = $0.commitSequence else { return true }
+					return !existingSequences.contains(sequence)
+				})
+				transcript.timestampedSections = sections
+				transcript.rawText = TimestampedTranscriptSectionBuilder.renderedText(from: sections)
+				transcript.text = transcript.rawText ?? ""
+				transcript.sessionSpeakers = recoveredSpeakers
+				transcript.liveTranscriptCheckpoint = commit.checkpoint
+				transcript.speakerSegments = appendUniqueSpeakerSegments(
+					commit.speakerSegments.values.flatMap { $0 },
+					to: transcript.speakerSegments ?? []
+				)
+				if var channels = transcript.audioChannels {
+					for channelIndex in channels.indices {
+						let source = channels[channelIndex].source
+						let channelSections = sections.filter { $0.audioSource == source }
+						channels[channelIndex].timestampedSections = channelSections
+						channels[channelIndex].text = TimestampedTranscriptSectionBuilder.renderedText(from: channelSections)
+						channels[channelIndex].liveCheckpoint = commit.checkpoint.sources[source]
+						channels[channelIndex].speakerSegments = appendUniqueSpeakerSegments(
+							commit.speakerSegments[source] ?? [],
+							to: channels[channelIndex].speakerSegments ?? []
+						)
+					}
+					transcript.audioChannels = channels
+				}
+				history.history[index] = transcript
+				if let sessionID = transcript.recordingSessionID {
+					for otherIndex in history.history.indices where history.history[otherIndex].recordingSessionID == sessionID {
+						history.history[otherIndex].sessionSpeakers = mergeSessionSpeakers(
+							recoveredSpeakers,
+							into: history.history[otherIndex].sessionSpeakers ?? []
+						)
+					}
+				}
+			}
+			} catch {
+				return .send(.liveRecoveryFailed(
+					historyID,
+					"Recovered transcription could not be saved: \(error.localizedDescription)"
+				))
+			}
+			if state.activeHistoryTranscriptID == historyID, var session = state.recordingSession {
+				session.sessionSpeakers = recoveredSpeakers
+				if !commit.sections.isEmpty { session.hasCommittedLiveTranscript = true }
+				state.recordingSession = session
+			}
+			return .none
+
+		case let .liveRecoveryCompleted(historyID):
+			state.$transcriptionHistory.withLock { history in
+				guard let index = history.history.firstIndex(where: { $0.id == historyID }) else { return }
+				history.history[index].status = .completed
+				history.history[index].recoverySessionID = nil
+				history.history[index].liveTranscriptCheckpoint?.drainState = .drained
+			}
+			if state.activeHistoryTranscriptID == historyID {
+				state.activeHistoryTranscriptID = nil
+				state.liveTakeGeneration = nil
+				state.liveTranscriptCoordinator = nil
+				state.liveSourcesNeedingFileRecovery = []
+				state.isTranscribing = false
+				if var session = state.recordingSession {
+					switch session.phase {
+					case .drainingForStop: session.phase = .ended
+					case .drainingForPause: session.phase = .paused
+					default: break
+					}
+					session.liveBacklog = 0
+					session.liveError = nil
+					session.engineSpeakerIDs = [:]
+					state.recordingSession = session
+				}
+			}
+			return .none
+
+		case let .liveRecoveryWarning(historyID, message):
+			state.$transcriptionHistory.withLock { history in
+				guard let index = history.history.firstIndex(where: { $0.id == historyID }) else { return }
+				history.history[index].processingErrors = (history.history[index].processingErrors ?? []) + [
+					.init(stage: .processing, message: message)
+				]
+			}
+			return .none
+
+		case let .liveRecoveryFailed(historyID, message):
+			state.$transcriptionHistory.withLock { history in
+				guard let index = history.history.firstIndex(where: { $0.id == historyID }) else { return }
+				history.history[index].status = .failed
+				history.history[index].recoverySessionID = nil
+				history.history[index].liveTranscriptCheckpoint?.drainState = .failed
+				let alreadyRecorded = history.history[index].processingErrors?.contains {
+					$0.stage == .transcription && $0.message == message
+				} == true
+				if !alreadyRecorded {
+					history.history[index].processingErrors = (history.history[index].processingErrors ?? []) + [
+						.init(stage: .transcription, message: message)
+					]
+				}
+			}
+			if state.activeHistoryTranscriptID == historyID {
+				state.activeHistoryTranscriptID = nil
+				state.liveTakeGeneration = nil
+				state.liveTranscriptCoordinator = nil
+				state.liveSourcesNeedingFileRecovery = []
+				state.isTranscribing = false
+				if var session = state.recordingSession {
+					session.phase = .endedWithError
+					session.liveError = message
+					state.recordingSession = session
+				}
 			}
 			return .none
 
@@ -1354,18 +2207,11 @@ struct TranscriptionFeature {
 			// row in this reducer turn so the transcript, screenshot, result, cancellation,
 			// or error actions that follow can always update the same durable run.
 			let artifactsToDelete = state.$transcriptionHistory.withLock { history -> [Transcript] in
-				var artifactsToDelete: [Transcript] = []
 				history.history.insert(transcript, at: 0)
 				if let maximumEntries = state.hexSettings.maxHistoryEntries, maximumEntries > 0 {
-					while history.history.count > maximumEntries,
-						  let index = history.history.lastIndex(where: { $0.recoverySessionID == nil }) {
-						let removedTranscript = history.history.remove(at: index)
-						if !history.history.contains(where: { $0.audioPath == removedTranscript.audioPath }) {
-							artifactsToDelete.append(removedTranscript)
-						}
-					}
+					return pruneHistoryToLogicalLimit(&history.history, maximumEntries: maximumEntries)
 				}
-				return artifactsToDelete
+				return []
 			}
 			return .run { [recording] _ in
 				for transcript in artifactsToDelete {
@@ -1677,6 +2523,7 @@ struct TranscriptionFeature {
 				state.agentHandoffPresentation = nil
 				return .cancel(id: CancelID.agentHandoffPresentation)
 			}
+			guard !state.hasActiveRecordingSession else { return .none }
         // Only cancel if we're in the middle of recording, transcribing, or post-processing
         guard state.isRecording || state.isTranscribing || state.isRefining || state.isCapturingSelectedTextForRefinement else {
           return .none
@@ -1685,13 +2532,14 @@ struct TranscriptionFeature {
 
       case .discard:
         // Silent discard for quick/accidental recordings
-        guard state.isRecording else {
+		guard !state.hasActiveRecordingSession, state.isRecording else {
           return .none
         }
         return handleDiscard(&state)
 
 		case let .hotKeyCancelled(source):
-			guard state.activeRecordingSource == source
+			guard !state.hasActiveRecordingSession,
+				state.activeRecordingSource == source
 				|| (source == .refined && state.isCapturingSelectedTextForRefinement)
 			else { return .none }
 			if state.isRecording,
@@ -1713,7 +2561,10 @@ struct TranscriptionFeature {
 			return .none
 
 		case let .hotKeyDiscarded(source):
-			guard state.activeRecordingSource == source, state.isRecording else { return .none }
+			guard !state.hasActiveRecordingSession,
+				state.activeRecordingSource == source,
+				state.isRecording
+			else { return .none }
 			return handleDiscard(&state)
       }
     }
@@ -2039,6 +2890,49 @@ private extension TranscriptionFeature {
 // MARK: - Recording Handlers
 
 private extension TranscriptionFeature {
+	func prepareSpeakerDiarizationModeEffect(_ mode: SpeakerDiarizationMode) -> Effect<Action> {
+		.run { [liveTranscription] send in
+			do {
+				try await liveTranscription.prepareSpeakerMode(mode)
+				await send(.recordingSessionSpeakerModePrepared(mode))
+			} catch is CancellationError {
+				return
+			} catch {
+				await send(.recordingSessionSpeakerModePreparationFailed(mode, error.localizedDescription))
+			}
+		}
+		.cancellable(id: CancelID.liveTranscription, cancelInFlight: true)
+	}
+
+	func prepareRecordingSessionEffect(_ session: RecordingSession?) -> Effect<Action> {
+		guard let session else { return .none }
+		guard session.liveTranscriptionEnabled || session.speakerIdentificationEnabled else {
+			return .send(.recordingSessionModelsReady)
+		}
+		let liveTranscriptionEnabled = session.liveTranscriptionEnabled
+		let speakerIdentificationEnabled = session.speakerIdentificationEnabled
+		let speakerMode = session.speakerMode
+		return .run { [liveTranscription, liveTranscriptionEnabled, speakerIdentificationEnabled, speakerMode] send in
+			do {
+				if liveTranscriptionEnabled {
+					try await liveTranscription.prepare(
+						LiveTranscriptionConfiguration.defaultModelName,
+						speakerIdentificationEnabled ? speakerMode : nil
+					)
+				} else if speakerIdentificationEnabled {
+					try await liveTranscription.prepareSpeakerMode(speakerMode)
+				}
+				try Task.checkCancellation()
+				await send(.recordingSessionModelsReady)
+			} catch is CancellationError {
+				return
+			} catch {
+				await send(.recordingSessionModelPreparationFailed(error.localizedDescription))
+			}
+		}
+		.cancellable(id: CancelID.liveTranscription, cancelInFlight: true)
+	}
+
 	func deactivateScreenAwareMode(_ state: inout State) {
 		guard state.isScreenAwareModeActive else { return }
 		state.isScreenAwareModeActive = false
@@ -2051,7 +2945,9 @@ private extension TranscriptionFeature {
 	cancelsScreenContextCapture: Bool = true
   ) -> Effect<Action> {
     guard !state.isRecording else { return .none }
-    guard state.modelBootstrapState.isModelReady else {
+	let startsLiveRecordingSession = state.recordingSession?.isRecording == true
+		&& state.recordingSession?.liveTranscriptionEnabled == true
+    guard startsLiveRecordingSession || state.modelBootstrapState.isModelReady else {
 		let selectedText = state.selectedTextForRefinement
 		state.selectedTextForRefinement = nil
       return .merge(
@@ -2095,6 +2991,12 @@ private extension TranscriptionFeature {
 			?? state.hexSettings.speakerIdentificationEnabled
 		state.activeSystemAudioEnabled = recordingSession?.systemAudioEnabled
 			?? state.hexSettings.includeSystemAudio
+		state.activeLiveTranscriptionEnabled = recordingSession?.liveTranscriptionEnabled ?? false
+		state.activeSpeakerDiarizationMode = recordingSession?.speakerMode
+			?? .highAccuracyFour
+		state.liveTranscriptCoordinator = nil
+		state.liveTakeGeneration = nil
+		state.liveSourcesNeedingFileRecovery = []
 		state.activeSystemAudioStartOffset = 0
     let startTime = now
     state.recordingStartTime = startTime
@@ -2139,8 +3041,10 @@ private extension TranscriptionFeature {
 					case let .started(startedAt):
 						await send(.systemAudioCaptureStarted(startedAt))
 					case .permissionDenied:
+						await send(.systemAudioCaptureFailed)
 						await send(.showError("System audio needs Screen Recording permission. Microphone recording will continue."))
 					case .failed:
+						await send(.systemAudioCaptureFailed)
 						await send(.showError("System audio could not be started. Microphone recording will continue."))
 					}
 				}
@@ -2206,6 +3110,10 @@ private extension TranscriptionFeature {
 		state.isAgentHandoffRequestedForActiveRecording = false
 		state.activeSystemAudioEnabled = false
 		state.activeSystemAudioStartOffset = 0
+		let shouldCancelLiveTranscription = state.liveTakeGeneration != nil
+		state.liveTakeGeneration = nil
+		state.liveTranscriptCoordinator = nil
+		state.liveSourcesNeedingFileRecovery = []
       // Recording was below minimum duration. If it captured at least 1.0s of audio we still
       // persist it as a cancelled entry so the user can retry; otherwise discard silently
       // (covers accidental modifier-only taps).
@@ -2217,6 +3125,9 @@ private extension TranscriptionFeature {
 	      return .merge(
 	        .cancel(id: CancelID.recordingStart),
 			.cancel(id: CancelID.screenContextCapture),
+			shouldCancelLiveTranscription
+				? .run { [liveTranscription] _ in await liveTranscription.cancel() }
+				: .none,
 		.run { [duration, sleepManagement, includeSystemAudio] send in
 			await selectedText?.cancel()
 			await sleepManagement.allowSleep()
@@ -2255,7 +3166,7 @@ private extension TranscriptionFeature {
     }
 
     let model = state.hexSettings.selectedModel
-    guard !model.isEmpty else {
+	guard state.activeLiveTranscriptionEnabled || !model.isEmpty else {
       // Defense-in-depth: handleStartRecording already blocks recording when the
       // bootstrap state says no model is ready, but settings can change while a
       // recording is in flight (or the in-memory bootstrap default can race a
@@ -2268,13 +3179,76 @@ private extension TranscriptionFeature {
       )
     }
 
+	if state.activeLiveTranscriptionEnabled,
+		let takeGeneration = state.liveTakeGeneration,
+		state.recordingSession != nil
+	{
+		state.isTranscribing = true
+		state.error = nil
+		let drainState: LiveTranscriptDrainState = state.recordingSession?.phase == .drainingForStop
+			? .drainingForStop
+			: .drainingForPause
+		state.liveTranscriptCoordinator?.setDrainState(drainState)
+		if let historyID = state.activeHistoryTranscriptID {
+			state.$transcriptionHistory.withLock { history in
+				guard let index = history.history.firstIndex(where: { $0.id == historyID }) else { return }
+				history.history[index].liveTranscriptCheckpoint?.drainState = drainState
+			}
+		}
+		let systemAudioStartOffset = state.activeSystemAudioStartOffset
+		let endsLiveSession = state.recordingSession?.phase == .drainingForStop
+		let requiresFileRecovery = !state.liveSourcesNeedingFileRecovery.isEmpty
+		let liveHistoryID = state.activeHistoryTranscriptID
+		return .merge(
+			.cancel(id: CancelID.recordingStart),
+			.run { [duration, endsLiveSession, includeSystemAudio, liveHistoryID, liveTranscription, recording, requiresFileRecovery, systemAudioCapture, sleepManagement] send in
+				await sleepManagement.allowSleep()
+				let systemAudioResult = includeSystemAudio
+					? await systemAudioCapture.stopCapture()
+					: .ignored(.noActiveCapture)
+				let stopResult = await recording.stopRecording()
+				switch stopResult {
+				case let .captured(url):
+					await send(.recordingCheckpointFinalized(url, duration, .processing))
+				case let .recovered(url, error):
+					await send(.recordingCheckpointFinalized(url, duration, .processing))
+					await send(.liveTranscriptionEvent(.failed(takeGeneration, error.localizedDescription)))
+					return
+				case .ignored(.staleSession):
+					return
+				case .ignored(.noActiveRecording):
+					await send(.liveTranscriptionEvent(.failed(takeGeneration, RecordingFailure.noCapturedAudio.localizedDescription)))
+					return
+				case let .failed(error):
+					await send(.liveTranscriptionEvent(.failed(takeGeneration, error.localizedDescription)))
+					return
+				}
+				if case let .captured(url, systemDuration) = systemAudioResult {
+					await send(.systemAudioCaptured(url, systemDuration, startOffset: systemAudioStartOffset))
+				} else if case let .failed(message) = systemAudioResult {
+					transcriptionFeatureLogger.warning(
+						"Live system audio capture ended with an error: \(message, privacy: .private)"
+					)
+					await send(.systemAudioCaptureEndedWithError(message))
+				}
+				soundEffect.play(.stopRecording)
+				if requiresFileRecovery, let liveHistoryID {
+					await send(.recoverLiveTranscriptTails([liveHistoryID]))
+				} else {
+					await liveTranscription.finish(takeGeneration, endsLiveSession)
+				}
+			}
+			.cancellable(id: CancelID.recordingFinalize)
+		)
+	}
+
     // Otherwise, proceed to transcription
     state.isTranscribing = true
     state.error = nil
     let language = state.hexSettings.outputLanguage
 
     state.isPrewarming = true
-	let shouldCreateHistoryCheckpoint = state.hexSettings.saveTranscriptionHistory
+	let shouldCreateHistoryCheckpoint = state.hexSettings.saveTranscriptionHistory || state.recordingSession != nil
 	let historyCheckpointID = state.activeHistoryTranscriptID
 	let selectedTextForCheckpoint = state.selectedTextForRefinement?.text
 	let screenContextForCheckpoint = state.screenContextForRefinement
@@ -2284,6 +3258,7 @@ private extension TranscriptionFeature {
 	let sourceAppName = state.sourceAppName
 	let speakerIdentificationEnabled = state.activeSpeakerIdentificationEnabled
 	let speakerDiarizationProvider = state.hexSettings.speakerDiarizationProvider
+	let speakerDiarizationMode = state.activeSpeakerDiarizationMode
 	let speakerIntroductionSettings = state.hexSettings
 	let systemAudioStartOffset = state.activeSystemAudioStartOffset
 
@@ -2423,6 +3398,7 @@ private extension TranscriptionFeature {
 							  diarization = try await speakerDiarization.analyze(
 								  channel.audioURL,
 								  speakerDiarizationProvider,
+								  speakerDiarizationMode,
 								  enrollmentProfiles
 							  )
 						  }
@@ -2432,7 +3408,7 @@ private extension TranscriptionFeature {
 						  for segment in diarization.segments {
 							  let profileID = segment.profileID?.uuidString ?? "unassigned"
 							  transcriptionFeatureLogger.info(
-								  "Speaker diarization segment source=\(channel.source.rawValue, privacy: .public) speaker=\(segment.speakerID, privacy: .public) profile=\(profileID, privacy: .public) start=\(String(format: "%.3f", segment.startTime), privacy: .public) end=\(String(format: "%.3f", segment.endTime), privacy: .public) duration=\(String(format: "%.3f", segment.endTime - segment.startTime), privacy: .public) activity=\(String(format: "%.4f", segment.qualityScore), privacy: .public)"
+								  "Speaker diarization segment source=\(channel.source.rawValue, privacy: .public) speaker=\(segment.speakerID, privacy: .private) profile=\(profileID, privacy: .private) start=\(String(format: "%.3f", segment.startTime), privacy: .public) end=\(String(format: "%.3f", segment.endTime), privacy: .public) duration=\(String(format: "%.3f", segment.endTime - segment.startTime), privacy: .public) activity=\(String(format: "%.4f", segment.qualityScore), privacy: .public)"
 							  )
 						  }
 						  let introductionContexts = SpeakerIdentification.introductionContexts(
@@ -2519,7 +3495,7 @@ private func storeSpeakerVoiceSamples(
 	for (profileID, segment) in candidates {
 		guard profilesWithoutSamples.contains(profileID) else {
 			transcriptionFeatureLogger.info(
-				"Speaker reference sample unchanged source=\(audioSource.rawValue, privacy: .public) profile=\(profileID.uuidString, privacy: .public) profileUpdated=false fingerprintUpdated=false"
+				"Speaker reference sample unchanged source=\(audioSource.rawValue, privacy: .public) profile=\(profileID.uuidString, privacy: .private) profileUpdated=false fingerprintUpdated=false"
 			)
 			continue
 		}
@@ -2533,11 +3509,11 @@ private func storeSpeakerVoiceSamples(
 			captured.append((profileID, sample))
 			let extractionVersion = sample.extractionVersion.map(String.init) ?? "legacy"
 			transcriptionFeatureLogger.notice(
-				"Speaker reference sample created source=\(audioSource.rawValue, privacy: .public) speaker=\(segment.speakerID, privacy: .public) profile=\(profileID.uuidString, privacy: .public) extractionVersion=\(extractionVersion, privacy: .public)"
+				"Speaker reference sample created source=\(audioSource.rawValue, privacy: .public) speaker=\(segment.speakerID, privacy: .private) profile=\(profileID.uuidString, privacy: .private) extractionVersion=\(extractionVersion, privacy: .public)"
 			)
 		} catch {
 			transcriptionFeatureLogger.warning(
-				"Speaker reference sample capture failed source=\(audioSource.rawValue, privacy: .public) speaker=\(segment.speakerID, privacy: .public) profile=\(profileID.uuidString, privacy: .public) error=\(error.localizedDescription, privacy: .private)"
+				"Speaker reference sample capture failed source=\(audioSource.rawValue, privacy: .public) speaker=\(segment.speakerID, privacy: .private) profile=\(profileID.uuidString, privacy: .private) error=\(error.localizedDescription, privacy: .private)"
 			)
 		}
 	}
@@ -3393,12 +4369,10 @@ private extension TranscriptionFeature {
 		transcriptionHistory.withLock { history in
 			history.history.insert(transcript, at: min(index, history.history.count))
 			guard let maxEntries = hexSettings.maxHistoryEntries, maxEntries > 0 else { return }
-			while history.history.count > maxEntries,
-				  let index = history.history.lastIndex(where: { $0.recoverySessionID == nil }) {
-				let removedTranscript = history.history.remove(at: index)
-				if !history.history.contains(where: { $0.audioPath == removedTranscript.audioPath }) {
-					audioToDelete.append(removedTranscript)
-				}
+			let removed = pruneHistoryToLogicalLimit(&history.history, maximumEntries: maxEntries)
+			for removedTranscript in removed
+			where !history.history.contains(where: { $0.audioPath == removedTranscript.audioPath }) {
+				audioToDelete.append(removedTranscript)
 			}
 		}
 		for transcript in audioToDelete {
@@ -3622,6 +4596,7 @@ private extension TranscriptionFeature {
   func handleDiscard(_ state: inout State) -> Effect<Action> {
 	let includeSystemAudio = state.activeSystemAudioEnabled
 	if var session = state.recordingSession, session.phase == .recording {
+		session.pauseRecording(at: now)
 		session.phase = .paused
 		state.recordingSession = session
 	}

@@ -104,12 +104,16 @@ final class SuperFastCaptureController {
     let requestedAt: Date
     let prependedDuration: TimeInterval
     var didLogFirstBuffer: Bool
+	var nextChunkSequence: Int
+	var nextSample: Int64
   }
 
   private let logger = HexLog.recording
-  private let processingQueue = DispatchQueue(label: "io.github.blackforestboi.Octo.SuperFastCapture")
-  private let stopBoundaryLock = NSLock()
-  private let meterContinuation: AsyncStream<Meter>.Continuation
+	private let processingQueue = DispatchQueue(label: "io.github.blackforestboi.Octo.SuperFastCapture")
+	private let stopBoundaryLock = NSLock()
+	private let inputTimelineLock = NSLock()
+	private let meterContinuation: AsyncStream<Meter>.Continuation
+	private let audioChunkRelay: CapturedAudioChunkRelay
   private let ringBuffer = FloatRingBuffer(
     capacity: Int(SuperFastCaptureConstants.sampleRate * SuperFastCaptureConstants.ringBufferDuration)
   )
@@ -122,6 +126,7 @@ final class SuperFastCaptureController {
 
   private var engine: AVAudioEngine?
   private var converter: AVAudioConverter?
+  private var inputTimelineLatency: TimeInterval = 0
   private var configurationChangeObserver: NSObjectProtocol?
   private var activeRecording: ActiveRecording?
   /// A synchronously-written PCM source whose capture stream failed. It stays available until
@@ -139,9 +144,11 @@ final class SuperFastCaptureController {
 
   init(
     meterContinuation: AsyncStream<Meter>.Continuation,
+	audioChunkRelay: CapturedAudioChunkRelay,
     onEngineConfigurationChange: @escaping @Sendable (Int) -> Void
   ) {
     self.meterContinuation = meterContinuation
+	self.audioChunkRelay = audioChunkRelay
     self.onEngineConfigurationChange = onEngineConfigurationChange
   }
 
@@ -223,6 +230,8 @@ final class SuperFastCaptureController {
       }
       throw error
     }
+    let inputTimelineLatency = max(0, inputNode.presentationLatency) + max(0, inputNode.latency)
+    setInputTimelineLatency(inputTimelineLatency)
     self.engine = engine
     configurationChangeObserver = NotificationCenter.default.addObserver(
       forName: .AVAudioEngineConfigurationChange,
@@ -232,7 +241,7 @@ final class SuperFastCaptureController {
       self?.handleConfigurationChange(generation: generation)
     }
     logger.notice(
-      "Capture engine armed reason=\(reason) sampleRate=\(String(format: "%.0f", inputFormat.sampleRate))Hz channels=\(inputFormat.channelCount) ringBuffer=\(String(format: "%.2f", SuperFastCaptureConstants.ringBufferDuration))s defaultPreRoll=\(String(format: "%.2f", SuperFastCaptureConstants.defaultPreRollDuration))s"
+      "Capture engine armed reason=\(reason) sampleRate=\(String(format: "%.0f", inputFormat.sampleRate))Hz channels=\(inputFormat.channelCount) inputTimelineLatency=\(String(format: "%.3f", inputTimelineLatency))s ringBuffer=\(String(format: "%.2f", SuperFastCaptureConstants.ringBufferDuration))s defaultPreRoll=\(String(format: "%.2f", SuperFastCaptureConstants.defaultPreRollDuration))s"
     )
   }
 
@@ -270,6 +279,7 @@ final class SuperFastCaptureController {
     }
     engine?.stop()
     engine = nil
+    setInputTimelineLatency(0)
   }
 
   private func handleConfigurationChange(generation: Int) {
@@ -317,8 +327,30 @@ final class SuperFastCaptureController {
           recoverySession: recoverySession,
           requestedAt: requestedAt,
           prependedDuration: prependedDuration,
-          didLogFirstBuffer: false
+          didLogFirstBuffer: false,
+		  nextChunkSequence: preRollSamples.isEmpty ? 0 : 1,
+		  nextSample: Int64(preRollSamples.count)
         )
+		if !preRollSamples.isEmpty {
+			let chunk = CapturedAudioChunk(
+				source: .microphone,
+				takeGeneration: recoverySession.id,
+				sequence: 0,
+				startSample: 0,
+				samples: preRollSamples
+			)
+			if audioChunkRelay.yield(chunk) {
+				audioChunkRelay.yield(.init(
+					source: .microphone,
+					takeGeneration: recoverySession.id,
+					sequence: 1,
+					startSample: Int64(preRollSamples.count),
+					samples: [],
+					discontinuityBefore: true
+				))
+				activeRecording?.nextChunkSequence = 2
+			}
+		}
       } catch {
         startError = error
       }
@@ -378,16 +410,19 @@ final class SuperFastCaptureController {
   }
 
   /// Establishes the audio cutoff from the physical input event before reducer and actor
-  /// scheduling can move the boundary. Core Graphics timestamps are nanoseconds since boot;
-  /// Core Audio host time uses the same monotonic clock expressed in host ticks.
+  /// scheduling can move the boundary. A tap's timestamp describes capture at the input node's
+  /// output, after hardware/stream and node processing latency, so translate the physical event
+  /// into that timeline. This is timestamp compensation, not post-roll audio.
   func requestStopBoundary(
     eventTimestampNanoseconds: UInt64?,
     postRollDuration: TimeInterval = 0
   ) {
     let eventHostTime = eventTimestampNanoseconds.map { Self.hostTimeForEventTimestamp($0) }
       ?? mach_absolute_time()
-    let targetHostTime = eventHostTime + AVAudioTime.hostTime(
-      forSeconds: max(0, postRollDuration)
+    let targetHostTime = Self.stopBoundaryHostTime(
+      eventHostTime: eventHostTime,
+      inputTimelineLatency: currentInputTimelineLatency(),
+      postRollDuration: postRollDuration
     )
     _ = installStopBoundary(targetHostTime)
   }
@@ -404,8 +439,10 @@ final class SuperFastCaptureController {
     if let requestedBoundary = currentStopBoundary() {
       targetHostTime = requestedBoundary.targetHostTime
     } else {
-      targetHostTime = mach_absolute_time() + AVAudioTime.hostTime(
-        forSeconds: postRollDuration
+      targetHostTime = Self.stopBoundaryHostTime(
+        eventHostTime: mach_absolute_time(),
+        inputTimelineLatency: currentInputTimelineLatency(),
+        postRollDuration: postRollDuration
       )
       guard installStopBoundary(targetHostTime) else {
         return .finalizing
@@ -452,6 +489,17 @@ final class SuperFastCaptureController {
 
   static func hostTimeForEventTimestamp(_ timestampNanoseconds: UInt64) -> UInt64 {
     AVAudioTime.hostTime(forSeconds: Double(timestampNanoseconds) / 1_000_000_000)
+  }
+
+  static func stopBoundaryHostTime(
+    eventHostTime: UInt64,
+    inputTimelineLatency: TimeInterval,
+    postRollDuration: TimeInterval
+  ) -> UInt64 {
+    let timelineOffset = max(0, inputTimelineLatency) + max(0, postRollDuration)
+    let offsetHostTime = AVAudioTime.hostTime(forSeconds: timelineOffset)
+    let (targetHostTime, overflow) = eventHostTime.addingReportingOverflow(offsetHostTime)
+    return overflow ? .max : targetHostTime
   }
 
   private func enqueue(_ buffer: AVAudioPCMBuffer, time: AVAudioTime, generation: Int) {
@@ -520,6 +568,28 @@ final class SuperFastCaptureController {
         try recording.recoverySession.append(
           UnsafeBufferPointer(start: samples, count: outputFramesToWrite)
         )
+		let chunkSamples = Array(UnsafeBufferPointer(start: samples, count: outputFramesToWrite))
+		let chunk = CapturedAudioChunk(
+			source: .microphone,
+			takeGeneration: recording.recoverySession.id,
+			sequence: recording.nextChunkSequence,
+			startSample: recording.nextSample,
+			samples: chunkSamples
+		)
+		if audioChunkRelay.yield(chunk) {
+			audioChunkRelay.yield(.init(
+				source: .microphone,
+				takeGeneration: recording.recoverySession.id,
+				sequence: recording.nextChunkSequence + 1,
+				startSample: recording.nextSample + Int64(outputFramesToWrite),
+				samples: [],
+				discontinuityBefore: true
+			))
+			recording.nextChunkSequence += 1
+		}
+		recording.nextChunkSequence += 1
+		recording.nextSample += Int64(outputFramesToWrite)
+		activeRecording = recording
       }
       if let stopBoundary,
          time.isHostTimeValid,
@@ -618,6 +688,18 @@ final class SuperFastCaptureController {
     stopBoundaryLock.lock()
     defer { stopBoundaryLock.unlock() }
     stopBoundary = nil
+  }
+
+  private func setInputTimelineLatency(_ latency: TimeInterval) {
+    inputTimelineLock.lock()
+    defer { inputTimelineLock.unlock() }
+    inputTimelineLatency = max(0, latency)
+  }
+
+  private func currentInputTimelineLatency() -> TimeInterval {
+    inputTimelineLock.lock()
+    defer { inputTimelineLock.unlock() }
+    return inputTimelineLatency
   }
 
   private func scheduleStopDrainTimeout() {

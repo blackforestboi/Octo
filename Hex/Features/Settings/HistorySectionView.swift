@@ -57,7 +57,7 @@ struct HistorySectionView: View {
 			Text("History")
 		} footer: {
 			if !store.hexSettings.saveTranscriptionHistory {
-				Text("When disabled, transcriptions will not be saved and audio files will be deleted immediately after transcription.")
+				Text("When disabled, ordinary transcriptions are not saved. Full Recording Sessions are always saved so committed live text remains crash-safe.")
 					.font(.footnote)
 					.foregroundColor(.secondary)
 			}

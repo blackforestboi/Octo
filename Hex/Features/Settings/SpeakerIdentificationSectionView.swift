@@ -11,6 +11,20 @@ struct SpeakerIdentificationSectionView: View {
 		Section {
 			Label {
 				Toggle(
+					"Live transcription in Recording Sessions",
+					isOn: Binding(
+						get: { store.hexSettings.liveTranscriptionEnabled },
+						set: { store.send(.setLiveTranscriptionEnabled($0)) }
+					)
+				)
+				Text("Show only durable, committed text with a short delay. Each session can override this default between takes.")
+					.settingsCaption()
+			} icon: {
+				Image(systemName: "text.bubble.fill")
+			}
+
+			Label {
+				Toggle(
 					"Identify speakers",
 					isOn: Binding(
 						get: { store.hexSettings.speakerIdentificationEnabled },
@@ -24,6 +38,50 @@ struct SpeakerIdentificationSectionView: View {
 			}
 
 			if store.hexSettings.speakerIdentificationEnabled {
+				Label {
+					HStack {
+						VStack(alignment: .leading, spacing: 2) {
+							Text("Speaker capacity")
+							Text(store.hexSettings.speakerDiarizationMode.detail)
+								.settingsCaption()
+						}
+						Spacer()
+						Picker("Speaker capacity", selection: Binding(
+							get: { store.hexSettings.speakerDiarizationMode },
+							set: { store.send(.setSpeakerDiarizationMode($0)) }
+						)) {
+							ForEach(SpeakerDiarizationMode.allCases) { mode in
+								Text("\(mode.displayName) · \(mode.detail)").tag(mode)
+							}
+						}
+						.pickerStyle(.menu)
+					}
+				} icon: {
+					Image(systemName: "person.3.sequence")
+				}
+
+				if store.isPreparingSpeakerDiarizationMode {
+					Label {
+						HStack(spacing: 8) {
+							ProgressView()
+								.controlSize(.small)
+							Text("Preparing the selected speaker model…")
+								.settingsCaption()
+						}
+					} icon: {
+						Image(systemName: "arrow.down.circle")
+					}
+				} else if let error = store.speakerDiarizationModePreparationError {
+					Label {
+						Text(error)
+							.settingsCaption()
+							.foregroundStyle(.red)
+					} icon: {
+						Image(systemName: "exclamationmark.triangle.fill")
+							.foregroundStyle(.red)
+					}
+				}
+
 				Label {
 					VStack(alignment: .leading, spacing: 2) {
 						Text("Automatic names")
@@ -60,7 +118,7 @@ struct SpeakerIdentificationSectionView: View {
 		} header: {
 			Text("Speaker Identification")
 		} footer: {
-			Text("The configured language model recognizes genuine introductions; saved profiles keep local voice embeddings and one local audio sample.")
+			Text("Recording Sessions are always saved to History so every visible live fragment remains crash-safe. The configured language model recognizes genuine introductions; saved profiles stay local.")
 		}
 		.enableInjection()
 	}

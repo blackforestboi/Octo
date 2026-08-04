@@ -16,6 +16,70 @@ public enum SpeakerDiarizationProvider: String, Codable, CaseIterable, Equatable
 	}
 }
 
+/// The accuracy/capacity contract selected for an entire recording session.
+public enum SpeakerDiarizationMode: String, Codable, CaseIterable, Equatable, Identifiable, Sendable {
+	case highAccuracyFour
+	case moreSpeakersTen
+
+	public var id: Self { self }
+
+	public var displayName: String {
+		switch self {
+		case .highAccuracyFour: "High Accuracy"
+		case .moreSpeakersTen: "More Speakers"
+		}
+	}
+
+	public var detail: String {
+		switch self {
+		case .highAccuracyFour: "Up to 4 speakers"
+		case .moreSpeakersTen: "Up to 10 speakers"
+		}
+	}
+
+	public var speakerCapacity: Int {
+		switch self {
+		case .highAccuracyFour: 4
+		case .moreSpeakersTen: 10
+		}
+	}
+
+	public var requiresAdditionalModel: Bool { self == .moreSpeakersTen }
+}
+
+/// A durable speaker identity scoped to one recording session. Transcript sections
+/// refer to this UUID rather than a diarizer's run-local slot identifier.
+public struct SessionSpeaker: Codable, Equatable, Identifiable, Sendable {
+	public var id: UUID
+	public var fallbackLabel: String
+	public var profileID: UUID?
+	public var lastKnownProfileName: String?
+
+	public init(
+		id: UUID = UUID(),
+		fallbackLabel: String,
+		profileID: UUID? = nil,
+		lastKnownProfileName: String? = nil
+	) {
+		self.id = id
+		self.fallbackLabel = fallbackLabel
+		self.profileID = profileID
+		self.lastKnownProfileName = lastKnownProfileName
+	}
+
+	public static func fallbackLabel(at index: Int) -> String {
+		let scalar = UnicodeScalar(65 + max(0, min(index, 25)))!
+		return "Speaker \(Character(scalar))"
+	}
+}
+
+public enum TranscriptFragmentKind: String, Codable, Equatable, Sendable {
+	case speech
+	case unclear
+	/// Reserved for durable timeline metadata; it is never rendered as transcript text.
+	case gap
+}
+
 /// A word recognized by an ASR provider together with its location in the source audio.
 public struct TimedTranscriptWord: Codable, Equatable, Sendable {
 	public var word: String
@@ -42,6 +106,12 @@ public struct TimestampedTranscriptSection: Codable, Equatable, Sendable, Identi
 	public var audioSource: TranscriptAudioSource?
 	/// A speaker label takes precedence over the audio-source label in History.
 	public var speakerName: String?
+	/// Stable session-local identity. Nil means speaker attribution was disabled or unsafe.
+	public var sessionSpeakerID: UUID?
+	/// Monotonic sequence assigned once, immediately before durable persistence.
+	public var commitSequence: Int?
+	/// Distinguishes recognized speech from the explicit hard-limit fallback.
+	public var fragmentKind: TranscriptFragmentKind?
 
 	public init(
 		id: UUID = UUID(),
@@ -49,7 +119,10 @@ public struct TimestampedTranscriptSection: Codable, Equatable, Sendable, Identi
 		startTime: TimeInterval,
 		endTime: TimeInterval,
 		audioSource: TranscriptAudioSource? = nil,
-		speakerName: String? = nil
+		speakerName: String? = nil,
+		sessionSpeakerID: UUID? = nil,
+		commitSequence: Int? = nil,
+		fragmentKind: TranscriptFragmentKind? = nil
 	) {
 		self.id = id
 		self.text = text
@@ -57,6 +130,9 @@ public struct TimestampedTranscriptSection: Codable, Equatable, Sendable, Identi
 		self.endTime = endTime
 		self.audioSource = audioSource
 		self.speakerName = speakerName
+		self.sessionSpeakerID = sessionSpeakerID
+		self.commitSequence = commitSequence
+		self.fragmentKind = fragmentKind
 	}
 
 	public var displayLabel: String? { speakerName ?? audioSource?.displayName }

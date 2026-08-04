@@ -5,6 +5,15 @@ import SwiftUI
 private let appLogger = HexLog.app
 private let cacheLogger = HexLog.caches
 
+private final class RecordingOptionsHostingView<Content: View>: NSHostingView<Content> {
+	override func layout() {
+		super.layout()
+		let fittingWidth = fittingSize.width
+		guard fittingWidth > 0, abs(frame.width - fittingWidth) > 0.5 else { return }
+		frame.size.width = fittingWidth
+	}
+}
+
 class HexAppDelegate: NSObject, NSApplicationDelegate {
 	var invisibleWindow: InvisibleWindow?
 	var settingsWindow: NSWindow?
@@ -261,13 +270,13 @@ class HexAppDelegate: NSObject, NSApplicationDelegate {
 
 		let accessory = NSTitlebarAccessoryViewController()
 		accessory.layoutAttribute = .right
-		let hostingView = NSHostingView(
+		let hostingView = RecordingOptionsHostingView(
 			rootView: RecordingSessionTitlebarControls(
 				store: HexApp.appStore
 			)
-			.frame(width: 330, height: 28, alignment: .trailing)
+			.frame(height: 28, alignment: .trailing)
 		)
-		hostingView.frame = NSRect(x: 0, y: 0, width: 330, height: 28)
+		hostingView.frame = NSRect(origin: .zero, size: hostingView.fittingSize)
 		accessory.view = hostingView
 		settingsWindow.addTitlebarAccessoryViewController(accessory)
 		recordingOptionsAccessory = accessory

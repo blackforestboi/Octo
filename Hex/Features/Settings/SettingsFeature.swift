@@ -17,6 +17,8 @@ private enum HotKeyCaptureTarget {
   case pasteLastTranscript
 }
 
+private struct SpeakerDiarizationPreparationCancellationID: Hashable {}
+
 extension SharedReaderKey
   where Self == InMemoryKey<Bool>.Default
 {
@@ -60,6 +62,8 @@ struct SettingsFeature {
     var shouldFlashModelSection = false
     var needsScreenRecordingPermission = false
     var isRequestingScreenRecordingPermission = false
+	var isPreparingSpeakerDiarizationMode = false
+	var speakerDiarizationModePreparationError: String?
 
   }
 
@@ -127,6 +131,10 @@ struct SettingsFeature {
     case setLowercaseTranscripts(Bool)
     case setRemovePunctuation(Bool)
     case setSpeakerIdentificationEnabled(Bool)
+	case setLiveTranscriptionEnabled(Bool)
+	case setSpeakerDiarizationMode(SpeakerDiarizationMode)
+	case speakerDiarizationModePrepared(SpeakerDiarizationMode)
+	case speakerDiarizationModePreparationFailed(SpeakerDiarizationMode, String)
   }
 
   @Dependency(\.keyEventMonitor) var keyEventMonitor
@@ -134,6 +142,7 @@ struct SettingsFeature {
   @Dependency(\.recording) var recording
   @Dependency(\.soundEffects) var soundEffects
   @Dependency(\.transcriptPersistence) var transcriptPersistence
+	@Dependency(\.liveTranscription) var liveTranscription
 
   private func deleteTranscriptFilesEffect(for transcripts: [Transcript]) -> Effect<Action> {
     .run { [transcriptPersistence] _ in
@@ -457,6 +466,38 @@ struct SettingsFeature {
         state.$hexSettings.withLock { $0.speakerIdentificationEnabled = enabled }
         return .none
 
+	  case let .setLiveTranscriptionEnabled(enabled):
+		state.$hexSettings.withLock { $0.liveTranscriptionEnabled = enabled }
+		return .none
+
+	  case let .setSpeakerDiarizationMode(mode):
+		state.$hexSettings.withLock { $0.speakerDiarizationMode = mode }
+		state.isPreparingSpeakerDiarizationMode = true
+		state.speakerDiarizationModePreparationError = nil
+		return .run { [liveTranscription] send in
+			do {
+				try await liveTranscription.prepareSpeakerMode(mode)
+				await send(.speakerDiarizationModePrepared(mode))
+			} catch is CancellationError {
+				return
+			} catch {
+				await send(.speakerDiarizationModePreparationFailed(mode, error.localizedDescription))
+			}
+		}
+		.cancellable(id: SpeakerDiarizationPreparationCancellationID(), cancelInFlight: true)
+
+	  case let .speakerDiarizationModePrepared(mode):
+		guard state.hexSettings.speakerDiarizationMode == mode else { return .none }
+		state.isPreparingSpeakerDiarizationMode = false
+		state.speakerDiarizationModePreparationError = nil
+		return .none
+
+	  case let .speakerDiarizationModePreparationFailed(mode, message):
+		guard state.hexSettings.speakerDiarizationMode == mode else { return .none }
+		state.isPreparingSpeakerDiarizationMode = false
+		state.speakerDiarizationModePreparationError = message
+		return .none
+
       case .startSettingPasteLastTranscriptHotkey:
         beginCapture(.pasteLastTranscript, state: &state)
         return .none
@@ -619,11 +660,15 @@ struct SettingsFeature {
         // them until the user explicitly deletes them so toggling History cannot destroy the
         // only copy after a restart.
         if !enabled {
-          let transcripts = state.transcriptionHistory.history.filter { $0.recoverySessionID == nil }
+		  let transcripts = state.transcriptionHistory.history.filter {
+			$0.recoverySessionID == nil && $0.recordingSessionID == nil
+		  }
           
           // Clear normal history while retaining recovered audio entries.
           state.$transcriptionHistory.withLock { history in
-            history.history.removeAll { $0.recoverySessionID == nil }
+			history.history.removeAll {
+				$0.recoverySessionID == nil && $0.recordingSessionID == nil
+			}
           }
 
 		  return deleteTranscriptFilesEffect(for: transcripts)

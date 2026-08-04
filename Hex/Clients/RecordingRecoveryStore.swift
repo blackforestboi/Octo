@@ -195,6 +195,15 @@ enum RecordingRecoveryStore {
     return UUID(uuidString: String(name.dropFirst(prefix.count)))
   }
 
+	static func createdAt(for sessionID: UUID) -> Date? {
+		let url = manifestURL(for: sessionID)
+		guard let data = try? Data(contentsOf: url),
+			let manifest = try? JSONDecoder().decode(Manifest.self, from: data),
+			manifest.id == sessionID
+		else { return nil }
+		return manifest.createdAt
+	}
+
   fileprivate static func finalize(manifest: Manifest) throws -> RecoveredRecording {
     try createDirectories()
     let sourceURL = sourceURL(for: manifest.id)
