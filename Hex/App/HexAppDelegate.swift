@@ -8,6 +8,7 @@ private let cacheLogger = HexLog.caches
 class HexAppDelegate: NSObject, NSApplicationDelegate {
 	var invisibleWindow: InvisibleWindow?
 	var settingsWindow: NSWindow?
+	private var recordingOptionsAccessory: NSTitlebarAccessoryViewController?
 	private(set) var menuBarStatusItemController: MenuBarStatusItemController?
 	private var launchedAtLogin = false
 
@@ -60,6 +61,12 @@ class HexAppDelegate: NSObject, NSApplicationDelegate {
 			self,
 			selector: #selector(handlePresentSettingsWindow),
 			name: .presentSettingsWindow,
+			object: nil
+		)
+		NotificationCenter.default.addObserver(
+			self,
+			selector: #selector(handlePresentHistoryWindow),
+			name: .presentHistoryWindow,
 			object: nil
 		)
 		// Start long-running app effects (global hotkeys, permissions, etc.)
@@ -211,7 +218,7 @@ class HexAppDelegate: NSObject, NSApplicationDelegate {
 
 		let settingsView = AppView(store: HexApp.appStore)
 		let settingsWindow = NSWindow(
-			contentRect: .init(x: 0, y: 0, width: 700, height: 700),
+			contentRect: .init(x: 0, y: 0, width: 780, height: 700),
 			styleMask: [.titled, .fullSizeContentView, .closable, .miniaturizable, .resizable],
 			backing: .buffered,
 			defer: false
@@ -219,7 +226,7 @@ class HexAppDelegate: NSObject, NSApplicationDelegate {
 		settingsWindow.titleVisibility = .visible
 		settingsWindow.contentView = NSHostingView(rootView: settingsView)
 		settingsWindow.isReleasedWhenClosed = false
-		settingsWindow.minSize = .init(width: 620, height: 560)
+		settingsWindow.minSize = .init(width: 700, height: 560)
 		settingsWindow.setFrameAutosaveName("Settings")
 		settingsWindow.center()
 		settingsWindow.toolbarStyle = NSWindow.ToolbarStyle.unified
@@ -236,6 +243,34 @@ class HexAppDelegate: NSObject, NSApplicationDelegate {
 
 	@objc private func handlePresentSettingsWindow() {
 		presentSettingsView()
+	}
+
+	@objc private func handlePresentHistoryWindow() {
+		// The app reducer has already selected the destination (currently the
+		// recording session), so only bring the shared foreground window forward.
+		presentAppWindow()
+		installRecordingOptionsAccessory()
+	}
+
+	private func installRecordingOptionsAccessory() {
+		guard let settingsWindow else { return }
+		if let recordingOptionsAccessory,
+		   let index = settingsWindow.titlebarAccessoryViewControllers.firstIndex(where: { $0 === recordingOptionsAccessory }) {
+			settingsWindow.removeTitlebarAccessoryViewController(at: index)
+		}
+
+		let accessory = NSTitlebarAccessoryViewController()
+		accessory.layoutAttribute = .right
+		let hostingView = NSHostingView(
+			rootView: RecordingSessionTitlebarControls(
+				store: HexApp.appStore
+			)
+			.frame(width: 330, height: 28, alignment: .trailing)
+		)
+		hostingView.frame = NSRect(x: 0, y: 0, width: 330, height: 28)
+		accessory.view = hostingView
+		settingsWindow.addTitlebarAccessoryViewController(accessory)
+		recordingOptionsAccessory = accessory
 	}
 
 	@objc private func handleAppearanceChange() {

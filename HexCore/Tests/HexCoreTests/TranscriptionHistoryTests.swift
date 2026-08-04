@@ -47,6 +47,24 @@ struct TranscriptionHistoryTests {
 	}
 
 	@Test
+	func recordingSessionMetadataRoundTripsAndLegacyFilesRemainCompatible() throws {
+		let sessionID = UUID()
+		let transcript = Transcript(
+			timestamp: .now,
+			text: "Session take",
+			audioPath: URL(fileURLWithPath: "/session.wav"),
+			duration: 2,
+			recordingSessionID: sessionID,
+			recordingSessionTitle: "Recording: Aug 3, 2026 at 13:00"
+		)
+
+		let decoded = try JSONDecoder().decode(Transcript.self, from: JSONEncoder().encode(transcript))
+
+		#expect(decoded.recordingSessionID == sessionID)
+		#expect(decoded.recordingSessionTitle == "Recording: Aug 3, 2026 at 13:00")
+	}
+
+	@Test
 	func latestPasteableTranscriptUsesNewestTimestamp() {
 		let oldTranscript = Transcript(
 			timestamp: Date(timeIntervalSince1970: 1),

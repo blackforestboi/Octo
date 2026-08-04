@@ -255,7 +255,7 @@ public struct HexSettings: Codable, Equatable, Sendable {
 		}
 	}
 
-	private var selectedRefinementModelID: String? {
+	public var selectedRefinementModelID: String? {
 		switch refinementProvider {
 		case .openRouter:
 			openRouterModelID

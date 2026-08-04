@@ -122,6 +122,12 @@ public struct Transcript: Codable, Equatable, Identifiable, Sendable {
 	/// Identifies audio reconstructed after an interrupted recording so it can be recovered
 	/// without being pasted as if it were a completed transcript.
 	public var recoverySessionID: UUID?
+	/// Identifies takes that belong to the same user-managed recording session.
+	/// The field is optional so existing History files remain fully compatible.
+	public var recordingSessionID: UUID?
+	/// The title the user sees for a recording session. It is repeated on each take so
+	/// a future History grouping can recover the session without another storage file.
+	public var recordingSessionTitle: String?
     
     public init(
         id: UUID = UUID(),
@@ -145,7 +151,9 @@ public struct Transcript: Codable, Equatable, Identifiable, Sendable {
 		outputGenerationDuration: TimeInterval? = nil,
 		screenshotByteCount: Int? = nil,
 		screenAwareInputSource: ScreenAwareInputSource? = nil,
-		recoverySessionID: UUID? = nil
+		recoverySessionID: UUID? = nil,
+		recordingSessionID: UUID? = nil,
+		recordingSessionTitle: String? = nil
     ) {
         self.id = id
         self.timestamp = timestamp
@@ -169,6 +177,8 @@ public struct Transcript: Codable, Equatable, Identifiable, Sendable {
 		self.screenshotByteCount = screenshotByteCount
 		self.screenAwareInputSource = screenAwareInputSource
 		self.recoverySessionID = recoverySessionID
+		self.recordingSessionID = recordingSessionID
+		self.recordingSessionTitle = recordingSessionTitle
     }
 }
 

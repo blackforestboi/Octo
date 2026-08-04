@@ -1103,6 +1103,354 @@ private extension ScreenAwareInputSource {
 	}
 }
 
+struct RecordingSessionView: View {
+	private enum Tab: Hashable {
+		case transcript
+		case summary(RewritePrompt.ID)
+	}
+	private struct IdentifiedSpeaker: Identifiable {
+		let id: String
+		let name: String
+	}
+
+	let session: TranscriptionFeature.RecordingSession
+	let takes: [Transcript]
+	let rewritePrompts: [RewritePrompt]
+	let meter: Meter
+	let systemAudioMeter: Meter
+	let isTranscribing: Bool
+	let send: (TranscriptionFeature.Action) -> Void
+	let onBack: () -> Void
+
+	@Shared(.speakerVoiceLibrary) private var speakerVoiceLibrary: SpeakerVoiceLibrary
+	@State private var selectedTab: Tab = .transcript
+	private var identifiedSpeakers: [IdentifiedSpeaker] {
+		var seen = Set<String>()
+		var speakers = [IdentifiedSpeaker]()
+
+		for take in takes.sorted(by: { $0.timestamp < $1.timestamp }) {
+			for segment in take.speakerSegments ?? [] {
+				let id = segment.profileID?.uuidString ?? "\(take.id)-\(segment.speakerID)"
+				guard seen.insert(id).inserted else { continue }
+				let savedName = segment.profileID.flatMap { profileID in
+					speakerVoiceLibrary.profiles.first(where: { $0.id == profileID })?.name
+				}
+				let segmentName = segment.speakerName.trimmingCharacters(in: .whitespacesAndNewlines)
+				speakers.append(.init(
+					id: id,
+					name: savedName ?? (segmentName.isEmpty ? "Speaker" : segmentName)
+				))
+			}
+		}
+
+		return speakers
+	}
+	private var transcriptText: String {
+		takes
+			.sorted { $0.timestamp < $1.timestamp }
+			.compactMap { transcript in
+				let text = transcript.rawText ?? transcript.text
+				return text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : text
+			}
+			.joined(separator: "\n\n")
+	}
+
+	var body: some View {
+		ScrollView {
+			VStack(alignment: .leading, spacing: 20) {
+				header
+				streamTimelines
+				content
+			}
+			.padding(24)
+			.frame(maxWidth: 920, alignment: .leading)
+		}
+		.toolbar {
+			ToolbarItem(placement: .navigation) {
+				Button(action: onBack) {
+					Label("Back", systemImage: "chevron.left")
+				}
+				.help("Return to History")
+			}
+		}
+	}
+
+	private var header: some View {
+		HStack(spacing: 10) {
+			Button(action: toggleRecording) {
+				Image(systemName: session.isRecording ? "pause.fill" : "record.circle")
+					.font(.title3)
+					.frame(width: 34, height: 30)
+			}
+			.buttonStyle(.borderedProminent)
+			.tint(session.isRecording ? .orange : .red)
+			.disabled(isTranscribing)
+			.help(session.isRecording ? "Pause recording" : "Continue recording")
+
+			if session.speakerIdentificationEnabled, !identifiedSpeakers.isEmpty {
+				ScrollView(.horizontal) {
+					HStack(spacing: 6) {
+						ForEach(identifiedSpeakers) { speaker in
+							Label(speaker.name, systemImage: "person.fill")
+								.font(.caption.weight(.medium))
+								.lineLimit(1)
+								.padding(.horizontal, 10)
+								.padding(.vertical, 6)
+								.background(.quaternary, in: Capsule())
+						}
+					}
+				}
+				.scrollIndicators(.hidden)
+			}
+		}
+	}
+
+	private var streamTimelines: some View {
+		VStack(spacing: 10) {
+			RecordingStreamTimeline(
+				label: "Microphone",
+				meter: meter,
+				isRecording: session.isRecording
+			)
+			if session.systemAudioEnabled {
+				RecordingStreamTimeline(
+					label: "System Audio",
+					meter: systemAudioMeter,
+					isRecording: session.isRecording,
+					isSystemAudio: true
+				)
+			}
+		}
+	}
+
+	private var content: some View {
+		VStack(alignment: .leading, spacing: 14) {
+			tabSwitcher
+			Group {
+				switch selectedTab {
+				case .transcript:
+					transcript
+				case let .summary(template):
+					summary(for: template)
+				}
+			}
+			.frame(maxWidth: .infinity, alignment: .leading)
+			.padding(18)
+			.background(.quaternary, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+		}
+	}
+
+	private var tabSwitcher: some View {
+		HStack(spacing: 8) {
+			tabButton("Transcript", tab: .transcript)
+			ForEach(session.summaries) { summary in
+				tabButton(summary.title, tab: .summary(summary.promptID))
+			}
+			addSummaryButton
+		}
+	}
+
+	private var addSummaryButton: some View {
+		Menu {
+			ForEach(rewritePrompts) { prompt in
+				Button(prompt.name) {
+					requestSummary(prompt)
+				}
+			}
+		} label: {
+			Text("Add Summary")
+				.font(.subheadline.weight(.medium))
+		}
+		.menuStyle(.borderlessButton)
+		.menuIndicator(.hidden)
+		.padding(.horizontal, 10)
+		.padding(.vertical, 5)
+		.background(Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+		.foregroundStyle(.secondary)
+		.disabled(session.isRecording || session.isGeneratingSummary)
+		.help("Choose a summary template")
+	}
+
+	private func tabButton(_ title: String, tab: Tab) -> some View {
+		Button {
+			selectedTab = tab
+		} label: {
+			Text(title)
+				.font(.subheadline.weight(.medium))
+				.padding(.horizontal, 10)
+				.padding(.vertical, 5)
+				.background(
+					selectedTab == tab ? Color.accentColor.opacity(0.24) : Color.primary.opacity(0.08),
+					in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+				)
+		}
+		.buttonStyle(.plain)
+		.foregroundStyle(selectedTab == tab ? .primary : .secondary)
+	}
+
+	@ViewBuilder
+	private var transcript: some View {
+		if session.isRecording {
+			ContentUnavailableView(
+				"Waiting for pause or stop",
+				systemImage: "waveform",
+				description: Text("The transcript appears after you pause or stop this recording.")
+			)
+		} else if transcriptText.isEmpty {
+			ContentUnavailableView(
+				isTranscribing ? "Transcribing…" : "No transcript yet",
+				systemImage: "text.bubble",
+				description: Text(isTranscribing ? "The latest paused take is being transcribed." : "Resume recording to add a take.")
+			)
+		} else {
+			VStack(alignment: .leading, spacing: 10) {
+				ForEach(takes.sorted { $0.timestamp < $1.timestamp }) { take in
+					let takeStartTime = max(0, take.timestamp.timeIntervalSince(session.startedAt))
+					if let sections = take.timestampedSections, !sections.isEmpty {
+						ForEach(sections) { section in
+							timestampedTranscriptLine(
+								start: takeStartTime + section.startTime,
+								end: takeStartTime + section.endTime,
+								text: section.text
+							)
+						}
+					} else {
+						timestampedTranscriptLine(
+							start: takeStartTime,
+							end: takeStartTime + take.duration,
+							text: take.rawText ?? take.text
+						)
+					}
+				}
+			}
+			.textSelection(.enabled)
+		}
+	}
+
+	@ViewBuilder
+	private func summary(for promptID: RewritePrompt.ID) -> some View {
+		if session.generatingSummaryPromptID == promptID {
+			let promptName = rewritePrompts.first(where: { $0.id == promptID })?.name ?? "summary"
+			ProgressView("Generating \(promptName.lowercased())…")
+		} else if let error = session.summaryError {
+			ContentUnavailableView(
+				"Summary unavailable",
+				systemImage: "exclamationmark.triangle",
+				description: Text(error)
+			)
+		} else if let summary = session.summaries.first(where: { $0.promptID == promptID }) {
+			Text(summary.text)
+				.textSelection(.enabled)
+				.fixedSize(horizontal: false, vertical: true)
+		} else {
+			ContentUnavailableView(
+				"Summary unavailable",
+				systemImage: "sparkles",
+				description: Text("Choose a rewrite prompt from Add Summary to generate it.")
+			)
+		}
+	}
+
+	private func requestSummary(_ prompt: RewritePrompt) {
+		selectedTab = .summary(prompt.id)
+		send(.generateRecordingSessionSummary(prompt))
+	}
+
+	private func timestampedTranscriptLine(start: TimeInterval, end: TimeInterval, text: String) -> some View {
+		HStack(alignment: .firstTextBaseline, spacing: 8) {
+			Text("\(formattedTimestamp(start))–\(formattedTimestamp(end))")
+				.font(.caption.monospacedDigit())
+				.foregroundStyle(.secondary)
+				.frame(width: 76, alignment: .leading)
+			Text(text)
+		}
+	}
+
+	private func formattedTimestamp(_ time: TimeInterval) -> String {
+		String(format: "%d:%02d", Int(time) / 60, Int(time) % 60)
+	}
+
+	private func toggleRecording() {
+		switch session.phase {
+		case .recording:
+			send(.pauseRecordingSession)
+		case .paused:
+			send(.resumeRecordingSession)
+		}
+	}
+
+	private func settingBinding(
+		get: @escaping () -> Bool,
+		sendAction: @escaping (Bool) -> TranscriptionFeature.Action
+	) -> Binding<Bool> {
+		Binding(get: get, set: { send(sendAction($0)) })
+	}
+
+}
+
+private struct RecordingStreamTimeline: View {
+	let label: String
+	let meter: Meter
+	let isRecording: Bool
+	var isSystemAudio = false
+	@State private var samples: [CGFloat] = []
+
+	var body: some View {
+		HStack(spacing: 12) {
+			Label(label, systemImage: isSystemAudio ? "desktopcomputer" : "mic")
+				.font(.caption.weight(.medium))
+				.foregroundStyle(.secondary)
+				.frame(width: 116, alignment: .leading)
+			RecordingTimelineWaveform(samples: samples, isRecording: isRecording)
+			.frame(maxWidth: .infinity, minHeight: 36)
+			.padding(.horizontal, 12)
+			.background(.quaternary, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+		}
+		.onAppear { append(meter) }
+		.onChange(of: meter) { _, newMeter in
+			guard isRecording else { return }
+			append(newMeter)
+		}
+	}
+
+	private func append(_ meter: Meter) {
+		guard isRecording else { return }
+		let boostedLevel = min(max(max(meter.averagePower, meter.peakPower * 0.88) * 7.5, 0), 1)
+		samples.append(CGFloat(pow(boostedLevel, 0.55)))
+		if samples.count > 600 {
+			samples.removeFirst(samples.count - 600)
+		}
+	}
+}
+
+private struct RecordingTimelineWaveform: View {
+	let samples: [CGFloat]
+	let isRecording: Bool
+
+	var body: some View {
+		Canvas { context, size in
+			let barWidth: CGFloat = 4
+			let gap: CGFloat = 3
+			let capacity = max(1, Int((size.width + gap) / (barWidth + gap)))
+			let values = Array(samples.suffix(capacity))
+			let startX = size.width - CGFloat(values.count) * (barWidth + gap) + gap
+			let color = isRecording ? Color.accentColor.opacity(0.82) : Color.secondary.opacity(0.32)
+
+			for (index, sample) in values.enumerated() {
+				let height = max(3, min(1, sample) * (size.height - 6))
+				let rect = CGRect(
+					x: startX + CGFloat(index) * (barWidth + gap),
+					y: (size.height - height) / 2,
+					width: barWidth,
+					height: height
+				)
+				context.fill(Path(roundedRect: rect, cornerRadius: 2), with: .color(color))
+			}
+		}
+		.accessibilityHidden(true)
+	}
+}
+
 struct HistoryView: View {
 	@ObserveInjection var inject
 	let store: StoreOf<HistoryFeature>
@@ -1124,7 +1472,7 @@ struct HistoryView: View {
 
 	var body: some View {
       Group {
-        if !hexSettings.saveTranscriptionHistory {
+		if !hexSettings.saveTranscriptionHistory {
           ContentUnavailableView {
             Label("History Disabled", systemImage: "clock.arrow.circlepath")
           } description: {

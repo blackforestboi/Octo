@@ -30,6 +30,7 @@ enum SystemAudioCaptureStopResult: Equatable, Sendable {
 struct SystemAudioCaptureClient {
 	var startCapture: @Sendable (_ parentRecordingSessionID: UUID) async -> SystemAudioCaptureStartResult = { _ in .failed }
 	var stopCapture: @Sendable () async -> SystemAudioCaptureStopResult = { .ignored(.noActiveCapture) }
+	var observeAudioLevel: @Sendable () async -> AsyncStream<Meter> = { AsyncStream { _ in } }
 	var recoverInterruptedRecordings: @Sendable () async -> [RecoveredSystemAudioRecording] = { [] }
 	var cleanup: @Sendable () async -> Void = {}
 }
@@ -40,6 +41,7 @@ extension SystemAudioCaptureClient: DependencyKey {
 		return Self(
 			startCapture: { await live.startCapture(parentRecordingSessionID: $0) },
 			stopCapture: { await live.stopCapture() },
+			observeAudioLevel: { await live.observeAudioLevel() },
 			recoverInterruptedRecordings: { await live.recoverInterruptedRecordings() },
 			cleanup: { await live.cleanup() }
 		)
@@ -56,10 +58,12 @@ extension DependencyValues {
 private final class SystemAudioCaptureWriter: NSObject, SCStreamOutput, @unchecked Sendable {
 	private let lock = NSLock()
 	private let session: SystemAudioRecoverySession
+	private let meterContinuation: AsyncStream<Meter>.Continuation
 	private var appendError: Swift.Error?
 
-	init(session: SystemAudioRecoverySession) {
+	init(session: SystemAudioRecoverySession, meterContinuation: AsyncStream<Meter>.Continuation) {
 		self.session = session
+		self.meterContinuation = meterContinuation
 	}
 
 	func stream(
@@ -74,10 +78,28 @@ private final class SystemAudioCaptureWriter: NSObject, SCStreamOutput, @uncheck
 		guard appendError == nil else { return }
 		do {
 			let (pcm, frameCount) = try Self.interleavedFloat32PCM(from: sampleBuffer)
+			meterContinuation.yield(Self.meter(for: pcm))
 			try session.appendInterleavedPCM(pcm, frameCount: frameCount)
 		} catch {
 			appendError = error
 			systemAudioCaptureLogger.error("Failed to append system audio PCM: \(error.localizedDescription, privacy: .private)")
+		}
+	}
+
+	private static func meter(for pcm: Data) -> Meter {
+		pcm.withUnsafeBytes { rawBuffer in
+			let samples = rawBuffer.bindMemory(to: Float.self)
+			guard !samples.isEmpty else { return Meter(averagePower: 0, peakPower: 0) }
+			var sumOfSquares: Float = 0
+			var peak: Float = 0
+			for sample in samples {
+				sumOfSquares += sample * sample
+				peak = max(peak, abs(sample))
+			}
+			return Meter(
+				averagePower: Double(sqrt(sumOfSquares / Float(samples.count))),
+				peakPower: Double(peak)
+			)
 		}
 	}
 
@@ -166,6 +188,7 @@ private actor SystemAudioCaptureClientLive {
 	}
 
 	private let recoveryStore = SystemAudioRecoveryStore()
+	private let (meterStream, meterContinuation) = AsyncStream<Meter>.makeStream()
 	private var pendingStartID: UUID?
 	private var capturePhase: CapturePhase?
 
@@ -228,7 +251,7 @@ private actor SystemAudioCaptureClientLive {
 				createdAt: startedAt
 			)
 			recoverySession = session
-			let writer = SystemAudioCaptureWriter(session: session)
+			let writer = SystemAudioCaptureWriter(session: session, meterContinuation: meterContinuation)
 			let stream = SCStream(filter: filter, configuration: configuration, delegate: nil)
 			try stream.addStreamOutput(
 				writer,
@@ -328,6 +351,10 @@ private actor SystemAudioCaptureClientLive {
 
 	func recoverInterruptedRecordings() -> [RecoveredSystemAudioRecording] {
 		recoveryStore.recoverInterruptedRecordings()
+	}
+
+	func observeAudioLevel() -> AsyncStream<Meter> {
+		meterStream
 	}
 
 	func cleanup() async {

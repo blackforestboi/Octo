@@ -117,10 +117,10 @@ actor TranscriptionClientLive {
           progressCallback(progress)
           preparationUpdate(.init(phase: .downloading, progress: progress.fractionCompleted))
         },
-        preparationPhase: { phase in
-          preparationUpdate(.init(phase: phase, progress: 1))
-        }
-      )
+		preparationPhase: { phase in
+		  preparationUpdate(.init(phase: phase, progress: 1))
+		}
+	      )
       currentModelName = variant
       return
     }

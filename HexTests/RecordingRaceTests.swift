@@ -1028,6 +1028,7 @@ final class RecordingRaceTests: XCTestCase {
 	}
 
 	func testScreenAwareActivatesAtHoldThresholdBeforeRelease() async {
+		let activationID = UUID(2)
 		let clock = TestClock()
 		var state = Self.makeState()
 		state.isRecording = true
@@ -1042,17 +1043,44 @@ final class RecordingRaceTests: XCTestCase {
 		}
 		store.exhaustivity = .off(showSkippedAssertions: false)
 
-		await store.send(.armScreenAwareActivation)
+		await store.send(.armScreenAwareActivation(activationID)) {
+			$0.pendingScreenAwareActivationID = activationID
+		}
 		await clock.advance(by: .seconds(0.74))
 		XCTAssertFalse(store.state.isScreenAwareModeActive)
 
 		await clock.advance(by: .seconds(0.01))
-		await store.receive(\.screenAwareActivationThresholdReached)
+		await store.receive(\.screenAwareActivationThresholdReached) {
+			$0.pendingScreenAwareActivationID = nil
+		}
 		await store.receive(\.screenAwareModeActivated) {
 			$0.isScreenAwareModeActive = true
 			$0.forcedRefinementMode = .refined
 		}
 		await store.receive(\.screenContextCaptured)
+		await store.finish()
+	}
+
+	func testScreenAwareQuickReleaseInvalidatesArmThatArrivesLate() async {
+		let activationID = UUID(2)
+		let clock = TestClock()
+		var state = Self.makeState()
+		state.isRecording = true
+		state.activeRecordingSource = .regular
+		let store = TestStore(initialState: state) {
+			TranscriptionFeature()
+		} withDependencies: {
+			$0.continuousClock = clock
+		}
+
+		await store.send(.cancelScreenAwareActivation(activationID)) {
+			$0.cancelledScreenAwareActivationID = activationID
+		}
+		await store.send(.armScreenAwareActivation(activationID)) {
+			$0.cancelledScreenAwareActivationID = nil
+		}
+		await clock.advance(by: .seconds(1))
+		XCTAssertFalse(store.state.isScreenAwareModeActive)
 		await store.finish()
 	}
 
@@ -1515,6 +1543,53 @@ final class RecordingRaceTests: XCTestCase {
 		XCTAssertNil(store.state.screenContextCaptureID)
 		await clock.advance(by: .seconds(5))
 		await store.receive(\.dismissError)
+		await store.finish()
+	}
+
+	func testRecordingSessionSummaryUsesTheSelectedTemplate() async {
+		let sessionID = UUID(uuidString: "00000000-0000-0000-0000-0000000000A1")!
+		let prompt = RewritePrompt(
+			id: UUID(uuidString: "00000000-0000-0000-0000-0000000000A2")!,
+			name: "Action items",
+			instructions: "Extract the action items."
+		)
+		var state = Self.makeState()
+		state.recordingSession = .init(
+			id: sessionID,
+			title: "Recording: Aug 3, 2026 at 13:00",
+			phase: .paused,
+			speakerIdentificationEnabled: false,
+			systemAudioEnabled: false
+		)
+		state.$transcriptionHistory.withLock { history in
+			history.history = [
+				Transcript(
+					timestamp: .now,
+					text: "Discussed the launch plan.",
+					audioPath: URL(fileURLWithPath: "/session.wav"),
+					duration: 2,
+					rawText: "Discussed the launch plan.",
+					recordingSessionID: sessionID
+				)
+			]
+		}
+		let store = TestStore(initialState: state) {
+			TranscriptionFeature()
+		} withDependencies: {
+			$0.refinement.refine = { _ in
+				return "- Confirm launch date"
+			}
+		}
+
+		await store.send(.generateRecordingSessionSummary(prompt)) {
+			$0.recordingSession?.generatingSummaryPromptID = prompt.id
+		}
+		await store.receive(\.recordingSessionSummaryGenerated) {
+			$0.recordingSession?.summaries = [
+				.init(promptID: prompt.id, title: prompt.name, text: "- Confirm launch date")
+			]
+			$0.recordingSession?.generatingSummaryPromptID = nil
+		}
 		await store.finish()
 	}
 

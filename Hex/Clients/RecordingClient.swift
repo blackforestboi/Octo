@@ -61,7 +61,7 @@ extension RecordingClient: DependencyKey {
 }
 
 /// Simple structure representing audio metering values.
-struct Meter: Equatable {
+struct Meter: Equatable, Sendable {
   let averagePower: Double
   let peakPower: Double
 }

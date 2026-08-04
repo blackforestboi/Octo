@@ -205,12 +205,75 @@ private func agentHandoffEndingGesture(
 	}
 }
 
+/// A Shift-modified starting chord opts into the persistent recording-session UI.
+/// This is deliberately evaluated before `HotKeyProcessor`: the normal processor
+/// requires an exact chord, while this opt-in uses one additional modifier.
+private func recordingSessionStartGesture(
+	for event: KeyEvent,
+	hotkey: HotKey,
+	pasteHotkey: HotKey?,
+	processorState: HotKeyProcessor.State
+) -> Bool {
+	guard processorState == .idle, !hotkey.modifiers.contains(.shift) else { return false }
+	guard !event.isShiftModifierTransition else { return false }
+	// The quick-paste shortcut takes precedence when it uses the same chord as
+	// the Shift-augmented recording hotkey. Otherwise the session window can
+	// become frontmost before the paste reaches the user's original text field.
+	if let pasteHotkey,
+		event.key == pasteHotkey.key,
+		event.modifiers.matchesExactly(pasteHotkey.modifiers)
+	{
+		return false
+	}
+	let sessionModifiers = hotkey.modifiers.union([.shift])
+	guard event.modifiers.matchesExactly(sessionModifiers) else { return false }
+	if let key = hotkey.key {
+		return event.isKeyDown && event.key == key
+	}
+	// Modifier-only hotkeys begin a session when the last configured modifier is
+	// pressed while Shift is already down. This mirrors their normal trigger point.
+	return event.phase == .other
+}
+
 @Reducer
 struct TranscriptionFeature {
   enum RecordingSource: Equatable {
     case regular
     case refined
   }
+
+	enum RecordingSessionPhase: Equatable {
+		case recording
+		case paused
+	}
+
+	struct RecordingSession: Equatable {
+		struct Summary: Equatable, Identifiable {
+			let promptID: RewritePrompt.ID
+			let title: String
+			let text: String
+
+			var id: RewritePrompt.ID { promptID }
+		}
+
+		let id: UUID
+		let title: String
+		let startedAt: Date = .now
+		var phase: RecordingSessionPhase
+		var speakerIdentificationEnabled: Bool
+		var systemAudioEnabled: Bool
+		var summaries: [Summary] = []
+		var generatingSummaryPromptID: RewritePrompt.ID?
+		var summaryError: String?
+
+		var isGeneratingSummary: Bool { generatingSummaryPromptID != nil }
+
+		var isRecording: Bool { phase == .recording }
+
+		func elapsedDuration(at date: Date) -> TimeInterval {
+			max(0, date.timeIntervalSince(startedAt))
+		}
+	}
 
 	enum CompletedTranscriptPresentation: Equatable {
 		case expanded(String)
@@ -345,6 +408,8 @@ struct TranscriptionFeature {
 		var postHocRefinement: RecentCompletedTranscript?
 		var pendingPressAndHoldActivationID: UUID?
 		var pendingTerminalRefinementID: UUID?
+		var pendingScreenAwareActivationID: UUID?
+		var cancelledScreenAwareActivationID: UUID?
 		var activeRecordingHotkey: HotKey?
 		var activeMinimumKeyTime: Double?
 		var activeRecordingSource: RecordingSource?
@@ -354,12 +419,16 @@ struct TranscriptionFeature {
 		/// Captured at recording start for the same in-flight consistency guarantee as speaker ID.
 		var activeSystemAudioEnabled = false
 		var activeSystemAudioStartOffset: TimeInterval = 0
+		/// A persistent user-managed recording page. Individual takes retain the
+		/// same identifier in History so this state can aggregate them live.
+		var recordingSession: RecordingSession?
 	var error: String?
 	var isMicrophonePermissionRequired = false
 	var recordingStartTime: Date?
 	var isLongRecordingCancellationConfirmationPresented = false
 	var outputGenerationStartTime: Date?
     var meter: Meter = .init(averagePower: 0, peakPower: 0)
+	var systemAudioMeter: Meter = .init(averagePower: 0, peakPower: 0)
     var sourceAppBundleID: String?
     var sourceAppName: String?
     /// URL of the audio file currently being transcribed. Set after `recording.stopRecording()`
@@ -378,6 +447,7 @@ struct TranscriptionFeature {
   enum Action {
     case task
     case audioLevelUpdated(Meter)
+	case systemAudioLevelUpdated(Meter)
 
     // Hotkey actions
 		case armPendingPressAndHold
@@ -385,11 +455,20 @@ struct TranscriptionFeature {
 		case cancelPendingPressAndHold
 		case armTerminalRefinement
 		case terminalRefinementActivated(UUID)
-		case armScreenAwareActivation
-		case screenAwareActivationThresholdReached
-		case cancelScreenAwareActivation
+		case armScreenAwareActivation(UUID)
+		case screenAwareActivationThresholdReached(UUID)
+		case cancelScreenAwareActivation(UUID)
     case hotKeyPressed
     case hotKeyReleased(RecordingSource)
+		case startRecordingSession
+		case recordingSessionOpened
+		case pauseRecordingSession
+		case resumeRecordingSession
+		case recordingSessionSpeakerIdentificationChanged(Bool)
+		case recordingSessionSystemAudioChanged(Bool)
+		case generateRecordingSessionSummary(RewritePrompt)
+		case recordingSessionSummaryGenerated(RewritePrompt, String)
+		case recordingSessionSummaryFailed(RewritePrompt.ID, String)
 			case refinedHotKeyPressed
 			case screenAwareModeActivated
 				case finishRecordingWithRefinement
@@ -460,7 +539,8 @@ struct TranscriptionFeature {
   }
 
   enum CancelID: Hashable {
-    case metering
+		case metering
+		case systemAudioMetering
     case recordingStart
     /// Trivial cleanup work that owns no temp WAV (the discard path's removeItem call).
     /// Safe to cancel when a new recording starts.
@@ -479,6 +559,7 @@ struct TranscriptionFeature {
 		case selectedTextRefinement
 		case errorPresentation
 		case completedTranscriptPresentation
+		case recordingSessionSummary
 		case transcriptPaste
 		case pendingPressAndHold
 		case terminalRefinementHold
@@ -510,12 +591,10 @@ struct TranscriptionFeature {
       // MARK: - Lifecycle / Setup
 
       case .task:
-        // Starts two concurrent effects:
-        // 1) Observing audio meter
-        // 2) Monitoring hot key events
-        // 3) Priming the recorder for instant startup
+        // Observe both audio tracks, monitor hotkeys, and prime the recorder.
         return .merge(
           startMeteringEffect(),
+		  startSystemAudioMeteringEffect(),
           startHotKeyMonitoringEffect(),
           warmUpRecorderEffect()
         )
@@ -525,6 +604,114 @@ struct TranscriptionFeature {
       case let .audioLevelUpdated(meter):
         state.meter = meter
         return .none
+
+	  case let .systemAudioLevelUpdated(meter):
+		state.systemAudioMeter = meter
+		return .none
+
+		// MARK: - Recording Session
+
+		case .startRecordingSession:
+			guard !state.isRecording, !state.isTranscribing, !state.isRefining else { return .none }
+			state.recordingSession = RecordingSession(
+				id: uuid(),
+				title: "Recording: \(now.formatted(date: .abbreviated, time: .shortened))",
+				phase: .recording,
+				speakerIdentificationEnabled: state.hexSettings.speakerIdentificationEnabled,
+				systemAudioEnabled: state.hexSettings.includeSystemAudio
+			)
+			return .merge(.send(.recordingSessionOpened), .send(.startRecording))
+
+		case .recordingSessionOpened:
+			return .none
+
+		case .pauseRecordingSession:
+			guard var session = state.recordingSession, session.phase == .recording else { return .none }
+			session.phase = .paused
+			session.summaries = []
+			session.summaryError = nil
+			session.generatingSummaryPromptID = nil
+			state.recordingSession = session
+			return state.isRecording ? .send(.stopRecording) : .none
+
+		case .resumeRecordingSession:
+			guard var session = state.recordingSession,
+				session.phase == .paused,
+				!state.isRecording,
+				!state.isTranscribing,
+				!state.isRefining
+			else { return .none }
+			session.phase = .recording
+			session.summaries = []
+			session.summaryError = nil
+			session.generatingSummaryPromptID = nil
+			state.recordingSession = session
+			return .send(.startRecording)
+
+		case let .recordingSessionSpeakerIdentificationChanged(isEnabled):
+			guard var session = state.recordingSession, !state.isRecording else { return .none }
+			session.speakerIdentificationEnabled = isEnabled
+			state.recordingSession = session
+			return .none
+
+		case let .recordingSessionSystemAudioChanged(isEnabled):
+			guard var session = state.recordingSession, !state.isRecording else { return .none }
+			session.systemAudioEnabled = isEnabled
+			state.recordingSession = session
+			return .none
+
+		case let .generateRecordingSessionSummary(template):
+			guard var session = state.recordingSession else { return .none }
+			let transcript = state.transcriptionHistory.history
+				.filter { $0.recordingSessionID == session.id }
+				.sorted { $0.timestamp < $1.timestamp }
+				.map { $0.rawText ?? $0.text }
+				.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+				.joined(separator: "\n\n")
+			guard !transcript.isEmpty else {
+				session.summaryError = "Pause or stop the recording before generating a summary."
+				state.recordingSession = session
+				return .none
+			}
+			session.generatingSummaryPromptID = template.id
+			session.summaryError = nil
+			state.recordingSession = session
+			let request = RefinementRequest(
+				text: transcript,
+				mode: .refined,
+				instructions: template.instructions,
+				provider: state.hexSettings.refinementProvider,
+				reasoningEffort: state.hexSettings.refinementReasoningEffort,
+				modelID: state.hexSettings.selectedRefinementModelID
+			)
+			return .run { [refinement] send in
+				do {
+					let summary = try await refinement.refine(request)
+					try Task.checkCancellation()
+					await send(.recordingSessionSummaryGenerated(template, summary))
+				} catch is CancellationError {
+					return
+				} catch {
+					await send(.recordingSessionSummaryFailed(template.id, error.localizedDescription))
+				}
+			}
+			.cancellable(id: CancelID.recordingSessionSummary, cancelInFlight: true)
+
+		case let .recordingSessionSummaryGenerated(template, summary):
+			guard var session = state.recordingSession, session.generatingSummaryPromptID == template.id else { return .none }
+			session.summaries.removeAll { $0.promptID == template.id }
+			session.summaries.append(.init(promptID: template.id, title: template.name, text: summary))
+			session.summaryError = nil
+			session.generatingSummaryPromptID = nil
+			state.recordingSession = session
+			return .none
+
+		case let .recordingSessionSummaryFailed(promptID, message):
+			guard var session = state.recordingSession, session.generatingSummaryPromptID == promptID else { return .none }
+			session.generatingSummaryPromptID = nil
+			session.summaryError = message
+			state.recordingSession = session
+			return .none
 
       // MARK: - HotKey Flow
 
@@ -566,23 +753,36 @@ struct TranscriptionFeature {
 			state.pendingTerminalRefinementID = nil
 			return .send(.finishRecordingWithRefinement)
 
-		case .armScreenAwareActivation:
+		case let .armScreenAwareActivation(activationID):
+			guard state.cancelledScreenAwareActivationID != activationID else {
+				state.cancelledScreenAwareActivationID = nil
+				return .none
+			}
 			guard state.isRecording, state.activeRecordingSource == .regular else { return .none }
 			let holdDuration = ScreenAwareActivation.holdDuration(for: state.hexSettings)
+			state.pendingScreenAwareActivationID = activationID
 			return .run { [clock] send in
 				try await clock.sleep(for: .seconds(holdDuration))
-				await send(.screenAwareActivationThresholdReached)
+				await send(.screenAwareActivationThresholdReached(activationID))
 			}
 			.cancellable(id: CancelID.screenAwareActivation, cancelInFlight: true)
 
-		case .screenAwareActivationThresholdReached:
-			guard state.isRecording,
+		case let .screenAwareActivationThresholdReached(activationID):
+			guard state.pendingScreenAwareActivationID == activationID,
+				state.isRecording,
 				state.activeRecordingSource == .regular,
 				!state.isScreenAwareModeActive
 			else { return .none }
+			state.pendingScreenAwareActivationID = nil
 			return .send(.screenAwareModeActivated)
 
-		case .cancelScreenAwareActivation:
+		case let .cancelScreenAwareActivation(activationID):
+			if state.pendingScreenAwareActivationID == activationID {
+				state.pendingScreenAwareActivationID = nil
+			} else {
+				// Key-up may reach the reducer before key-down's delayed arm action.
+				state.cancelledScreenAwareActivationID = activationID
+			}
 			return .cancel(id: CancelID.screenAwareActivation)
 
       case .hotKeyPressed:
@@ -985,6 +1185,10 @@ struct TranscriptionFeature {
 
 		case .recordingStartFailed:
 			guard state.isRecording else { return .none }
+			if var session = state.recordingSession, session.phase == .recording {
+				session.phase = .paused
+				state.recordingSession = session
+			}
 			return .merge(
 				handleDiscard(&state),
 				.run { _ in
@@ -995,6 +1199,10 @@ struct TranscriptionFeature {
 
 		case .recordingPermissionRequired:
 			guard state.isRecording else { return .none }
+			if var session = state.recordingSession, session.phase == .recording {
+				session.phase = .paused
+				state.recordingSession = session
+			}
 			let discard = handleDiscard(&state)
 			state.error = "Microphone access required — click to grant access"
 			state.isMicrophonePermissionRequired = true
@@ -1029,6 +1237,9 @@ struct TranscriptionFeature {
 		case let .recordingCheckpointStarted(checkpoint):
 			guard state.isRecording, state.hexSettings.saveTranscriptionHistory else { return .none }
 			guard state.activeHistoryTranscriptID == nil else { return .none }
+			let recordingSession = state.recordingSession?.isRecording == true
+				? state.recordingSession
+				: nil
 			let transcript = Transcript(
 				timestamp: checkpoint.createdAt,
 				text: "",
@@ -1044,7 +1255,9 @@ struct TranscriptionFeature {
 						duration: 0
 					)
 				],
-				recoverySessionID: checkpoint.sessionID
+				recoverySessionID: checkpoint.sessionID,
+				recordingSessionID: recordingSession?.id,
+				recordingSessionTitle: recordingSession?.title
 			)
 			state.activeHistoryTranscriptID = transcript.id
 			let artifactsToDelete = state.$transcriptionHistory.withLock { history -> [Transcript] in
@@ -1520,6 +1733,15 @@ private extension TranscriptionFeature {
     .cancellable(id: CancelID.metering, cancelInFlight: true)
   }
 
+	func startSystemAudioMeteringEffect() -> Effect<Action> {
+		.run { send in
+			for await meter in await systemAudioCapture.observeAudioLevel() {
+				await send(.systemAudioLevelUpdated(meter))
+			}
+		}
+		.cancellable(id: CancelID.systemAudioMetering, cancelInFlight: true)
+	}
+
   /// Effect to start monitoring hotkey events through the `keyEventMonitor`.
   func startHotKeyMonitoringEffect() -> Effect<Action> {
     .run { send in
@@ -1527,6 +1749,7 @@ private extension TranscriptionFeature {
       @Shared(.isSettingHotKey) var isSettingHotKey: Bool
       @Shared(.hexSettings) var hexSettings: HexSettings
 		let rewritePromptHoldTracker = RewritePromptHoldTracker()
+		var pendingScreenAwareActivationID: UUID?
 
       // Handle incoming input events (keyboard and mouse)
       let token = keyEventMonitor.handleInputEvent { inputEvent in
@@ -1635,6 +1858,19 @@ private extension TranscriptionFeature {
           }
 
 
+		  if recordingSessionStartGesture(
+			for: keyEvent,
+			hotkey: hexSettings.hotkey,
+			pasteHotkey: hexSettings.pasteLastTranscriptHotkey,
+			processorState: hotKeyProcessor.state
+		  ) {
+			// Session recording is controlled by the History page, so releasing its
+			// starting chord must not also complete a press-and-hold recording.
+			hotKeyProcessor.reset()
+			Task { await send(.startRecordingSession) }
+			return true
+		  }
+
 		  if hexSettings.agentHandoffEnabled {
 		  switch agentHandoffEndingGesture(
 			for: keyEvent,
@@ -1677,15 +1913,22 @@ private extension TranscriptionFeature {
 			return useDoubleTapOnly || keyEvent.key != nil
 
 		  case .startRecordingAndArmScreenAware:
+			let activationID = UUID()
+			pendingScreenAwareActivationID = activationID
 			Task {
 				await send(.hotKeyPressed)
-				await send(.armScreenAwareActivation)
+				await send(.armScreenAwareActivation(activationID))
 			}
 			return useDoubleTapOnly || keyEvent.key != nil
 
 		  case .stopRecording:
+			let screenAwareActivationID = pendingScreenAwareActivationID
+			pendingScreenAwareActivationID = nil
 			let stopEventTimestamp = keyEvent.timestamp
 			Task {
+				if let screenAwareActivationID {
+					await send(.cancelScreenAwareActivation(screenAwareActivationID))
+				}
 				await recording.requestStopBoundary(stopEventTimestamp)
 				await send(.hotKeyReleased(.regular))
 			}
@@ -1693,7 +1936,10 @@ private extension TranscriptionFeature {
 
 		  case .locked:
 			// Screen Aware is decided by the hold timer, never by the key-up event.
-			Task { await send(.cancelScreenAwareActivation) }
+			if let activationID = pendingScreenAwareActivationID {
+				pendingScreenAwareActivationID = nil
+				Task { await send(.cancelScreenAwareActivation(activationID)) }
+			}
 			return false
 
 		  case .stopRecordingWithRefinement:
@@ -1817,6 +2063,8 @@ private extension TranscriptionFeature {
       )
     }
 	state.isRecording = true
+	state.meter = .init(averagePower: 0, peakPower: 0)
+	state.systemAudioMeter = .init(averagePower: 0, peakPower: 0)
 	state.error = nil
 	state.isMicrophonePermissionRequired = false
 	state.isLongRecordingCancellationConfirmationPresented = false
@@ -1840,8 +2088,13 @@ private extension TranscriptionFeature {
 	state.activeRecordingHotkey = state.hexSettings.hotkey
 	state.activeMinimumKeyTime = state.hexSettings.minimumKeyTime
 		state.activeRecordingSource = source
-		state.activeSpeakerIdentificationEnabled = state.hexSettings.speakerIdentificationEnabled
-		state.activeSystemAudioEnabled = state.hexSettings.includeSystemAudio
+		let recordingSession = state.recordingSession?.isRecording == true
+			? state.recordingSession
+			: nil
+		state.activeSpeakerIdentificationEnabled = recordingSession?.speakerIdentificationEnabled
+			?? state.hexSettings.speakerIdentificationEnabled
+		state.activeSystemAudioEnabled = recordingSession?.systemAudioEnabled
+			?? state.hexSettings.includeSystemAudio
 		state.activeSystemAudioStartOffset = 0
     let startTime = now
     state.recordingStartTime = startTime
@@ -3368,6 +3621,10 @@ private extension TranscriptionFeature {
 
   func handleDiscard(_ state: inout State) -> Effect<Action> {
 	let includeSystemAudio = state.activeSystemAudioEnabled
+	if var session = state.recordingSession, session.phase == .recording {
+		session.phase = .paused
+		state.recordingSession = session
+	}
 	state.isRecording = false
 	state.isLongRecordingCancellationConfirmationPresented = false
 	deactivateScreenAwareMode(&state)

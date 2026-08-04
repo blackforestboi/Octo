@@ -14,28 +14,33 @@ Changes to existing user experience must be explicitly confirmed by the user. Ne
 
 Local Debug builds may only be run when the user explicitly requests them.
 
+All checkouts and agent threads share one canonical Debug bundle. Never run a raw
+Debug `xcodebuild`, override its output paths, or launch a wildcard DerivedData path.
+The wrapper serializes concurrent builds so separate worktrees overwrite the same
+bundle instead of creating additional app locations and permission entries.
+
 ```bash
 # Local development build (the default for feature work): uses Apple Development signing
 # so macOS TCC permissions such as Accessibility and Input Monitoring remain stable.
 # Do not run tests, archives, Developer ID signing, DMGs, or release builds unless explicitly requested.
-xcodebuild -scheme Octo -configuration Debug \
-  -skipMacroValidation -skipPackagePluginValidation build
+./dev/build-debug.sh
 
 # Compile-only fallback for machines without an Apple Development identity.
 # Do not use this build to validate macOS permission registration.
-xcodebuild -scheme Octo -configuration Debug \
-  -skipMacroValidation -skipPackagePluginValidation \
-  CODE_SIGNING_ALLOWED=NO build
+./dev/build-debug.sh --unsigned
 
-# Launch the locally built bundle
-open ~/Library/Developer/Xcode/DerivedData/Hex-*/Build/Products/Debug/'Octo Debug.app'
+# Build and launch the one canonical locally built bundle
+./dev/build-debug.sh --launch
+
+# Canonical app path (shared by the main checkout and every worktree)
+open ~/Library/Developer/Xcode/DerivedData/OctoDebugShared/Build/Products/Debug/'Octo Debug.app'
 
 # Tests are opt-in only: run them only when the user explicitly asks.
 # Unit tests (must be run from HexCore directory)
 cd HexCore && swift test
 
 # Or run all tests via Xcode
-xcodebuild test -scheme Octo
+./dev/build-debug.sh --test
 
 # Open in Xcode (recommended for development)
 open Hex.xcodeproj

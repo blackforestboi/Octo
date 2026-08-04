@@ -176,6 +176,7 @@
 			packageProductDependencies = (
 				47E05E012D444EE900D26DA6 /* ComposableArchitecture */,
 				476316262E5FB31400913CDE /* HexCore */,
+				47E16A612EC6C9D300885CF7 /* FluidAudio */,
 				4F0D6A192F1A000100000001 /* IssueReporting */,
 				4F0D6A1A2F1A000100000001 /* PerceptionCore */,
 				4F0D6A1D2F1A000100000001 /* Clocks */,
@@ -217,7 +218,6 @@
 				47C08AB52DE9F61B00564AE6 /* Inject */,
 				47512ABE2E14D8C9000E25BA /* WhisperKit */,
 				476316262E5FB31400913CDE /* HexCore */,
-				47E16A612EC6C9D300885CF7 /* FluidAudio */,
 				4F0D6A072F1A000100000001 /* Sharing */,
 				4F0D6A0C2F1A000100000001 /* CasePaths */,
 				4F0D6A0D2F1A000100000001 /* IdentifiedCollections */,
@@ -687,10 +687,10 @@
 		};
 		47E16A602EC6C9D300885CF7 /* XCRemoteSwiftPackageReference "FluidAudio" */ = {
 			isa = XCRemoteSwiftPackageReference;
-			repositoryURL = "https://github.com/blackforestboi/FluidAudio";
+			repositoryURL = "https://github.com/FluidInference/FluidAudio";
 			requirement = {
-				kind = revision;
-				revision = 5fe6950cd14f1de30a8e7f8add9bbf211b4cd2f4;
+				kind = exactVersion;
+				version = 0.15.5;
 			};
 		};
 		4F0D6A062F1A000100000001 /* XCRemoteSwiftPackageReference "swift-sharing" */ = {

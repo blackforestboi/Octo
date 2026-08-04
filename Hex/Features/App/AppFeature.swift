@@ -24,6 +24,7 @@ struct AppFeature {
     case handoffs
     case remappings
     case history
+		case session
     case about
 		case support
   }
@@ -275,6 +276,14 @@ struct AppFeature {
           await send(.settings(.set(\.shouldFlashModelSection, false)))
         }
 		.cancellable(id: CancelID.modelMissingFlash, cancelInFlight: true)
+
+		case .transcription(.recordingSessionOpened):
+			state.activeTab = .session
+			return .run { _ in
+				await MainActor.run {
+					NotificationCenter.default.post(name: .presentHistoryWindow, object: nil)
+				}
+			}
 
       case .transcription:
         return .none
@@ -530,6 +539,16 @@ struct AppView: View {
   var body: some View {
     NavigationSplitView(columnVisibility: $columnVisibility) {
       List(selection: $store.activeTab) {
+		if let session = store.transcription.recordingSession {
+			Button {
+				store.send(.setActiveTab(.session))
+			} label: {
+				SessionSidebarLabel(session: session)
+			}
+			.buttonStyle(.plain)
+			.tag(AppFeature.ActiveTab.session)
+		}
+
         Button {
           store.send(.setActiveTab(.history))
         } label: {
@@ -586,6 +605,7 @@ struct AppView: View {
 			.buttonStyle(.plain)
 			.tag(AppFeature.ActiveTab.support)
       }
+		.navigationSplitViewColumnWidth(min: 220, ideal: 250, max: 300)
     } detail: {
       switch store.state.activeTab {
       case .settings:
@@ -610,6 +630,26 @@ struct AppView: View {
 			onOpenSpeaker: { store.send(.focusSpeakerProfile($0)) }
 		)
 		  .navigationTitle("History")
+		case .session:
+			if let session = store.transcription.recordingSession {
+				RecordingSessionView(
+					session: session,
+					takes: store.history.transcriptionHistory.history.filter { $0.recordingSessionID == session.id },
+					rewritePrompts: store.hexSettings.rewritePrompts,
+					meter: store.transcription.meter,
+					systemAudioMeter: store.transcription.systemAudioMeter,
+					isTranscribing: store.transcription.isTranscribing,
+					send: { store.send(.transcription($0)) },
+					onBack: { store.send(.setActiveTab(.history)) }
+				)
+				.navigationTitle(session.title)
+			} else {
+				HistoryView(
+					store: store.scope(state: \.history, action: \.history),
+					onOpenSpeaker: { store.send(.focusSpeakerProfile($0)) }
+				)
+				.navigationTitle("History")
+			}
       case .about:
         AboutView(store: store.scope(state: \.settings, action: \.settings))
           .navigationTitle("About")
@@ -620,4 +660,91 @@ struct AppView: View {
     }
     .enableInjection()
   }
+}
+
+struct RecordingSessionTitlebarControls: View {
+	@Bindable var store: StoreOf<AppFeature>
+
+	var body: some View {
+		if store.activeTab == .session, let session = store.transcription.recordingSession {
+			HStack(spacing: 18) {
+				captureToggle(
+					"Speaker ID",
+					isOn: Binding(
+						get: { store.transcription.recordingSession?.speakerIdentificationEnabled ?? false },
+						set: { store.send(.transcription(.recordingSessionSpeakerIdentificationChanged($0))) }
+					)
+				)
+				captureToggle(
+					"System Audio",
+					isOn: Binding(
+						get: { store.transcription.recordingSession?.systemAudioEnabled ?? false },
+						set: { store.send(.transcription(.recordingSessionSystemAudioChanged($0))) }
+					)
+				)
+			}
+			.fixedSize()
+			.padding(.trailing, 8)
+			.accessibilityElement(children: .contain)
+			.accessibilityLabel("Recording options")
+			.disabled(session.isRecording)
+		}
+	}
+
+	private func captureToggle(_ title: String, isOn: Binding<Bool>) -> some View {
+		HStack(spacing: 7) {
+			Text(title)
+			Toggle("", isOn: isOn)
+				.labelsHidden()
+				.toggleStyle(.switch)
+		}
+	}
+}
+
+private struct SessionSidebarLabel: View {
+	let session: TranscriptionFeature.RecordingSession
+
+	var body: some View {
+		TimelineView(.periodic(from: .now, by: 1)) { context in
+			HStack(spacing: 10) {
+				ZStack(alignment: .bottomTrailing) {
+					Image(systemName: "waveform")
+					if session.isRecording {
+						PulsingSessionDot()
+					}
+				}
+					.frame(width: 22)
+				Text("Session")
+				Spacer(minLength: 6)
+				Text(formattedElapsedTime(session.elapsedDuration(at: context.date)))
+					.monospacedDigit()
+					.foregroundStyle(.secondary)
+			}
+		}
+		.accessibilityElement(children: .combine)
+		.accessibilityLabel("Session")
+		.accessibilityValue(session.isRecording ? "Recording" : "Paused")
+	}
+
+	private func formattedElapsedTime(_ duration: TimeInterval) -> String {
+		let totalSeconds = Int(duration)
+		return String(format: "%d:%02d", totalSeconds / 60, totalSeconds % 60)
+	}
+}
+
+private struct PulsingSessionDot: View {
+	@State private var isPulsing = false
+
+	var body: some View {
+		Circle()
+			.fill(.red)
+			.frame(width: 8, height: 8)
+			.scaleEffect(isPulsing ? 1 : 0.7)
+			.shadow(color: .red.opacity(isPulsing ? 0.7 : 0.2), radius: isPulsing ? 5 : 1)
+			.onAppear {
+				withAnimation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true)) {
+					isPulsing = true
+				}
+			}
+	}
 }

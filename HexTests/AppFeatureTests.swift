@@ -66,6 +66,39 @@ final class AppFeatureTests: XCTestCase {
 		}
 	}
 
+	func testRecordingSessionOpeningSelectsSession() async {
+		let store = TestStore(initialState: AppFeature.State()) {
+			AppFeature()
+		}
+
+		await store.send(.transcription(.recordingSessionOpened)) {
+			$0.activeTab = .session
+		}
+		await store.finish()
+	}
+
+	func testLeavingRecordingSessionKeepsItAvailableToResume() async {
+		let sessionID = UUID(uuidString: "00000000-0000-0000-0000-0000000000B1")!
+		var state = AppFeature.State()
+		state.activeTab = .session
+		state.transcription.recordingSession = .init(
+			id: sessionID,
+			title: "Recording: Aug 3, 2026 at 23:30",
+			phase: .paused,
+			speakerIdentificationEnabled: false,
+			systemAudioEnabled: false
+		)
+		let store = TestStore(initialState: state) {
+			AppFeature()
+		}
+
+		await store.send(.setActiveTab(.history)) {
+			$0.activeTab = .history
+		}
+		XCTAssertEqual(store.state.transcription.recordingSession?.id, sessionID)
+		XCTAssertEqual(store.state.transcription.recordingSession?.phase, .paused)
+	}
+
 	func testSupportTabCanBeSelected() async {
 		let store = TestStore(initialState: AppFeature.State()) {
 			AppFeature()
