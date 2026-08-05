@@ -781,6 +781,7 @@ struct RecordingSessionTitlebarControls: View {
 			let session = store.transcription.recordingSession
 		{
 			HStack(spacing: 14) {
+				/*
 				captureToggle(
 					"Live Transcript",
 					isOn: Binding(
@@ -789,6 +790,7 @@ struct RecordingSessionTitlebarControls: View {
 					)
 				)
 				.disabled(session.phase != .paused)
+				*/
 				captureToggle(
 					"Speaker ID",
 					isOn: Binding(

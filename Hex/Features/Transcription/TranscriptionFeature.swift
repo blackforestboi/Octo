@@ -747,6 +747,7 @@ struct TranscriptionFeature {
 		case .startRecordingSession:
 			guard !state.hasActiveRecordingSession else { return .none }
 			guard !state.isRecording, !state.isTranscribing, !state.isRefining else { return .none }
+			state.completedTranscriptPresentation = nil
 			state.recordingSession = RecordingSession(
 				id: uuid(),
 				title: "Recording: \(now.formatted(date: .abbreviated, time: .shortened))",
@@ -757,7 +758,11 @@ struct TranscriptionFeature {
 				speakerMode: state.hexSettings.speakerDiarizationMode,
 				isSpeakerModeReady: !state.hexSettings.speakerIdentificationEnabled
 			)
-			return .merge(.send(.recordingSessionOpened), prepareRecordingSessionEffect(state.recordingSession))
+			return .merge(
+				.cancel(id: CancelID.completedTranscriptPresentation),
+				.send(.recordingSessionOpened),
+				prepareRecordingSessionEffect(state.recordingSession)
+			)
 
 		case .recordingSessionOpened:
 			return .none
@@ -2465,6 +2470,7 @@ struct TranscriptionFeature {
 			.cancellable(id: CancelID.transcriptPaste, cancelInFlight: true)
 
 		case let .showCompletedTranscript(text):
+			guard !state.hasActiveRecordingSession else { return .none }
 			state.completedTranscriptPresentation = .expanded(text)
 			return .cancel(id: CancelID.completedTranscriptPresentation)
 

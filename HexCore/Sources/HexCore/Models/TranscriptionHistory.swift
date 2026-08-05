@@ -129,7 +129,7 @@ public struct Transcript: Codable, Equatable, Identifiable, Sendable {
 	/// The field is optional so existing History files remain fully compatible.
 	public var recordingSessionID: UUID?
 	/// The title the user sees for a recording session. It is repeated on each take so
-	/// a future History grouping can recover the session without another storage file.
+	/// History can group the session without another storage file.
 	public var recordingSessionTitle: String?
 	/// Stable identities referenced by committed live transcript sections.
 	public var sessionSpeakers: [SessionSpeaker]?

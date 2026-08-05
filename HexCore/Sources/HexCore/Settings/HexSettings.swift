@@ -309,7 +309,7 @@ public struct HexSettings: Codable, Equatable, Sendable {
 		lowercaseTranscripts: Bool = false,
 		removePunctuation: Bool = false,
 		speakerIdentificationEnabled: Bool = false,
-		liveTranscriptionEnabled: Bool = true,
+		liveTranscriptionEnabled: Bool = false,
 		speakerDiarizationMode: SpeakerDiarizationMode = .highAccuracyFour,
 		includeSystemAudio: Bool = false,
 		speakerDiarizationProvider: SpeakerDiarizationProvider = .fluidAudio,

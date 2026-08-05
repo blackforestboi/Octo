@@ -82,6 +82,8 @@ public enum TranscriptFragmentKind: String, Codable, Equatable, Sendable {
 
 /// A word recognized by an ASR provider together with its location in the source audio.
 public struct TimedTranscriptWord: Codable, Equatable, Sendable {
+	public static let matchingTimingTolerance: TimeInterval = 0.35
+
 	public var word: String
 	public var startTime: TimeInterval
 	public var endTime: TimeInterval
@@ -90,6 +92,14 @@ public struct TimedTranscriptWord: Codable, Equatable, Sendable {
 		self.word = word
 		self.startTime = startTime
 		self.endTime = endTime
+	}
+
+	/// Matches the same recognition across overlapping provider windows despite timing jitter.
+	public func approximatelyMatches(_ other: Self) -> Bool {
+		word.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+			== other.word.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+			&& abs(startTime - other.startTime) <= Self.matchingTimingTolerance
+			&& abs(endTime - other.endTime) <= Self.matchingTimingTolerance
 	}
 }
 

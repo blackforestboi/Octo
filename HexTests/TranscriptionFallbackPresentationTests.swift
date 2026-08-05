@@ -74,6 +74,108 @@ final class TranscriptionFallbackPresentationTests: XCTestCase {
 		XCTAssertNil(pastedText)
 	}
 
+	func testActiveRecordingSessionDoesNotShowTranscriptWhenDestinationIsMissing() async {
+		let probe = ClipboardProbe()
+		var state = TranscriptionFeature.State()
+		state.recordingSession = .init(
+			id: UUID(),
+			title: "Session",
+			phase: .paused,
+			speakerIdentificationEnabled: false,
+			systemAudioEnabled: false,
+			liveTranscriptionEnabled: false,
+			speakerMode: .highAccuracyFour
+		)
+		let store = TestStore(initialState: state) {
+			TranscriptionFeature()
+		} withDependencies: {
+			$0.pasteboard.focusedEditableDestination = { .absent }
+			$0.pasteboard.paste = { text in await probe.recordPaste(text) }
+		}
+
+		await store.send(.pasteCompletedTranscript("Session transcript"))
+		await store.receive(\.showCompletedTranscript)
+		await store.finish()
+
+		XCTAssertNil(store.state.completedTranscriptPresentation)
+		let pastedText = await probe.pastedText
+		XCTAssertNil(pastedText)
+	}
+
+	func testActiveRecordingSessionStillPastesIntoAvailableDestination() async {
+		let probe = ClipboardProbe()
+		var state = TranscriptionFeature.State()
+		state.recordingSession = .init(
+			id: UUID(),
+			title: "Session",
+			phase: .paused,
+			speakerIdentificationEnabled: false,
+			systemAudioEnabled: false,
+			liveTranscriptionEnabled: false,
+			speakerMode: .highAccuracyFour
+		)
+		let store = TestStore(initialState: state) {
+			TranscriptionFeature()
+		} withDependencies: {
+			$0.pasteboard.focusedEditableDestination = { .available }
+			$0.pasteboard.paste = { text in await probe.recordPaste(text) }
+		}
+
+		await store.send(.pasteCompletedTranscript("Paste session transcript"))
+		await store.finish()
+
+		let pastedText = await probe.pastedText
+		XCTAssertEqual(pastedText, "Paste session transcript")
+		XCTAssertNil(store.state.completedTranscriptPresentation)
+	}
+
+	func testEndedRecordingSessionStillShowsTranscriptWhenDestinationIsMissing() async {
+		var state = TranscriptionFeature.State()
+		state.recordingSession = .init(
+			id: UUID(),
+			title: "Session",
+			phase: .ended,
+			speakerIdentificationEnabled: false,
+			systemAudioEnabled: false,
+			liveTranscriptionEnabled: false,
+			speakerMode: .highAccuracyFour
+		)
+		let store = TestStore(initialState: state) {
+			TranscriptionFeature()
+		} withDependencies: {
+			$0.pasteboard.focusedEditableDestination = { .absent }
+		}
+
+		await store.send(.pasteCompletedTranscript("Post-session transcript"))
+		await store.receive(\.showCompletedTranscript) {
+			$0.completedTranscriptPresentation = .expanded("Post-session transcript")
+		}
+		await store.finish()
+	}
+
+	func testStartingRecordingSessionClearsExistingTranscriptPresentation() async {
+		let sessionID = UUID()
+		var state = TranscriptionFeature.State()
+		state.completedTranscriptPresentation = .expanded("Earlier transcript")
+		state.$hexSettings.withLock {
+			$0.speakerIdentificationEnabled = false
+			$0.includeSystemAudio = false
+			$0.liveTranscriptionEnabled = false
+		}
+		let store = TestStore(initialState: state) {
+			TranscriptionFeature()
+		} withDependencies: {
+			$0.uuid = .constant(sessionID)
+		}
+		store.exhaustivity = .off(showSkippedAssertions: false)
+
+		await store.send(.startRecordingSession)
+
+		XCTAssertNil(store.state.completedTranscriptPresentation)
+		XCTAssertEqual(store.state.recordingSession?.id, sessionID)
+		XCTAssertEqual(store.state.recordingSession?.phase, .preparing)
+	}
+
 	func testCopyShowsConfirmationThenHidesAfterTwoSeconds() async {
 		let clock = TestClock()
 		let probe = ClipboardProbe()

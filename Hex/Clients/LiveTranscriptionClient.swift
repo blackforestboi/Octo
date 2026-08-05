@@ -105,6 +105,48 @@ extension DependencyValues {
 }
 
 #if canImport(FluidAudio)
+/// Reconstructs the cumulative timed transcript from FluidAudio's current-window updates.
+enum LiveTranscriptionWordHistory {
+	static func merging(
+		_ existing: [TimedTranscriptWord],
+		with incoming: [TimedTranscriptWord]
+	) -> [TimedTranscriptWord] {
+		guard !incoming.isEmpty else { return existing }
+		guard !existing.isEmpty else { return incoming }
+
+		var firstOverlap: (oldIndex: Int, newIndex: Int)?
+		overlapSearch: for (newIndex, newWord) in incoming.enumerated() {
+			for oldIndex in existing.indices.reversed() {
+				let oldWord = existing[oldIndex]
+				if oldWord.endTime < newWord.startTime - TimedTranscriptWord.matchingTimingTolerance {
+					break
+				}
+				if oldWord.approximatelyMatches(newWord) {
+					firstOverlap = (oldIndex, newIndex)
+					break overlapSearch
+				}
+			}
+		}
+
+		let preservedPrefix: ArraySlice<TimedTranscriptWord>
+		if let firstOverlap {
+			let alignedIncomingStart = max(existing.startIndex, firstOverlap.oldIndex - firstOverlap.newIndex)
+			preservedPrefix = existing[..<alignedIncomingStart]
+		} else if let incomingStart = incoming.first?.startTime,
+			let existingEnd = existing.last?.endTime,
+			incomingStart < existingEnd - TimedTranscriptWord.matchingTimingTolerance
+		{
+			preservedPrefix = existing.prefix {
+				$0.endTime < incomingStart - TimedTranscriptWord.matchingTimingTolerance
+			}
+		} else {
+			preservedPrefix = existing[...]
+		}
+
+		return Array(preservedPrefix) + incoming
+	}
+}
+
 enum LiveTranscriptionASRTuning {
 	static let configuration = SlidingWindowAsrConfig(
 		chunkSeconds: 2,
@@ -130,6 +172,7 @@ private actor LiveTranscriptionClientLive {
 	private var diarizerTimeOffsets: [TranscriptAudioSource: TimeInterval] = [:]
 	private var hypothesisGenerations: [TranscriptAudioSource: Int] = [:]
 	private var latestHypotheses: [TranscriptAudioSource: LiveTranscriptionHypothesis] = [:]
+	private var wordHistories: [TranscriptAudioSource: [TimedTranscriptWord]] = [:]
 	private var eventContinuation: AsyncStream<LiveTranscriptionEvent>.Continuation?
 	private var sortformerModels: SortformerModels?
 	private var lsEENDModel: LSEENDModel?
@@ -383,6 +426,7 @@ private actor LiveTranscriptionClientLive {
 		diarizerTimeOffsets.removeAll()
 		hypothesisGenerations.removeAll()
 		latestHypotheses.removeAll()
+		wordHistories.removeAll()
 		eventContinuation?.finish()
 		eventContinuation = nil
 		configuration = nil
@@ -396,13 +440,18 @@ private actor LiveTranscriptionClientLive {
 		guard configuration?.takeGeneration == takeGeneration else { return }
 		let offset = sourceOffsets[source] ?? 0
 		let wordTimings = buildWordTimings(from: update.tokenTimings)
-		let words = wordTimings.map {
+		let windowWords = wordTimings.map {
 			TimedTranscriptWord(
 				word: $0.word,
 				startTime: $0.startTime + offset,
 				endTime: $0.endTime + offset
 			)
 		}
+		let words = LiveTranscriptionWordHistory.merging(
+			wordHistories[source] ?? [],
+			with: windowWords
+		)
+		wordHistories[source] = words
 		let diarization = diarizationSnapshot(for: source)
 		let modelSpeechThrough = max(
 			words.map(\.endTime).max() ?? 0,

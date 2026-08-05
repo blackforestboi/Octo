@@ -311,10 +311,7 @@ public struct LiveTranscriptCommitCoordinator: Equatable, Sendable {
 		var foundOverlap = false
 		for new in current.words {
 			let match = previous.words.indices.dropFirst(oldSearchStart).first { index in
-				let old = previous.words[index]
-				return normalized(old.word) == normalized(new.word)
-					&& abs(old.startTime - new.startTime) <= 0.35
-					&& abs(old.endTime - new.endTime) <= 0.35
+				previous.words[index].approximatelyMatches(new)
 			}
 			guard let match else {
 				if foundOverlap { break }
@@ -398,10 +395,6 @@ public struct LiveTranscriptCommitCoordinator: Equatable, Sendable {
 			if $0.endTime != $1.endTime { return $0.endTime < $1.endTime }
 			return ($0.audioSource?.rawValue ?? "") < ($1.audioSource?.rawValue ?? "")
 		}
-	}
-
-	private func normalized(_ word: String) -> String {
-		word.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
 	}
 
 	private func endsAtNaturalBoundary(_ text: String) -> Bool {
