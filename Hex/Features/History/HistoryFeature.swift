@@ -87,6 +87,62 @@ enum HistorySearch {
 	}
 }
 
+enum HistoryListEntry: Equatable, Identifiable {
+	enum ID: Hashable {
+		case recordingSession(UUID)
+		case transcript(UUID)
+	}
+
+	case recordingSession(id: UUID, title: String, takes: [Transcript])
+	case transcript(Transcript)
+
+	var id: ID {
+		switch self {
+		case let .recordingSession(id, _, _): .recordingSession(id)
+		case let .transcript(transcript): .transcript(transcript.id)
+		}
+	}
+
+	static func grouped(
+		from history: [Transcript],
+		matchingTranscriptIDs: Set<UUID>? = nil
+	) -> [Self] {
+		let runs = history.filter { $0.isRefinementSource != true }
+		let matchingSessionIDs = matchingTranscriptIDs.map { matchingIDs in
+			Set(runs.compactMap { transcript in
+				matchingIDs.contains(transcript.id) ? transcript.recordingSessionID : nil
+			})
+		}
+		let visibleRuns = runs.filter { transcript in
+			guard let matchingTranscriptIDs else { return true }
+			return matchingTranscriptIDs.contains(transcript.id)
+				|| transcript.recordingSessionID.map { matchingSessionIDs?.contains($0) == true } == true
+		}
+
+		var order = [ID]()
+		var groupedTranscripts = [ID: [Transcript]]()
+		for transcript in visibleRuns {
+			let id = transcript.recordingSessionID.map(ID.recordingSession) ?? .transcript(transcript.id)
+			if groupedTranscripts[id] == nil { order.append(id) }
+			groupedTranscripts[id, default: []].append(transcript)
+		}
+
+		return order.compactMap { id in
+			guard let transcripts = groupedTranscripts[id], let first = transcripts.first else { return nil }
+			switch id {
+			case let .recordingSession(sessionID):
+				let title = transcripts.lazy
+					.compactMap(\.recordingSessionTitle)
+					.first(where: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty })
+					?? "Recording Session"
+				return .recordingSession(id: sessionID, title: title, takes: transcripts)
+			case .transcript:
+				return .transcript(first)
+			}
+		}
+	}
+}
+
 private func highlightedText(_ text: String, matching query: String) -> AttributedString {
 	var attributedText = AttributedString(text)
 	for term in query.split(whereSeparator: \.isWhitespace) where !term.isEmpty {
@@ -508,25 +564,31 @@ struct HistoryFeature {
 					await pasteboard.copy(text)
 				}
 
-			case let .deleteTranscript(id):
-				guard let transcript = state.transcriptionHistory.history.first(where: { $0.id == id }) else {
-					return .none
-				}
+		case let .deleteTranscript(id):
+			guard let transcript = state.transcriptionHistory.history.first(where: { $0.id == id }) else {
+				return .none
+			}
+			let sessionTranscripts = transcript.recordingSessionID.map { sessionID in
+				state.transcriptionHistory.history.filter { $0.recordingSessionID == sessionID }
+			} ?? [transcript]
+			let sessionAudioPaths = Set(sessionTranscripts.map(\.audioPath))
+			let transcriptsToDelete = state.transcriptionHistory.history.filter { candidate in
+				sessionTranscripts.contains { $0.id == candidate.id }
+					|| (candidate.isRefinementSource == true && sessionAudioPaths.contains(candidate.audioPath))
+			}
+			let idsToDelete = Set(transcriptsToDelete.map(\.id))
 
-				if state.playingTranscriptID == id {
-					state.stopAudioPlayback()
-				}
+			if state.playingTranscriptID.map(idsToDelete.contains) == true {
+				state.stopAudioPlayback()
+			}
 
-				_ = state.$transcriptionHistory.withLock { history in
-					history.history.removeAll { $0.audioPath == transcript.audioPath }
-				}
-				let recordingIsStillReferenced = state.transcriptionHistory.history.contains { $0.audioPath == transcript.audioPath }
-
-				guard !recordingIsStillReferenced else { return .none }
-				return .merge(
-					.cancel(id: CancelID.playbackProgress),
-					deleteTranscriptFilesEffect(for: [transcript])
-				)
+			_ = state.$transcriptionHistory.withLock { history in
+				history.history.removeAll { idsToDelete.contains($0.id) }
+			}
+			return .merge(
+				.cancel(id: CancelID.playbackProgress),
+				deleteTranscriptFilesEffect(for: transcriptsToDelete)
+			)
 
 			case .deleteAllTranscripts:
 				return .send(.confirmDeleteAll)
@@ -1055,6 +1117,122 @@ private struct RunHistoryItemView: View {
 	private func formatMegabytes(_ bytes: Int) -> String { String(format: "%.2f MB", Double(bytes) / 1_000_000) }
 }
 
+private struct RecordingSessionHistoryItemView<TakeContent: View>: View {
+	let title: String
+	let takes: [Transcript]
+	let searchQuery: String
+	let onCopy: () -> Void
+	let onDelete: () -> Void
+	let takeContent: TakeContent
+	@State private var isShowingTakes = false
+
+	init(
+		title: String,
+		takes: [Transcript],
+		searchQuery: String,
+		onCopy: @escaping () -> Void,
+		onDelete: @escaping () -> Void,
+		@ViewBuilder takeContent: () -> TakeContent
+	) {
+		self.title = title
+		self.takes = takes
+		self.searchQuery = searchQuery
+		self.onCopy = onCopy
+		self.onDelete = onDelete
+		self.takeContent = takeContent()
+	}
+
+	private var sortedTakes: [Transcript] {
+		takes.sorted { $0.timestamp < $1.timestamp }
+	}
+
+	private var combinedTranscript: String {
+		sortedTakes
+			.map { ($0.rawText ?? $0.text).trimmingCharacters(in: .whitespacesAndNewlines) }
+			.filter { !$0.isEmpty }
+			.joined(separator: "\n\n")
+	}
+
+	private var mostRecentTimestamp: Date {
+		takes.map(\.timestamp).max() ?? .now
+	}
+
+	private var totalDuration: TimeInterval {
+		takes.reduce(0) { $0 + $1.duration }
+	}
+
+	var body: some View {
+		VStack(alignment: .leading, spacing: 0) {
+			HStack(spacing: 8) {
+				Label(title, systemImage: "record.circle")
+					.font(.headline)
+				Spacer()
+				Text("\(takes.count) \(takes.count == 1 ? "take" : "takes")")
+					.font(.caption.weight(.medium))
+					.foregroundStyle(.secondary)
+			}
+			.padding(12)
+			.overlay(alignment: .bottom) { Divider() }
+
+			VStack(alignment: .leading, spacing: 8) {
+				Label("Transcription", systemImage: "text.quote")
+					.font(.caption.weight(.semibold))
+					.foregroundStyle(.secondary)
+				Text(highlightedText(
+					combinedTranscript.isEmpty ? "No transcription was produced." : combinedTranscript,
+					matching: searchQuery
+				))
+					.textSelection(.enabled)
+					.fixedSize(horizontal: false, vertical: true)
+			}
+			.padding(12)
+			.overlay(alignment: .bottom) { Divider() }
+
+			DisclosureGroup(isExpanded: $isShowingTakes) {
+				VStack(spacing: 12) {
+					takeContent
+				}
+				.padding(.top, 12)
+			} label: {
+				Label("Individual takes", systemImage: "waveform")
+					.font(.caption.weight(.semibold))
+					.foregroundStyle(.secondary)
+			}
+			.padding(12)
+			.overlay(alignment: .bottom) { Divider() }
+
+			HStack(spacing: 8) {
+				Image(systemName: "clock")
+				Text(mostRecentTimestamp.relativeFormatted())
+				Text("•")
+				Text(mostRecentTimestamp.formatted(date: .omitted, time: .shortened))
+				Text("•")
+				Text(format(totalDuration))
+				Spacer()
+				Button(action: onCopy) { Image(systemName: "doc.on.doc.fill") }
+					.buttonStyle(.plain)
+					.help("Copy session transcript")
+				Button(action: onDelete) { Image(systemName: "trash.fill") }
+					.buttonStyle(.plain)
+					.foregroundStyle(.secondary)
+					.help("Delete session")
+			}
+			.font(.subheadline)
+			.foregroundStyle(.secondary)
+			.padding(.horizontal, 12)
+			.padding(.vertical, 8)
+		}
+		.background(
+			Color.octoCardBackground,
+			in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+		)
+	}
+
+	private func format(_ time: TimeInterval) -> String {
+		String(format: "%d:%02d", Int(time) / 60, Int(time) % 60)
+	}
+}
+
 private extension TranscriptProcessingStage {
 	var displayName: String {
 		switch self {
@@ -1464,10 +1642,11 @@ struct HistoryView: View {
 	@FocusState private var isSearchFieldFocused: Bool
 	@Shared(.hexSettings) var hexSettings: HexSettings
 
-	private var visibleTranscripts: [Transcript] {
-		let runs = store.transcriptionHistory.history.filter { $0.isRefinementSource != true }
-		guard let matchingTranscriptIDs else { return runs }
-		return runs.filter { matchingTranscriptIDs.contains($0.id) }
+	private var visibleEntries: [HistoryListEntry] {
+		HistoryListEntry.grouped(
+			from: store.transcriptionHistory.history,
+			matchingTranscriptIDs: matchingTranscriptIDs
+		)
 	}
 
 	var body: some View {
@@ -1502,33 +1681,34 @@ struct HistoryView: View {
 					.onSubmit(searchHistory)
 					.padding()
 
-				if matchingTranscriptIDs != nil && visibleTranscripts.isEmpty {
+				if matchingTranscriptIDs != nil && visibleEntries.isEmpty {
 					ContentUnavailableView.search(text: submittedSearchQuery)
 						.frame(maxWidth: .infinity, maxHeight: .infinity)
 				} else {
           ScrollView {
             LazyVStack(spacing: 12) {
-              ForEach(visibleTranscripts) { transcript in
-                RunHistoryItemView(
-                  transcript: transcript,
-                  legacyRawTranscript: store.transcriptionHistory.history.first(where: {
-                    $0.isRefinementSource == true && $0.audioPath == transcript.audioPath
-                  })?.text,
-                  isPlaying: store.playingTranscriptID == transcript.id && !store.isPlaybackPaused,
-                  isPlaybackPaused: store.playingTranscriptID == transcript.id && store.isPlaybackPaused,
-                  playbackProgress: store.playbackProgress,
-                  playbackDuration: store.playbackDuration,
-                  isRerunning: store.rerunningTranscriptIDs.contains(transcript.id),
-                  onPlay: { store.send(.playTranscript(transcript.id)) },
-                  onSeek: { store.send(.seekTranscript(transcript.id, $0)) },
-                  onCopy: { store.send(.copyToClipboard(transcript.text)) },
-				  onRerunTranscription: { store.send(.rerunTranscription(transcript.id)) },
-				  onRerunFullRun: { store.send(.rerunFullRun(transcript.id)) },
-					onDelete: { store.send(.deleteTranscript(transcript.id)) },
-					onOpenSpeaker: onOpenSpeaker,
-					searchQuery: matchingTranscriptIDs == nil ? "" : submittedSearchQuery
-                )
-              }
+				ForEach(visibleEntries) { entry in
+					switch entry {
+					case let .transcript(transcript):
+						runHistoryItem(transcript)
+					case let .recordingSession(_, title, takes):
+						RecordingSessionHistoryItemView(
+							title: title,
+							takes: takes,
+							searchQuery: matchingTranscriptIDs == nil ? "" : submittedSearchQuery,
+							onCopy: { store.send(.copyToClipboard(sessionTranscript(for: takes))) },
+							onDelete: {
+								if let firstTake = takes.first {
+									store.send(.deleteTranscript(firstTake.id))
+								}
+							}
+						) {
+							ForEach(takes.sorted(by: { $0.timestamp < $1.timestamp })) { transcript in
+								runHistoryItem(transcript)
+							}
+						}
+					}
+				}
             }
             .padding()
           }
@@ -1548,7 +1728,38 @@ struct HistoryView: View {
             Text("Are you sure you want to delete all transcripts? This action cannot be undone.")
           }
         }
-      }.enableInjection()
+	  }.enableInjection()
+	}
+
+	private func sessionTranscript(for takes: [Transcript]) -> String {
+		takes
+			.sorted { $0.timestamp < $1.timestamp }
+			.map { $0.text.trimmingCharacters(in: .whitespacesAndNewlines) }
+			.filter { !$0.isEmpty }
+			.joined(separator: "\n\n")
+	}
+
+	@ViewBuilder
+	private func runHistoryItem(_ transcript: Transcript) -> some View {
+		RunHistoryItemView(
+			transcript: transcript,
+			legacyRawTranscript: store.transcriptionHistory.history.first(where: {
+				$0.isRefinementSource == true && $0.audioPath == transcript.audioPath
+			})?.text,
+			isPlaying: store.playingTranscriptID == transcript.id && !store.isPlaybackPaused,
+			isPlaybackPaused: store.playingTranscriptID == transcript.id && store.isPlaybackPaused,
+			playbackProgress: store.playbackProgress,
+			playbackDuration: store.playbackDuration,
+			isRerunning: store.rerunningTranscriptIDs.contains(transcript.id),
+			onPlay: { store.send(.playTranscript(transcript.id)) },
+			onSeek: { store.send(.seekTranscript(transcript.id, $0)) },
+			onCopy: { store.send(.copyToClipboard(transcript.text)) },
+			onRerunTranscription: { store.send(.rerunTranscription(transcript.id)) },
+			onRerunFullRun: { store.send(.rerunFullRun(transcript.id)) },
+			onDelete: { store.send(.deleteTranscript(transcript.id)) },
+			onOpenSpeaker: onOpenSpeaker,
+			searchQuery: matchingTranscriptIDs == nil ? "" : submittedSearchQuery
+		)
 	}
 
 	private func searchHistory() {

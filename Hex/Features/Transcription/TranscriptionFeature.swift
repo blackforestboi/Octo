@@ -260,6 +260,8 @@ struct TranscriptionFeature {
 		let title: String
 		let startedAt: Date = .now
 		var phase: RecordingSessionPhase
+		var accumulatedRecordingDuration: TimeInterval = 0
+		var currentRecordingStartedAt: Date?
 		var speakerIdentificationEnabled: Bool
 		var systemAudioEnabled: Bool
 		var summaries: [Summary] = []
@@ -270,8 +272,20 @@ struct TranscriptionFeature {
 
 		var isRecording: Bool { phase == .recording }
 
+		mutating func beginRecording(at date: Date) {
+			guard currentRecordingStartedAt == nil else { return }
+			currentRecordingStartedAt = date
+		}
+
+		mutating func pauseRecording(at date: Date) {
+			guard let currentRecordingStartedAt else { return }
+			accumulatedRecordingDuration += max(0, date.timeIntervalSince(currentRecordingStartedAt))
+			self.currentRecordingStartedAt = nil
+		}
+
 		func elapsedDuration(at date: Date) -> TimeInterval {
-			max(0, date.timeIntervalSince(startedAt))
+			accumulatedRecordingDuration
+				+ (currentRecordingStartedAt.map { max(0, date.timeIntervalSince($0)) } ?? 0)
 		}
 	}
 
@@ -464,6 +478,7 @@ struct TranscriptionFeature {
 		case recordingSessionOpened
 		case pauseRecordingSession
 		case resumeRecordingSession
+		case stopRecordingSession
 		case recordingSessionSpeakerIdentificationChanged(Bool)
 		case recordingSessionSystemAudioChanged(Bool)
 		case generateRecordingSessionSummary(RewritePrompt)
@@ -613,13 +628,15 @@ struct TranscriptionFeature {
 
 		case .startRecordingSession:
 			guard !state.isRecording, !state.isTranscribing, !state.isRefining else { return .none }
-			state.recordingSession = RecordingSession(
+			var session = RecordingSession(
 				id: uuid(),
 				title: "Recording: \(now.formatted(date: .abbreviated, time: .shortened))",
 				phase: .recording,
 				speakerIdentificationEnabled: state.hexSettings.speakerIdentificationEnabled,
 				systemAudioEnabled: state.hexSettings.includeSystemAudio
 			)
+			session.beginRecording(at: now)
+			state.recordingSession = session
 			return .merge(.send(.recordingSessionOpened), .send(.startRecording))
 
 		case .recordingSessionOpened:
@@ -627,6 +644,7 @@ struct TranscriptionFeature {
 
 		case .pauseRecordingSession:
 			guard var session = state.recordingSession, session.phase == .recording else { return .none }
+			session.pauseRecording(at: now)
 			session.phase = .paused
 			session.summaries = []
 			session.summaryError = nil
@@ -641,12 +659,25 @@ struct TranscriptionFeature {
 				!state.isTranscribing,
 				!state.isRefining
 			else { return .none }
+			session.beginRecording(at: now)
 			session.phase = .recording
 			session.summaries = []
 			session.summaryError = nil
 			session.generatingSummaryPromptID = nil
 			state.recordingSession = session
 			return .send(.startRecording)
+
+		case .stopRecordingSession:
+			guard var session = state.recordingSession else { return .none }
+			let shouldStopRecording = session.phase == .recording && state.isRecording
+			if session.phase == .recording {
+				session.pauseRecording(at: now)
+			}
+			state.recordingSession = nil
+			return .merge(
+				.cancel(id: CancelID.recordingSessionSummary),
+				shouldStopRecording ? .send(.stopRecording) : .none
+			)
 
 		case let .recordingSessionSpeakerIdentificationChanged(isEnabled):
 			guard var session = state.recordingSession, !state.isRecording else { return .none }
@@ -1186,6 +1217,7 @@ struct TranscriptionFeature {
 		case .recordingStartFailed:
 			guard state.isRecording else { return .none }
 			if var session = state.recordingSession, session.phase == .recording {
+				session.pauseRecording(at: now)
 				session.phase = .paused
 				state.recordingSession = session
 			}
@@ -1200,6 +1232,7 @@ struct TranscriptionFeature {
 		case .recordingPermissionRequired:
 			guard state.isRecording else { return .none }
 			if var session = state.recordingSession, session.phase == .recording {
+				session.pauseRecording(at: now)
 				session.phase = .paused
 				state.recordingSession = session
 			}
@@ -3622,6 +3655,7 @@ private extension TranscriptionFeature {
   func handleDiscard(_ state: inout State) -> Effect<Action> {
 	let includeSystemAudio = state.activeSystemAudioEnabled
 	if var session = state.recordingSession, session.phase == .recording {
+		session.pauseRecording(at: now)
 		session.phase = .paused
 		state.recordingSession = session
 	}

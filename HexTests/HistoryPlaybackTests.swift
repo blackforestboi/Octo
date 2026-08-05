@@ -135,6 +135,49 @@ final class HistoryPlaybackTests: XCTestCase {
       $0.isPlaybackPaused = false
     }
   }
+
+	func testDeletingRecordingSessionRemovesAllTakesAndLegacyRefinementSources() async {
+		let sessionID = UUID()
+		let firstAudioURL = URL(fileURLWithPath: "/session-first.wav")
+		var firstTake = Transcript(
+			timestamp: Date(timeIntervalSince1970: 1),
+			text: "First take",
+			audioPath: firstAudioURL,
+			duration: 1,
+			recordingSessionID: sessionID
+		)
+		let secondTake = Transcript(
+			timestamp: Date(timeIntervalSince1970: 2),
+			text: "Second take",
+			audioPath: URL(fileURLWithPath: "/session-second.wav"),
+			duration: 1,
+			recordingSessionID: sessionID
+		)
+		var refinementSource = firstTake
+		refinementSource.id = UUID()
+		refinementSource.isRefinementSource = true
+		refinementSource.recordingSessionID = nil
+		firstTake.rawText = refinementSource.text
+		let ordinaryRun = Transcript(
+			timestamp: Date(timeIntervalSince1970: 3),
+			text: "Ordinary run",
+			audioPath: URL(fileURLWithPath: "/ordinary.wav"),
+			duration: 1
+		)
+		let store = TestStore(
+			initialState: HistoryFeature.State(
+				transcriptionHistory: Shared(value: .init(history: [firstTake, secondTake, refinementSource, ordinaryRun]))
+			)
+		) {
+			HistoryFeature()
+		}
+		store.exhaustivity = .off(showSkippedAssertions: false)
+
+		await store.send(.deleteTranscript(firstTake.id))
+		await store.finish()
+
+		XCTAssertEqual(store.state.transcriptionHistory.history.map(\.id), [ordinaryRun.id])
+	}
 }
 
 private func makeTestAudioURL() throws -> URL {

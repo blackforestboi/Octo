@@ -35,6 +35,7 @@ struct AppFeature {
 		var settings: SettingsFeature.State = .init()
 		var history: HistoryFeature.State = .init()
 		var activeTab: ActiveTab = .settings
+		var isEndRecordingSessionConfirmationPresented = false
 		var speakerProfileIDToFocus: UUID?
 		@Shared(.hexSettings) var hexSettings: HexSettings
 		@Shared(.modelBootstrapState) var modelBootstrapState: ModelBootstrapState
@@ -52,6 +53,9 @@ struct AppFeature {
     case settings(SettingsFeature.Action)
     case history(HistoryFeature.Action)
     case setActiveTab(ActiveTab)
+		case requestEndRecordingSession
+		case cancelEndRecordingSession
+		case confirmEndRecordingSession
 		case focusSpeakerProfile(UUID)
     case task
     case pasteLastTranscript
@@ -352,6 +356,20 @@ struct AppFeature {
 				state.speakerProfileIDToFocus = nil
 			}
 			return .none
+		case .requestEndRecordingSession:
+			guard state.transcription.recordingSession != nil else {
+				state.activeTab = .history
+				return .none
+			}
+			state.isEndRecordingSessionConfirmationPresented = true
+			return .none
+		case .cancelEndRecordingSession:
+			state.isEndRecordingSessionConfirmationPresented = false
+			return .none
+		case .confirmEndRecordingSession:
+			state.isEndRecordingSessionConfirmationPresented = false
+			state.activeTab = .history
+			return .send(.transcription(.stopRecordingSession))
 		case let .focusSpeakerProfile(profileID):
 			state.activeTab = .speakers
 			state.speakerProfileIDToFocus = profileID
@@ -640,7 +658,7 @@ struct AppView: View {
 					systemAudioMeter: store.transcription.systemAudioMeter,
 					isTranscribing: store.transcription.isTranscribing,
 					send: { store.send(.transcription($0)) },
-					onBack: { store.send(.setActiveTab(.history)) }
+					onBack: { store.send(.requestEndRecordingSession) }
 				)
 				.navigationTitle(session.title)
 			} else {
@@ -656,9 +674,25 @@ struct AppView: View {
 			case .support:
 				SupportView()
 					.navigationTitle("Support")
-      }
-    }
-    .enableInjection()
+		}
+	}
+	.enableInjection()
+		.alert(
+			"End Session",
+			isPresented: Binding(
+				get: { store.isEndRecordingSessionConfirmationPresented },
+				set: { if !$0 { store.send(.cancelEndRecordingSession) } }
+			)
+		) {
+			Button("End Session", role: .destructive) {
+				store.send(.confirmEndRecordingSession)
+			}
+			Button("Cancel", role: .cancel) {
+				store.send(.cancelEndRecordingSession)
+			}
+		} message: {
+			Text("Your session will be available via the history.")
+		}
   }
 }
 

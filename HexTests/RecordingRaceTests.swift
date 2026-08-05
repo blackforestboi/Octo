@@ -1546,6 +1546,26 @@ final class RecordingRaceTests: XCTestCase {
 		await store.finish()
 	}
 
+	func testRecordingSessionElapsedDurationFreezesWhilePausedAndResumes() {
+		let firstStart = Date(timeIntervalSince1970: 1_000)
+		var session = TranscriptionFeature.RecordingSession(
+			id: UUID(),
+			title: "Session",
+			phase: .recording,
+			speakerIdentificationEnabled: false,
+			systemAudioEnabled: false
+		)
+
+		session.beginRecording(at: firstStart)
+		XCTAssertEqual(session.elapsedDuration(at: firstStart.addingTimeInterval(8)), 8)
+
+		session.pauseRecording(at: firstStart.addingTimeInterval(10))
+		XCTAssertEqual(session.elapsedDuration(at: firstStart.addingTimeInterval(70)), 10)
+
+		session.beginRecording(at: firstStart.addingTimeInterval(100))
+		XCTAssertEqual(session.elapsedDuration(at: firstStart.addingTimeInterval(105)), 15)
+	}
+
 	func testRecordingSessionSummaryUsesTheSelectedTemplate() async {
 		let sessionID = UUID(uuidString: "00000000-0000-0000-0000-0000000000A1")!
 		let prompt = RewritePrompt(
