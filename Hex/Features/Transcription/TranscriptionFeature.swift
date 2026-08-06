@@ -628,6 +628,7 @@ struct TranscriptionFeature {
 
 		case .startRecordingSession:
 			guard !state.isRecording, !state.isTranscribing, !state.isRefining else { return .none }
+			state.completedTranscriptPresentation = nil
 			var session = RecordingSession(
 				id: uuid(),
 				title: "Recording: \(now.formatted(date: .abbreviated, time: .shortened))",
@@ -637,7 +638,11 @@ struct TranscriptionFeature {
 			)
 			session.beginRecording(at: now)
 			state.recordingSession = session
-			return .merge(.send(.recordingSessionOpened), .send(.startRecording))
+			return .merge(
+				.cancel(id: CancelID.completedTranscriptPresentation),
+				.send(.recordingSessionOpened),
+				.send(.startRecording)
+			)
 
 		case .recordingSessionOpened:
 			return .none
@@ -1652,6 +1657,7 @@ struct TranscriptionFeature {
 			.cancellable(id: CancelID.transcriptPaste, cancelInFlight: true)
 
 		case let .showCompletedTranscript(text):
+			guard state.recordingSession == nil else { return .none }
 			state.completedTranscriptPresentation = .expanded(text)
 			return .cancel(id: CancelID.completedTranscriptPresentation)
 
