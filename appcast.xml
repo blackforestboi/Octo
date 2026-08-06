@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
+    <channel>
+        <title>Octo Updates</title>
+        <link>https://blackforestboi.github.io/Octo/appcast.xml</link>
+        <description>Updates for Octo</description>
+        <language>en</language>
+        <item>
+            <title>2026.8.6</title>
+            <pubDate>Thu, 06 Aug 2026 14:15:41 +0200</pubDate>
+            <sparkle:version>93</sparkle:version>
+            <sparkle:shortVersionString>2026.8.6</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <enclosure url="https://github.com/blackforestboi/Octo/releases/download/v2026.8.6/Octo-2026.8.6.dmg" length="9965442" type="application/octet-stream" sparkle:edSignature="qYwfU5hTqR1RoupCfHYceQTjL/SQzoAkhM1CZdHqNPKKnkyb2hEJ4Bwn5TGgMSpjGKkVHdBQzEEEV3H0N1KQBw=="/>
+        </item>
+        <item>
+            <title>2026.7.311</title>
+            <pubDate>Fri, 31 Jul 2026 11:52:31 +0000</pubDate>
+            <sparkle:version>19</sparkle:version>
+            <sparkle:shortVersionString>2026.7.311</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <enclosure url="https://github.com/blackforestboi/Octo/releases/download/v2026.7.311/Octo-2026.7.311.dmg" length="9149816" type="application/octet-stream" sparkle:edSignature="xIOJpDfBC37jIVfnQFM42z0VEUwlig5N5Ziha7nA2TR+vK0yWqJZJIp8mmJNPdavjGQIXdU88oin4rMpg9iBCA=="/>
+        </item>
+        <item>
+            <title>2026.7.31</title>
+            <pubDate>Fri, 31 Jul 2026 01:04:39 +0000</pubDate>
+            <sparkle:version>17</sparkle:version>
+            <sparkle:shortVersionString>2026.7.31</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <enclosure url="https://github.com/blackforestboi/Octo/releases/download/v2026.7.31/Octo-2026.7.31.dmg" length="9104826" type="application/octet-stream" sparkle:edSignature="4pVRsqJ/od3HaB8hhbhsZhCzySC5I5/hVGPHwtChdjvFxzYeHgFOfqi87hPXg0eU4I7y1B/5O/bKCMUGLR2kAQ=="/>
+        </item>
+        <item>
+            <title>2026.7.29</title>
+            <pubDate>Wed, 29 Jul 2026 15:32:35 +0000</pubDate>
+            <sparkle:version>14</sparkle:version>
+            <sparkle:shortVersionString>2026.7.29</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <enclosure url="https://github.com/blackforestboi/Octo/releases/download/v2026.7.29/Octo-2026.7.29.dmg" length="8487784" type="application/octet-stream" sparkle:edSignature="iDXiFrN6GLGe7JiRPqko8XzGbg95/JsnXln2ZjuF1b3Qps+JDV33zfZyd0w23QytX3hitjsmBSSX4ERylzGiBg=="/>
+        </item>
+        <item>
+            <title>2026.7.28</title>
+            <pubDate>Tue, 28 Jul 2026 15:53:06 +0000</pubDate>
+            <sparkle:version>13</sparkle:version>
+            <sparkle:shortVersionString>2026.7.28</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <enclosure url="https://github.com/blackforestboi/Octo/releases/download/v2026.7.28/Octo-2026.7.28.dmg" length="8441823" type="application/octet-stream" sparkle:edSignature="iBBUqXQcl/KkTPqbvssHxDg2mT1unEZjmnwEUeMBEqQpohwJZ6ec6Hc0wbM5PtCvGnHE1SQpKFaX6UeFKEtiBg=="/>
+        </item>
+        <item>
+            <title>2026.7.24</title>
+            <pubDate>Fri, 24 Jul 2026 08:47:02 +0000</pubDate>
+            <sparkle:version>11</sparkle:version>
+            <sparkle:shortVersionString>2026.7.24</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <enclosure url="https://github.com/blackforestboi/Octo/releases/download/v2026.7.24/Octo-2026.7.24.dmg" length="8410933" type="application/octet-stream" sparkle:edSignature="7AaGIz+z5G41G0QKmPN4ZWeVAo+WuJdWe+46leggrqtEjgtw3qaGC/XDcG52P81uQE6hVh002sxQ1doU+1KqBw=="/>
+        </item>
+    </channel>
+</rss>
