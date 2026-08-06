@@ -59,5 +59,6 @@
             <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
             <enclosure url="https://github.com/blackforestboi/Octo/releases/download/v2026.7.24/Octo-2026.7.24.dmg" length="8410933" type="application/octet-stream" sparkle:edSignature="7AaGIz+z5G41G0QKmPN4ZWeVAo+WuJdWe+46leggrqtEjgtw3qaGC/XDcG52P81uQE6hVh002sxQ1doU+1KqBw=="/>
         </item>
+        <!-- Keep this feed deployment on a fresh Pages revision. -->
     </channel>
 </rss>
