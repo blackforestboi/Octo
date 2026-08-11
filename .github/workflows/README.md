@@ -11,8 +11,9 @@ It runs when that file changes on `main` or when manually dispatched.
 tagged release on a GitHub-hosted macOS runner. It publishes the GitHub Release,
 generates the signed Sparkle appcast, and deploys the feed to GitHub Pages.
 
-Pushing a `v*` tag starts the workflow. An existing tag can be retried through
-the workflow's manual `tag` input.
+Create and push the release tag, then manually run the workflow from `main` with
+that tag. Keeping dispatch on `main` satisfies the Pages environment protection
+rules while the workflow checks out and builds the immutable tag.
 
 ## Local release pipeline
 

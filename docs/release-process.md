@@ -13,12 +13,14 @@ the release commit and its tag:
 git push origin main
 git tag -a v2026.8.111 -m "Release v2026.8.111"
 git push origin v2026.8.111
+gh workflow run release.yml --ref main -f tag=v2026.8.111
 ```
 
-The tag starts `.github/workflows/release.yml`, which builds, signs, notarizes,
-packages, and publishes the release entirely on GitHub-hosted infrastructure.
-The workflow requires the repository's Apple signing, App Store Connect API,
-and Sparkle private-key secrets.
+The manual dispatch starts `.github/workflows/release.yml` from the Pages-approved
+`main` branch while checking out the immutable tag for the build. It signs,
+notarizes, packages, and publishes the release entirely on GitHub-hosted
+infrastructure. The release workflow requires the repository's Apple signing,
+App Store Connect API, and Sparkle private-key secrets.
 
 ## Local prerequisites
 
