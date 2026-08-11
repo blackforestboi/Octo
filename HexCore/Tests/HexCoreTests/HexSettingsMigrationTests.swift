@@ -1,4 +1,5 @@
 import XCTest
+import Sauce
 @testable import HexCore
 
 final class HexSettingsMigrationTests: XCTestCase {
@@ -22,6 +23,9 @@ final class HexSettingsMigrationTests: XCTestCase {
 		XCTAssertEqual(decoded.copyToClipboard, true)
 		XCTAssertTrue(decoded.superFastModeEnabled)
 		XCTAssertEqual(decoded.useDoubleTapOnly, true)
+		XCTAssertFalse(decoded.useSingleTapToStart)
+		XCTAssertFalse(decoded.refinementHotkeyEnabled)
+		XCTAssertNil(decoded.refinementHotkey)
 		XCTAssertTrue(decoded.allowLongPressForOnDemand)
 		XCTAssertEqual(decoded.doubleTapLockEnabled, true)
 		XCTAssertEqual(decoded.outputLanguage, "en")
@@ -56,6 +60,20 @@ final class HexSettingsMigrationTests: XCTestCase {
 		let data = try JSONEncoder().encode(settings)
 		let decoded = try JSONDecoder().decode(HexSettings.self, from: data)
 		XCTAssertEqual(decoded, settings)
+	}
+
+	func testRefinementHotkeySettingsRoundTrip() throws {
+		let hotkey = HotKey(key: .v, modifiers: [.option, .shift])
+		let settings = HexSettings(
+			refinementHotkeyEnabled: true,
+			refinementHotkey: hotkey
+		)
+
+		let data = try JSONEncoder().encode(settings)
+		let decoded = try JSONDecoder().decode(HexSettings.self, from: data)
+
+		XCTAssertTrue(decoded.refinementHotkeyEnabled)
+		XCTAssertEqual(decoded.refinementHotkey, hotkey)
 	}
 
 	func testLegacyCLIRefinementSettingsMigrateToMatchingHandoffConfiguration() throws {
@@ -100,17 +118,30 @@ final class HexSettingsMigrationTests: XCTestCase {
 
 	func testNewSettingsDefaultToDoubleTapOnly() {
 		XCTAssertTrue(HexSettings().useDoubleTapOnly)
+		XCTAssertFalse(HexSettings().useSingleTapToStart)
 	}
 
 	func testInitNormalizesDoubleTapOnlyWhenLockDisabled() {
-		let settings = HexSettings(useDoubleTapOnly: true, doubleTapLockEnabled: false)
+		let settings = HexSettings(
+			useDoubleTapOnly: true,
+			useSingleTapToStart: true,
+			doubleTapLockEnabled: false
+		)
 
 		XCTAssertFalse(settings.useDoubleTapOnly)
+		XCTAssertFalse(settings.useSingleTapToStart)
 		XCTAssertFalse(settings.doubleTapLockEnabled)
 	}
 
+	func testInitPrefersSingleTapStartOverDoubleTapOnly() {
+		let settings = HexSettings(useDoubleTapOnly: true, useSingleTapToStart: true)
+
+		XCTAssertTrue(settings.useSingleTapToStart)
+		XCTAssertFalse(settings.useDoubleTapOnly)
+	}
+
 	func testDecodeNormalizesDoubleTapOnlyWhenLockDisabled() throws {
-		let payload = "{\"useDoubleTapOnly\":true,\"doubleTapLockEnabled\":false}"
+		let payload = "{\"useDoubleTapOnly\":true,\"useSingleTapToStart\":true,\"doubleTapLockEnabled\":false}"
 		guard let data = payload.data(using: .utf8) else {
 			XCTFail("Failed to encode JSON payload")
 			return
@@ -119,6 +150,7 @@ final class HexSettingsMigrationTests: XCTestCase {
 		let decoded = try JSONDecoder().decode(HexSettings.self, from: data)
 
 		XCTAssertFalse(decoded.useDoubleTapOnly)
+		XCTAssertFalse(decoded.useSingleTapToStart)
 		XCTAssertFalse(decoded.doubleTapLockEnabled)
 	}
 

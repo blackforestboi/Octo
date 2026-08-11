@@ -12,6 +12,8 @@ public struct RefinementRequest: Equatable, Sendable {
 	public let modelID: String?
 	/// Optional screenshot and locally recognized text for screen-aware requests.
 	public let screenContext: ScreenContext?
+	/// Optional selected app text to transform when a screen-aware request also has a spoken instruction.
+	public let selectedText: String?
 	/// Whether the screen-aware request includes the screenshot or relies on local OCR only.
 	public let screenAwareInputSource: ScreenAwareInputSource
 
@@ -23,6 +25,7 @@ public struct RefinementRequest: Equatable, Sendable {
 		reasoningEffort: RefinementReasoningEffort = .none,
 		modelID: String? = nil,
 		screenContext: ScreenContext? = nil,
+		selectedText: String? = nil,
 		screenAwareInputSource: ScreenAwareInputSource = .image
 	) {
 		self.text = text
@@ -32,6 +35,7 @@ public struct RefinementRequest: Equatable, Sendable {
 		self.reasoningEffort = reasoningEffort
 		self.modelID = modelID
 		self.screenContext = screenContext
+		self.selectedText = selectedText
 		self.screenAwareInputSource = screenAwareInputSource
 	}
 
@@ -44,6 +48,7 @@ public struct RefinementRequest: Equatable, Sendable {
 			reasoningEffort: reasoningEffort,
 			modelID: modelID,
 			screenContext: screenContext,
+			selectedText: selectedText,
 			screenAwareInputSource: screenAwareInputSource
 		)
 	}

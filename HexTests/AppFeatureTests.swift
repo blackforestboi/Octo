@@ -7,6 +7,15 @@ import XCTest
 
 @MainActor
 final class AppFeatureTests: XCTestCase {
+	func testRefinementHotkeyForwardsToTranscription() async {
+		let store = TestStore(initialState: AppFeature.State()) {
+			AppFeature()
+		}
+
+		await store.send(.refinementHotkeyPressed)
+		await store.receive(.transcription(.refineMostRecentTranscription))
+	}
+
 	func testModelReadinessCompletionOpensTheRecordingGate() async {
 		var state = AppFeature.State()
 		state.$hexSettings.withLock { $0.selectedModel = ParakeetModel.englishV2.identifier }

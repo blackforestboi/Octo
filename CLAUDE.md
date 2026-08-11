@@ -183,25 +183,25 @@ FluidAudio models reside under `Application Support/FluidAudio/Models`.
 
 ## Releasing a New Version
 
-Releases are automated via a local CLI tool that handles building, signing, notarizing, and uploading.
+Releases are automated via `release/local-release.sh`. The canonical entrypoint
+is `bun run release`; `--local-build` selects local archive, signing,
+notarization, stapling, and packaging while the rest of the release flow remains
+unchanged. `bun run release:local` is a convenience alias.
 
 ### Prerequisites
 
-1. **AWS credentials** must be set (for S3 uploads):
-   ```bash
-   export AWS_ACCESS_KEY_ID=...
-   export AWS_SECRET_ACCESS_KEY=...
-   ```
+1. **Developer ID signing** must be available for team `5YUPQC9D96`.
 
-2. **Notarization credentials** stored in keychain (one-time setup):
+2. **Notarization credentials** must be stored in the keychain (one-time setup):
    ```bash
    xcrun notarytool store-credentials "AC_PASSWORD"
    ```
 
-3. **Dependencies installed** at project root and in tools:
+3. **GitHub CLI** must be authenticated with repository write access.
+
+4. **Dependencies installed** at project root:
    ```bash
-   bun install                # project root (for changesets)
-   cd tools && bun install    # tools dependencies
+   bun install
    ```
 
 ### Release Steps
@@ -210,7 +210,7 @@ Releases are automated via a local CLI tool that handles building, signing, nota
 
 2. **Run a Release compile preflight before pushing a release tag** - this catches
    macOS deployment-target availability errors and Swift type-checking failures
-   before the signed CI archive begins:
+   before the signed local archive begins:
    ```bash
    xcodebuild -scheme Octo -configuration Release \
      -skipMacroValidation -skipPackagePluginValidation \
@@ -221,41 +221,31 @@ Releases are automated via a local CLI tool that handles building, signing, nota
    macOS 14 deployment target with `#available` and keep numeric animation
    expressions explicit when Swift cannot infer a single numeric type.
 
-3. **Ensure changesets exist** - any user-facing change should have a `.changeset/*.md` file:
-   ```bash
-   bun run changeset:add-ai patch "Fix microphone selection"
-   ```
+3. **Prepare the release metadata** - apply pending changesets, sync the
+   changelog, and commit the release version before invoking the publisher. The
+   command requires `CFBundleShortVersionString` to already match the tag.
 
 4. **Run the release command** from project root:
    ```bash
-   bun run tools/src/cli.ts release
+   bun run release -- --local-build --tag v<version> --publish
    ```
 
 ### What the Release Tool Does
 
-1. Checks for clean working tree
-2. Finds pending changesets and applies them (bumps version in `package.json`)
-3. Syncs changelog to `Hex/Resources/changelog.md`
-4. Updates `Info.plist` and `project.pbxproj` with new version
-5. Increments build number
-6. Archives an Apple Silicon-only (`arm64`) app with xcodebuild using the persistent
+1. Checks for a clean default-branch working tree
+2. Verifies that the tag matches `CFBundleShortVersionString` and that the
+   project and plist build metadata agree
+3. For a new tag, increments the Sparkle build number when it is
+   not newer than the live or committed appcast
+4. Archives an Apple Silicon-only (`arm64`) app with xcodebuild using the persistent
    Release DerivedData cache; version/build-number edits do not invalidate it,
    and it clears that cache only when dependency inputs or the Xcode toolchain
    fingerprint changes
-7. Exports and signs with Developer ID
-8. Notarizes app with Apple
-9. Creates and signs DMG
-10. Notarizes DMG
-11. Generates Sparkle appcast
-12. Publishes the signed appcast to GitHub Pages and links it to GitHub release assets
-13. Commits version changes, creates git tag, pushes
-14. Creates GitHub release with DMG and ZIP attachments
-
-### If No Changesets Exist
-
-The tool will prompt you to either:
-- Stop and create a changeset (recommended)
-- Continue with manual version bump (useful for re-running failed releases)
+5. Re-signs and validates the app, notarizes the app and DMG, and creates the
+   ZIP and DMG locally
+6. Verifies the archived app and generated appcast contain matching release and
+   build values
+7. Creates or updates the GitHub Release and commits the signed appcast
 
 ### Artifacts
 
@@ -268,5 +258,5 @@ Each release produces Apple Silicon-only artifacts:
 
 - **"Working tree is not clean"**: Commit or stash all changes before releasing
 - **Notarization fails**: Check Apple ID credentials and app-specific password
-- **S3 upload fails**: Verify AWS credentials and bucket permissions
+- **GitHub upload fails**: Verify `gh auth status` and repository write access
 - **Build fails**: Ensure Xcode 16+ and valid code signing certificates

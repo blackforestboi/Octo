@@ -55,6 +55,18 @@ struct HotKeySectionView: View {
             if store.hexSettings.doubleTapLockEnabled {
                 Label {
                     Toggle(
+                        "Start recording on a single tap",
+                        isOn: Binding(
+                            get: { store.hexSettings.useSingleTapToStart },
+                            set: { store.send(.setUseSingleTapToStart($0)) }
+                        )
+                    )
+                } icon: {
+                    Image(systemName: "hand.tap.fill")
+                }
+
+                Label {
+                    Toggle(
                         "Use double-tap only",
                         isOn: Binding(
                             get: { store.hexSettings.useDoubleTapOnly },
@@ -82,7 +94,8 @@ struct HotKeySectionView: View {
 
             // Minimum key time (for modifier-only shortcuts)
             if store.hexSettings.hotkey.key == nil,
-               !(store.hexSettings.doubleTapLockEnabled && store.hexSettings.useDoubleTapOnly) {
+               !(store.hexSettings.doubleTapLockEnabled
+					&& (store.hexSettings.useDoubleTapOnly || store.hexSettings.useSingleTapToStart)) {
                 Label {
                     Slider(
                         value: Binding(
@@ -194,20 +207,28 @@ struct HotKeySectionView: View {
         let refinementEnabled = store.hexSettings.refinementEnabled
 		let agentHandoffEnabled = store.hexSettings.agentHandoffEnabled
         if store.hexSettings.doubleTapLockEnabled {
-			return ((!store.hexSettings.useDoubleTapOnly || store.hexSettings.allowLongPressForOnDemand)
+			let usesSingleTapStart = store.hexSettings.useSingleTapToStart
+			return ((!usesSingleTapStart && (!store.hexSettings.useDoubleTapOnly || store.hexSettings.allowLongPressForOnDemand))
 				? [HotKeySequence(title: String(localized: refinementEnabled ? "Start on-demand transcription or insta-refine selected text" : "Start on-demand transcription"), presses: [.long])]
                 : []) + [
-                HotKeySequence(title: String(localized: "Start hands-free transcription"), presses: [.short, .short]),
+                HotKeySequence(title: String(localized: "Start hands-free transcription"), presses: usesSingleTapStart ? [.short] : [.short, .short]),
                 HotKeySequence(title: String(localized: "Finish normally"), presses: [.short]),
-			] + (refinementEnabled ? [
-				HotKeySequence(title: String(localized: "Start screen-aware transcription"), presses: [.short, .long]),
+			] + (refinementEnabled ? (usesSingleTapStart ? [
                 HotKeySequence(title: String(localized: "Finish with refinement"), presses: [.long]),
 				HotKeySequence(
 					title: String(localized: "Finish with rewrite prompt"),
 					presses: [.numberRange, .long],
 					usesPlusSeparator: true
 				),
-			] : []) + agentHandoffSequence(enabled: agentHandoffEnabled)
+			] : [
+				HotKeySequence(title: String(localized: "Start screen-aware transcription"), presses: [.short, .long]),
+				HotKeySequence(title: String(localized: "Finish with refinement"), presses: [.long]),
+				HotKeySequence(
+					title: String(localized: "Finish with rewrite prompt"),
+					presses: [.numberRange, .long],
+					usesPlusSeparator: true
+				),
+			]) : []) + agentHandoffSequence(enabled: agentHandoffEnabled)
         } else {
 			return [
                 HotKeySequence(title: String(localized: "Transcribe while held"), presses: [.long]),

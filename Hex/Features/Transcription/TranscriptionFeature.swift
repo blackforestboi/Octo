@@ -498,6 +498,7 @@ struct TranscriptionFeature {
 				case finishScreenAwareRecording
 				case selectedTextCaptured(SelectedTextCapture)
 				case selectedTextCaptureUnavailable
+				case selectedTextCaptureTimedOut
 				case screenContextCaptured(UUID, ScreenContext)
 				case screenContextArtifactPersisted(UUID, URL)
 				case screenContextCaptureFailed(UUID, Error)
@@ -572,6 +573,7 @@ struct TranscriptionFeature {
 	#endif
 		case selectedTextOnlyRefinement
 		case selectedTextRefinement
+		case selectedTextCaptureTimeout
 		case errorPresentation
 		case completedTranscriptPresentation
 		case recordingSessionSummary
@@ -896,7 +898,7 @@ struct TranscriptionFeature {
 				state.isRefining = false
 				state.isCapturingSelectedTextForRefinement = true
 				state.refinedHotKeyReleasedWhileCapturingSelection = false
-				return .run { [pasteboard] send in
+				let captureSelection = Effect<Action>.run { [pasteboard] send in
 					let selectedText = await pasteboard.captureSelectedText()
 					guard !Task.isCancelled else {
 						await selectedText?.cancel()
@@ -909,6 +911,12 @@ struct TranscriptionFeature {
 					}
 				}
 				.cancellable(id: CancelID.selectedTextRefinement, cancelInFlight: true)
+				let captureTimeout = Effect<Action>.run { [clock] send in
+					try await clock.sleep(for: .seconds(1))
+					await send(.selectedTextCaptureTimedOut)
+				}
+				.cancellable(id: CancelID.selectedTextCaptureTimeout, cancelInFlight: true)
+				return .merge(captureSelection, captureTimeout)
 
 			case .screenAwareModeActivated:
 					guard state.isRecording,
@@ -1138,11 +1146,33 @@ struct TranscriptionFeature {
 			case .selectedTextCaptureUnavailable:
 				state.isCapturingSelectedTextForRefinement = false
 				state.refinedHotKeyReleasedWhileCapturingSelection = false
-				guard let pending = state.pendingSelectedTextTranscription else { return .none }
+				guard let pending = state.pendingSelectedTextTranscription else {
+					return .cancel(id: CancelID.selectedTextCaptureTimeout)
+				}
 				state.pendingSelectedTextTranscription = nil
-				return .send(.transcriptionResult(pending.channels, microphoneAudioURL: pending.microphoneAudioURL))
+				return .merge(
+					.cancel(id: CancelID.selectedTextCaptureTimeout),
+					.send(.transcriptionResult(pending.channels, microphoneAudioURL: pending.microphoneAudioURL))
+				)
+
+			case .selectedTextCaptureTimedOut:
+				guard state.isCapturingSelectedTextForRefinement else { return .none }
+				state.isCapturingSelectedTextForRefinement = false
+				state.refinedHotKeyReleasedWhileCapturingSelection = false
+				let pending = state.pendingSelectedTextTranscription
+				state.pendingSelectedTextTranscription = nil
+				transcriptionFeatureLogger.notice("Selected-text capture timed out; continuing without selection")
+				var effects: [Effect<Action>] = [
+					.cancel(id: CancelID.selectedTextRefinement),
+					.cancel(id: CancelID.selectedTextCaptureTimeout),
+				]
+				if let pending {
+					effects.append(.send(.transcriptionResult(pending.channels, microphoneAudioURL: pending.microphoneAudioURL)))
+				}
+				return .merge(effects)
 
 			case let .selectedTextCaptured(selectedText):
+				guard state.isCapturingSelectedTextForRefinement else { return .none }
 				state.isCapturingSelectedTextForRefinement = false
 				state.refinedHotKeyReleasedWhileCapturingSelection = false
 				state.selectedTextForRefinement = selectedText
@@ -1150,11 +1180,17 @@ struct TranscriptionFeature {
 					state.forcedRefinementMode = .refined
 					if let pending = state.pendingSelectedTextTranscription {
 						state.pendingSelectedTextTranscription = nil
-						return .send(.transcriptionResult(pending.channels, microphoneAudioURL: pending.microphoneAudioURL))
+						return .merge(
+							.cancel(id: CancelID.selectedTextCaptureTimeout),
+							.send(.transcriptionResult(pending.channels, microphoneAudioURL: pending.microphoneAudioURL))
+						)
 					}
-					return .none
+					return .cancel(id: CancelID.selectedTextCaptureTimeout)
 				}
-				return .send(.startSelectedTextOnlyRefinement)
+				return .merge(
+					.cancel(id: CancelID.selectedTextCaptureTimeout),
+					.send(.startSelectedTextOnlyRefinement)
+				)
 
 			case .startSelectedTextOnlyRefinement:
 				guard let selectedText = state.selectedTextForRefinement else { return .none }
@@ -1784,27 +1820,33 @@ private extension TranscriptionFeature {
   /// Effect to start monitoring hotkey events through the `keyEventMonitor`.
   func startHotKeyMonitoringEffect() -> Effect<Action> {
     .run { send in
-		var hotKeyProcessor: HotKeyProcessor = .init(hotkey: HotKey(key: nil, modifiers: [.option]))
-      @Shared(.isSettingHotKey) var isSettingHotKey: Bool
-      @Shared(.hexSettings) var hexSettings: HexSettings
+	var hotKeyProcessor: HotKeyProcessor = .init(hotkey: HotKey(key: nil, modifiers: [.option]))
+	  @Shared(.isSettingHotKey) var isSettingHotKey: Bool
+	  @Shared(.isSettingPasteLastTranscriptHotkey) var isSettingPasteLastTranscriptHotkey: Bool
+	  @Shared(.isSettingRefinementHotkey) var isSettingRefinementHotkey: Bool
+	  @Shared(.hexSettings) var hexSettings: HexSettings
 		let rewritePromptHoldTracker = RewritePromptHoldTracker()
 		var pendingScreenAwareActivationID: UUID?
 
       // Handle incoming input events (keyboard and mouse)
       let token = keyEventMonitor.handleInputEvent { inputEvent in
         // Skip if the user is currently setting a hotkey
-			if isSettingHotKey {
-	          return false
-	        }
+		if isSettingHotKey || isSettingPasteLastTranscriptHotkey || isSettingRefinementHotkey {
+		  return false
+		}
 
         // Always keep hotKeyProcessor in sync with current user hotkey preference
         hotKeyProcessor.hotkey = hexSettings.hotkey
 		let supportsScreenAwareGesture = hexSettings.refinementEnabled
 			&& ScreenAwareActivation.isAvailable(with: hexSettings)
-	        let useDoubleTapOnly = hexSettings.doubleTapLockEnabled
-	          && hexSettings.useDoubleTapOnly
+		let useDoubleTapOnly = hexSettings.doubleTapLockEnabled
+		  && hexSettings.useDoubleTapOnly
+		let useSingleTapToStart = hexSettings.doubleTapLockEnabled
+		  && hexSettings.useSingleTapToStart
+		let usesLockedStartGesture = useDoubleTapOnly || useSingleTapToStart
 	        hotKeyProcessor.doubleTapLockEnabled = hexSettings.doubleTapLockEnabled
 	        hotKeyProcessor.useDoubleTapOnly = useDoubleTapOnly
+		hotKeyProcessor.useSingleTapToStart = useSingleTapToStart
 	        hotKeyProcessor.allowLongPressForOnDemand = hexSettings.allowLongPressForOnDemand
 		hotKeyProcessor.lockingHoldDuration = hexSettings.refinementEnabled
 			? max(hexSettings.minimumKeyTime, ScreenAwareActivation.minimumHoldDuration)
@@ -1935,7 +1977,7 @@ private extension TranscriptionFeature {
 		  switch hotKeyProcessor.process(keyEvent: keyEvent) {
 		  case .armPendingPressAndHold:
 			Task { await send(.armPendingPressAndHold) }
-			return useDoubleTapOnly || keyEvent.key != nil
+			return usesLockedStartGesture || keyEvent.key != nil
 
 		  case .cancelPendingPressAndHold:
 			Task { await send(.cancelPendingPressAndHold) }
@@ -1943,13 +1985,13 @@ private extension TranscriptionFeature {
 
 		  case .armTerminalRefinement:
 			Task { await send(.armTerminalRefinement) }
-			return useDoubleTapOnly || keyEvent.key != nil
+			return usesLockedStartGesture || keyEvent.key != nil
 
 		  case .startRecording:
 			Task { await send(.hotKeyPressed) }
             // If the hotkey is purely modifiers, return false to keep it from interfering with normal usage
-            // But if useDoubleTapOnly is true, always intercept the key
-			return useDoubleTapOnly || keyEvent.key != nil
+            // Locked start gestures always intercept the key.
+			return usesLockedStartGesture || keyEvent.key != nil
 
 		  case .startRecordingAndArmScreenAware:
 			let activationID = UUID()
@@ -1958,7 +2000,7 @@ private extension TranscriptionFeature {
 				await send(.hotKeyPressed)
 				await send(.armScreenAwareActivation(activationID))
 			}
-			return useDoubleTapOnly || keyEvent.key != nil
+			return usesLockedStartGesture || keyEvent.key != nil
 
 		  case .stopRecording:
 			let screenAwareActivationID = pendingScreenAwareActivationID
@@ -3024,6 +3066,7 @@ private extension TranscriptionFeature {
 				return settings.screenAwareRequest(
 					for: text,
 					context: screenContext,
+					selectedText: selectedText?.text,
 					inputSource: state.screenAwareInputSourceForRefinement,
 					imageModelID: imageModelID
 				)
@@ -3576,6 +3619,7 @@ private extension TranscriptionFeature {
 				.cancel(id: CancelID.postHocRefinement),
 				.cancel(id: CancelID.selectedTextOnlyRefinement),
 				.cancel(id: CancelID.selectedTextRefinement),
+				.cancel(id: CancelID.selectedTextCaptureTimeout),
 				.cancel(id: CancelID.screenContextCapture),
       .cancel(id: CancelID.recordingStart),
 	  .run { [sleepManagement, systemAudioCapture] _ in
@@ -3700,6 +3744,7 @@ private extension TranscriptionFeature {
 			.cancel(id: CancelID.screenAwareActivation),
 			.cancel(id: CancelID.postHocRefinement),
 			.cancel(id: CancelID.selectedTextRefinement),
+			.cancel(id: CancelID.selectedTextCaptureTimeout),
 			.cancel(id: CancelID.screenContextCapture),
 	  .run { [sleepManagement, systemAudioCapture] _ in
 		await selectedText?.cancel()

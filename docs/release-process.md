@@ -34,15 +34,25 @@ build or notarize the app; it only deploys the committed feed to GitHub Pages.
 ## Publish a release
 
 ```bash
-bun run release:local -- --tag v2026.7.162 --publish
+bun run release -- --local-build --tag v2026.7.162 --publish
 ```
 
 Run the command only from a clean default branch after the release version is
-committed. It verifies that the tag matches `CFBundleShortVersionString`, creates
-and pushes the tag if needed, produces an Apple Silicon-only notarized ZIP and
-DMG locally, uploads them to GitHub Releases, then signs and commits the appcast.
-The appcast commit triggers the lightweight Pages deployment workflow; it does
-not start a macOS build.
+committed. `--local-build` is the build-location switch: it makes the archive,
+Developer ID signing, notarization, stapling, and packaging happen on this Mac.
+All publishing steps remain in the same flow: it creates and pushes the tag if
+needed, uploads the Apple Silicon-only notarized ZIP and DMG to GitHub Releases,
+then signs and commits the appcast. The appcast commit triggers the lightweight
+Pages deployment workflow; it does not start a macOS build.
+
+`bun run release:local -- --tag v2026.7.162 --publish` remains as a convenience
+alias for the same pipeline and supplies `--local-build` automatically.
+
+Before the archive, the command checks that `CFBundleVersion` and every
+`CURRENT_PROJECT_VERSION` agree. For a new tag, if the source build number is
+not newer than either the live Pages feed or the committed feed, it increments
+both sources, commits that metadata change, and pushes it before building. The
+generated appcast and archived app are checked again before publishing.
 
 The command refuses to publish unless `--publish` is provided. This prevents an
 accidental build or GitHub release while preparing a release.

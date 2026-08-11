@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026.8.11
+
+### Patch Changes
+
+- Add a dedicated refinement hotkey and optional single-tap start behavior.
+- Restore selected text as refinement context across more macOS apps.
+- Prevent selected-text refinement from remaining stuck in Processing when Accessibility does not respond.
+
 ## 2026.7.311
 
 ### Minor Changes

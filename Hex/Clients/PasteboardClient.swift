@@ -110,6 +110,13 @@ extension DependencyValues {
 
 final class PasteboardClientLive {
     @Shared(.hexSettings) var hexSettings: HexSettings
+
+	private static let selectedTextQueryTimeout: Float = 0.2
+
+	private struct FocusedSelection: @unchecked Sendable {
+		let element: AXUIElement
+		let text: String
+	}
     
     private struct PasteboardSnapshot {
         let items: [[String: Any]]
@@ -201,36 +208,47 @@ final class PasteboardClientLive {
         return .indeterminate
     }
 
-    /// Reads the current selection through Accessibility without synthesizing a Copy command.
-    /// This is deliberately side-effect-free: selection enrichment must not alter hotkey state.
+    /// Reads the current selection through the focused application's Accessibility tree.
     @MainActor
     func captureSelectedText() async -> SelectedTextCapture? {
         guard let sourceProcessIdentifier = NSWorkspace.shared.frontmostApplication?.processIdentifier else {
             return nil
         }
-		guard let (focusedElement, selectedText) = focusedSelection() else { return nil }
+		let selectionTask = Task.detached(priority: .userInitiated, operation: {
+			Self.focusedSelection(processIdentifier: sourceProcessIdentifier)
+		})
+		let focusedSelection = await withTaskCancellationHandler {
+			await selectionTask.value
+		} onCancel: {
+			selectionTask.cancel()
+		}
+		guard let focusedSelection else { return nil }
+		let focusedElement = focusedSelection.element
+		let selectedText = focusedSelection.text
 
-        return SelectedTextCapture(
-            text: selectedText,
-            replaceSelection: { [weak self] text in
-                guard let self else { return .pasteFailed }
+		return SelectedTextCapture(
+			text: selectedText,
+			replaceSelection: { [weak self] text in
+				guard let self else { return .pasteFailed }
 				return await self.replaceSelectedTextUsingAccessibility(
-                    with: text,
+					with: text,
 					originalSelection: selectedText,
 					focusedElement: focusedElement,
-                    sourceProcessIdentifier: sourceProcessIdentifier
-                )
-            },
+					sourceProcessIdentifier: sourceProcessIdentifier
+				)
+			},
 			cancelSelection: {}
-        )
-    }
+		)
+	}
 
-	@MainActor
-	private func focusedSelection() -> (AXUIElement, String)? {
-		let systemWideElement = AXUIElementCreateSystemWide()
+	private static func focusedSelection(processIdentifier: pid_t) -> FocusedSelection? {
+		guard !Task.isCancelled else { return nil }
+		let focusedApplication = AXUIElementCreateApplication(processIdentifier)
+		AXUIElementSetMessagingTimeout(focusedApplication, selectedTextQueryTimeout)
+
 		var focusedElementRef: CFTypeRef?
 		guard AXUIElementCopyAttributeValue(
-			systemWideElement,
+			focusedApplication,
 			kAXFocusedUIElementAttribute as CFString,
 			&focusedElementRef
 		) == .success,
@@ -238,17 +256,64 @@ final class PasteboardClientLive {
 		else { return nil }
 		let focusedElement = focusedElementRef as! AXUIElement
 
+		var candidate: AXUIElement? = focusedElement
+		for _ in 0..<12 {
+			guard !Task.isCancelled, let element = candidate else { break }
+			AXUIElementSetMessagingTimeout(element, selectedTextQueryTimeout)
+			if let selectedText = selectedText(on: element) {
+				return FocusedSelection(element: element, text: selectedText)
+			}
+
+			var parentRef: CFTypeRef?
+			guard AXUIElementCopyAttributeValue(
+				element,
+				kAXParentAttribute as CFString,
+				&parentRef
+			) == .success,
+			let parentRef
+			else { break }
+			candidate = parentRef as! AXUIElement
+		}
+
+		return nil
+	}
+
+	private static func selectedText(on element: AXUIElement) -> String? {
 		var selectedTextRef: CFTypeRef?
-		guard AXUIElementCopyAttributeValue(
-			focusedElement,
+		if AXUIElementCopyAttributeValue(
+			element,
 			kAXSelectedTextAttribute as CFString,
 			&selectedTextRef
 		) == .success,
-		let selectedText = selectedTextRef as? String
+		let selectedText = selectedTextRef as? String,
+		!selectedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+		{
+			return selectedText
+		}
+
+		var selectedRangeRef: CFTypeRef?
+		guard AXUIElementCopyAttributeValue(
+			element,
+			kAXSelectedTextRangeAttribute as CFString,
+			&selectedRangeRef
+		) == .success,
+		let selectedRangeRef,
+		CFGetTypeID(selectedRangeRef) == AXValueGetTypeID()
+		else { return nil }
+		let selectedRange = selectedRangeRef as! AXValue
+
+		var textForRangeRef: CFTypeRef?
+		guard AXUIElementCopyParameterizedAttributeValue(
+			element,
+			kAXStringForRangeParameterizedAttribute as CFString,
+			selectedRange,
+			&textForRangeRef
+		) == .success,
+		let selectedText = textForRangeRef as? String,
+		!selectedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
 		else { return nil }
 
-		guard !selectedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
-		return (focusedElement, selectedText)
+		return selectedText
 	}
 
     /// Replaces the captured selection only while the source app and selection still match.

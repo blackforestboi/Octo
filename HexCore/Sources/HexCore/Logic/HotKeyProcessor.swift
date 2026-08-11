@@ -98,6 +98,10 @@ public struct HotKeyProcessor {
     /// A held first press still activates an ordinary press-and-hold recording.
     public var useDoubleTapOnly: Bool = false
 
+    /// If true, a single hotkey tap starts and locks a recording. The next
+    /// terminal hotkey gesture still uses the standard locked-recording path.
+    public var useSingleTapToStart: Bool = false
+
     /// Allows the first press in double-tap-only mode to become an on-demand
     /// recording when held beyond the double-tap threshold.
     public var allowLongPressForOnDemand: Bool = true
@@ -172,18 +176,21 @@ public struct HotKeyProcessor {
     /// - Parameters:
     ///   - hotkey: The key combination to detect
     ///   - useDoubleTapOnly: If true, quick taps require a double-tap lock
+    ///   - useSingleTapToStart: If true, the first tap starts a locked recording
     ///   - allowLongPressForOnDemand: If true, a held first press still records on demand
     ///   - doubleTapLockEnabled: If false, disables double-tap lock behavior
     ///   - minimumKeyTime: Minimum duration for valid key press (overridden to modifierOnlyMinimumDuration for modifier-only)
     public init(
         hotkey: HotKey,
         useDoubleTapOnly: Bool = false,
+        useSingleTapToStart: Bool = false,
         allowLongPressForOnDemand: Bool = true,
         doubleTapLockEnabled: Bool = true,
         minimumKeyTime: TimeInterval = HexCoreConstants.defaultMinimumKeyTime
     ) {
         self.hotkey = hotkey
         self.useDoubleTapOnly = useDoubleTapOnly
+        self.useSingleTapToStart = useSingleTapToStart
         self.allowLongPressForOnDemand = allowLongPressForOnDemand
         self.doubleTapLockEnabled = doubleTapLockEnabled
         self.minimumKeyTime = minimumKeyTime
@@ -406,6 +413,10 @@ extension HotKeyProcessor {
         useDoubleTapOnly && doubleTapLockEnabled
     }
 
+    private var isSingleTapStartEnabledForCurrentHotkey: Bool {
+        useSingleTapToStart && doubleTapLockEnabled
+    }
+
     /// Handles keyboard events that match the configured hotkey.
     ///
     /// # State Transitions
@@ -432,6 +443,12 @@ extension HotKeyProcessor {
             {
                 clearDoubleTapTracking()
                 return .refineMostRecentTranscription
+            }
+
+            if isSingleTapStartEnabledForCurrentHotkey {
+                clearDoubleTapTracking()
+                state = .doubleTapLock
+                return .startRecording
             }
 
             if isDoubleTapOnlyEnabledForCurrentHotkey {

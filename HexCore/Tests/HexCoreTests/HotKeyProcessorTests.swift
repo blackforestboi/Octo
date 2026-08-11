@@ -370,6 +370,49 @@ struct HotKeyProcessorTests {
         )
     }
 
+	@Test
+	func singleTapStart_startsLockedRecordingAndKeepsTerminalTapBehavior() throws {
+		runScenario(
+			hotkey: HotKey(key: .a, modifiers: [.command]),
+			useSingleTapToStart: true,
+			steps: [
+				ScenarioStep(time: 0.0, key: .a, modifiers: [.command], expectedOutput: .startRecording, expectedIsMatched: true, expectedState: .doubleTapLock),
+				ScenarioStep(time: 0.1, key: nil, modifiers: [.command], expectedOutput: nil, expectedIsMatched: true, expectedState: .doubleTapLock),
+				ScenarioStep(time: 1.0, key: .a, modifiers: [.command], expectedOutput: nil, expectedIsMatched: true),
+				ScenarioStep(time: 1.1, key: nil, modifiers: [.command], expectedOutput: .stopRecording, expectedIsMatched: false)
+			]
+		)
+	}
+
+	@Test
+	func singleTapStart_startsLockedRecordingForModifierOnlyHotkeys() throws {
+		runScenario(
+			hotkey: HotKey(key: nil, modifiers: [.command]),
+			useSingleTapToStart: true,
+			steps: [
+				ScenarioStep(time: 0.0, key: nil, modifiers: [.command], expectedOutput: .startRecording, expectedIsMatched: true, expectedState: .doubleTapLock),
+				ScenarioStep(time: 0.1, key: nil, modifiers: [], expectedOutput: nil, expectedIsMatched: true, expectedState: .doubleTapLock),
+				ScenarioStep(time: 1.0, key: nil, modifiers: [.command], expectedOutput: nil, expectedIsMatched: true),
+				ScenarioStep(time: 1.1, key: nil, modifiers: [], expectedOutput: .stopRecording, expectedIsMatched: false)
+			]
+		)
+	}
+
+	@Test
+	func singleTapStart_keepsTerminalHoldRefinementBehavior() throws {
+		runScenario(
+			hotkey: HotKey(key: nil, modifiers: [.option]),
+			useSingleTapToStart: true,
+			lockingHoldDuration: 0.75,
+			steps: [
+				ScenarioStep(time: 0.0, modifiers: [.option], expectedOutput: .startRecording, expectedState: .doubleTapLock),
+				ScenarioStep(time: 0.1, modifiers: [], expectedOutput: nil, expectedState: .doubleTapLock),
+				ScenarioStep(time: 1.0, modifiers: [.option], expectedOutput: .armTerminalRefinement, expectedIsMatched: true),
+				ScenarioStep(time: 1.75, modifiers: [], expectedOutput: .stopRecordingWithRefinement, expectedIsMatched: false)
+			]
+		)
+	}
+
     // MARK: - Double-Tap Only (Modifier-Only)
 
     @Test
@@ -954,6 +997,7 @@ func pressAndHold_secondTapReleaseDoesNotClassifyScreenAware() {
 func runScenario(
     hotkey: HotKey,
     useDoubleTapOnly: Bool = false,
+	useSingleTapToStart: Bool = false,
 	allowLongPressForOnDemand: Bool = true,
 	doubleTapLockEnabled: Bool = true,
 	lockingHoldDuration: TimeInterval? = nil,
@@ -974,6 +1018,7 @@ func runScenario(
         HotKeyProcessor(
             hotkey: hotkey,
             useDoubleTapOnly: useDoubleTapOnly,
+			useSingleTapToStart: useSingleTapToStart,
 			allowLongPressForOnDemand: allowLongPressForOnDemand,
 			doubleTapLockEnabled: doubleTapLockEnabled
         )

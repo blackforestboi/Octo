@@ -411,6 +411,29 @@ final class RefinementTests: XCTestCase {
 		XCTAssertTrue(prompt.sourceText.contains("No text was recognized locally."))
 	}
 
+	func testScreenAwareRequestIncludesSelectedTextAsSourceMaterial() {
+		let context = ScreenContext(
+			imagePNGData: Data([0x01]),
+			recognizedText: "Visible account balance",
+			pixelWidth: 2560,
+			pixelHeight: 1440,
+			cursorX: 123,
+			cursorY: 456
+		)
+		let request = HexSettings().screenAwareRequest(
+			for: "Make it concise",
+			context: context,
+			selectedText: "Draft update"
+		)
+
+		XCTAssertEqual(request.text, "Make it concise")
+		XCTAssertEqual(request.selectedText, "Draft update")
+		let prompt = ScreenAwarePromptBuilder.prompt(request: request, context: context)
+		XCTAssertTrue(prompt.systemInstruction.contains("primary source material"))
+		XCTAssertTrue(prompt.sourceText.contains("<selected_text>\nDraft update\n</selected_text>"))
+		XCTAssertTrue(prompt.sourceText.contains("<spoken_request>\nMake it concise\n</spoken_request>"))
+	}
+
 	func testScreenAwareConfigurationRejectsWhitespaceOnlyModelID() {
 		XCTAssertFalse(HexSettings(screenAwareOpenRouterModelID: nil).isScreenAwareDictationConfigured)
 		XCTAssertTrue(HexSettings(screenAwareDictationEnabled: true).isScreenAwareDictationConfigured)

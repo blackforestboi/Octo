@@ -112,6 +112,9 @@ public struct HexSettings: Codable, Equatable, Sendable {
 	public var copyToClipboard: Bool
 	public var superFastModeEnabled: Bool
 	public var useDoubleTapOnly: Bool
+	/// Starts and locks a recording on the first hotkey tap. This is mutually
+	/// exclusive with `useDoubleTapOnly`, while terminal gestures stay the same.
+	public var useSingleTapToStart: Bool
 	public var allowLongPressForOnDemand: Bool
 	public var doubleTapLockEnabled: Bool
 	public var outputLanguage: String?
@@ -119,6 +122,9 @@ public struct HexSettings: Codable, Equatable, Sendable {
 	public var saveTranscriptionHistory: Bool
 	public var maxHistoryEntries: Int?
 	public var pasteLastTranscriptHotkey: HotKey?
+	/// Enables an optional hotkey that refines the most recently completed transcript.
+	public var refinementHotkeyEnabled: Bool
+	public var refinementHotkey: HotKey?
 	public var hasCompletedModelBootstrap: Bool
 	public var hasCompletedStorageMigration: Bool
 	public var wordRemovalsEnabled: Bool
@@ -232,6 +238,7 @@ public struct HexSettings: Codable, Equatable, Sendable {
 		public func screenAwareRequest(
 			for spokenRequest: String,
 			context: ScreenContext,
+			selectedText: String? = nil,
 			inputSource: ScreenAwareInputSource? = nil,
 			imageModelID: String? = nil
 		) -> RefinementRequest {
@@ -245,12 +252,16 @@ public struct HexSettings: Codable, Equatable, Sendable {
 			reasoningEffort: refinementReasoningEffort,
 			modelID: usesUploadedImage ? (imageModelID ?? screenAwareOpenRouterModelID) : selectedRefinementModelID,
 				screenContext: context,
+				selectedText: selectedText,
 				screenAwareInputSource: inputSource
 			)
 		}
 
 	private mutating func normalizeDoubleTapSettings() {
 		if !doubleTapLockEnabled {
+			useDoubleTapOnly = false
+			useSingleTapToStart = false
+		} else if useSingleTapToStart {
 			useDoubleTapOnly = false
 		}
 	}
@@ -290,6 +301,7 @@ public struct HexSettings: Codable, Equatable, Sendable {
 		copyToClipboard: Bool = false,
 		superFastModeEnabled: Bool = true,
 		useDoubleTapOnly: Bool = true,
+		useSingleTapToStart: Bool = false,
 		allowLongPressForOnDemand: Bool = true,
 		doubleTapLockEnabled: Bool = true,
 		outputLanguage: String? = nil,
@@ -297,6 +309,8 @@ public struct HexSettings: Codable, Equatable, Sendable {
 		saveTranscriptionHistory: Bool = true,
 		maxHistoryEntries: Int? = nil,
 		pasteLastTranscriptHotkey: HotKey? = HexSettings.defaultPasteLastTranscriptHotkey,
+		refinementHotkeyEnabled: Bool = false,
+		refinementHotkey: HotKey? = nil,
 		hasCompletedModelBootstrap: Bool = false,
 		hasCompletedStorageMigration: Bool = false,
 		wordRemovalsEnabled: Bool = false,
@@ -346,6 +360,7 @@ public struct HexSettings: Codable, Equatable, Sendable {
 		self.copyToClipboard = copyToClipboard
 		self.superFastModeEnabled = superFastModeEnabled
 		self.useDoubleTapOnly = useDoubleTapOnly
+		self.useSingleTapToStart = useSingleTapToStart
 		self.allowLongPressForOnDemand = allowLongPressForOnDemand
 		self.doubleTapLockEnabled = doubleTapLockEnabled
 		self.outputLanguage = outputLanguage
@@ -353,6 +368,8 @@ public struct HexSettings: Codable, Equatable, Sendable {
 		self.saveTranscriptionHistory = saveTranscriptionHistory
 		self.maxHistoryEntries = maxHistoryEntries
 		self.pasteLastTranscriptHotkey = pasteLastTranscriptHotkey
+		self.refinementHotkeyEnabled = refinementHotkeyEnabled
+		self.refinementHotkey = refinementHotkey
 		self.hasCompletedModelBootstrap = hasCompletedModelBootstrap
 		self.hasCompletedStorageMigration = hasCompletedStorageMigration
 		self.wordRemovalsEnabled = wordRemovalsEnabled
@@ -475,6 +492,7 @@ private enum HexSettingKey: String, CodingKey, CaseIterable {
 	case copyToClipboard
 	case superFastModeEnabled
 	case useDoubleTapOnly
+	case useSingleTapToStart
 	case allowLongPressForOnDemand
 	case doubleTapLockEnabled
 	case outputLanguage
@@ -482,6 +500,8 @@ private enum HexSettingKey: String, CodingKey, CaseIterable {
 	case saveTranscriptionHistory
 	case maxHistoryEntries
 	case pasteLastTranscriptHotkey
+	case refinementHotkeyEnabled
+	case refinementHotkey
 	case hasCompletedModelBootstrap
 	case hasCompletedStorageMigration
 	case wordRemovalsEnabled
@@ -607,6 +627,7 @@ private enum HexSettingsSchema {
 		SettingsField(.copyToClipboard, keyPath: \.copyToClipboard, default: defaults.copyToClipboard).eraseToAny(),
 		SettingsField(.superFastModeEnabled, keyPath: \.superFastModeEnabled, default: defaults.superFastModeEnabled).eraseToAny(),
 		SettingsField(.useDoubleTapOnly, keyPath: \.useDoubleTapOnly, default: defaults.useDoubleTapOnly).eraseToAny(),
+		SettingsField(.useSingleTapToStart, keyPath: \.useSingleTapToStart, default: defaults.useSingleTapToStart).eraseToAny(),
 		SettingsField(.allowLongPressForOnDemand, keyPath: \.allowLongPressForOnDemand, default: defaults.allowLongPressForOnDemand).eraseToAny(),
 		SettingsField(.doubleTapLockEnabled, keyPath: \.doubleTapLockEnabled, default: defaults.doubleTapLockEnabled).eraseToAny(),
 		SettingsField(
@@ -638,6 +659,15 @@ private enum HexSettingsSchema {
 			.pasteLastTranscriptHotkey,
 			keyPath: \.pasteLastTranscriptHotkey,
 			default: defaults.pasteLastTranscriptHotkey,
+			encode: { container, key, value in
+				try container.encodeIfPresent(value, forKey: key)
+			}
+		).eraseToAny(),
+		SettingsField(.refinementHotkeyEnabled, keyPath: \.refinementHotkeyEnabled, default: defaults.refinementHotkeyEnabled).eraseToAny(),
+		SettingsField(
+			.refinementHotkey,
+			keyPath: \.refinementHotkey,
+			default: defaults.refinementHotkey,
 			encode: { container, key, value in
 				try container.encodeIfPresent(value, forKey: key)
 			}

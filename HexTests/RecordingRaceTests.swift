@@ -918,6 +918,66 @@ final class RecordingRaceTests: XCTestCase {
 		XCTAssertEqual(refinedPaste, "shorter draft")
 	}
 
+	func testScreenAwareRefinementRetainsSelectedText() async throws {
+		let audioURL = FileManager.default.temporaryDirectory.appendingPathComponent("screen-aware-selected-text-\(UUID().uuidString).wav")
+		XCTAssertTrue(FileManager.default.createFile(atPath: audioURL.path, contents: Data("audio".utf8)))
+		defer { try? FileManager.default.removeItem(at: audioURL) }
+
+		let refinementProbe = RefinementProbe()
+		let selectedText = SelectedTextCapture(
+			text: "draft message",
+			replaceSelection: { _ in .replaced },
+			cancelSelection: {}
+		)
+		var state = Self.makeState()
+		state.isTranscribing = true
+		state.forcedRefinementMode = .refined
+		state.selectedTextForRefinement = selectedText
+		state.screenContextForRefinement = Self.makeScreenContext()
+		state.$hexSettings.withLock {
+			$0.saveTranscriptionHistory = false
+		}
+		let store = TestStore(initialState: state) {
+			TranscriptionFeature()
+		} withDependencies: {
+			$0.date.now = Date(timeIntervalSince1970: 1_234)
+			$0.pasteboard.paste = { _ in }
+			$0.refinement.refine = { request in
+				await refinementProbe.recordInput(request.text)
+				await refinementProbe.recordSelectedText(request.selectedText)
+				return "refined draft"
+			}
+			$0.soundEffects.play = { _ in }
+		}
+		store.exhaustivity = .off(showSkippedAssertions: false)
+
+		await store.send(.transcriptionAudioCaptured(audioURL, 2)) {
+			$0.activeTranscriptionAudioURL = audioURL
+			$0.activeTranscriptionDuration = 2
+		}
+		await store.send(.transcriptionResult("make it shorter", audioURL)) {
+			$0.isTranscribing = false
+			$0.isRefining = true
+		}
+		await store.receive(\.refinementResult) {
+			$0.activeTranscriptionAudioURL = nil
+			$0.activeTranscriptionDuration = nil
+			$0.isRefining = false
+			$0.selectedTextForRefinement = nil
+			$0.screenContextForRefinement = nil
+			$0.forcedRefinementMode = nil
+			$0.activeRecordingHotkey = nil
+			$0.activeMinimumKeyTime = nil
+			$0.activeRecordingSource = nil
+		}
+		await store.finish()
+
+		let refinementInput = await refinementProbe.input
+		let refinedSelectedText = await refinementProbe.selectedText
+		XCTAssertEqual(refinementInput, "make it shorter")
+		XCTAssertEqual(refinedSelectedText, "draft message")
+	}
+
 	func testSilentSelectedTextRefinementUsesDefaultInstructions() async throws {
 		let audioURL = FileManager.default.temporaryDirectory.appendingPathComponent("silent-selected-text-refinement-\(UUID().uuidString).wav")
 		XCTAssertTrue(FileManager.default.createFile(atPath: audioURL.path, contents: Data("audio".utf8)))
@@ -1003,6 +1063,30 @@ final class RecordingRaceTests: XCTestCase {
 			$0.isCapturingSelectedTextForRefinement = false
 			$0.refinedHotKeyReleasedWhileCapturingSelection = false
 		}
+		await store.finish()
+	}
+
+	func testSelectionCaptureTimeoutClearsProcessingWhenAccessibilityDoesNotRespond() async {
+		let clock = TestClock()
+		let captureProbe = PendingSelectedTextCaptureProbe()
+		let store = TestStore(initialState: Self.makeState()) {
+			TranscriptionFeature()
+		} withDependencies: {
+			$0.continuousClock = clock
+			$0.pasteboard.captureSelectedText = { await captureProbe.capture() }
+		}
+
+		await store.send(.refinedHotKeyPressed) {
+			$0.isCapturingSelectedTextForRefinement = true
+		}
+		await captureProbe.waitUntilPending()
+
+		await clock.advance(by: .seconds(1))
+		await store.receive(\.selectedTextCaptureTimedOut) {
+			$0.isCapturingSelectedTextForRefinement = false
+		}
+
+		await captureProbe.resume(nil)
 		await store.finish()
 	}
 
@@ -1637,10 +1721,12 @@ final class RecordingRaceTests: XCTestCase {
 private actor RefinementProbe {
 	private(set) var input: String?
 	private(set) var instructions: String?
+	private(set) var selectedText: String?
 	private(set) var paste: String?
 
 	func recordInput(_ value: String) { input = value }
 	func recordInstructions(_ value: String) { instructions = value }
+	func recordSelectedText(_ value: String?) { selectedText = value }
 	func recordPaste(_ value: String) { paste = value }
 }
 

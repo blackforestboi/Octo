@@ -12,11 +12,15 @@ readonly SPARKLE_KEYCHAIN_SERVICE_DEFAULT="Octo Sparkle Private Key"
 
 usage() {
   cat <<'USAGE'
-Usage: bun run release:local -- --tag v<version> --publish
+Usage:
+  bun run release -- --local-build --tag v<version> --publish
+  bun run release:local -- --tag v<version> --publish
 
 Build, notarize, staple, and publish an Octo release from this Mac.
 
 Required:
+  --local-build    Perform the archive, Developer ID signing, notarization,
+                   stapling, and packaging on this Mac.
   --tag v<version>  Version tag, matching CFBundleShortVersionString.
   --publish         Required acknowledgement that this command will create/push
                     the tag, create or update a GitHub Release, and push the
@@ -51,11 +55,33 @@ require_command() {
   command -v "$1" >/dev/null 2>&1 || die "Required command is unavailable: $1"
 }
 
+read_latest_appcast_build() {
+  python3 - "$1" <<'PYTHON'
+import sys
+import xml.etree.ElementTree as ET
+
+sparkle_namespace = "{http://www.andymatuschak.org/xml-namespaces/sparkle}"
+root = ET.parse(sys.argv[1]).getroot()
+builds = []
+for element in root.iter():
+    if element.tag == f"{sparkle_namespace}version" and element.text:
+        value = element.text.strip()
+        if value.isdigit():
+            builds.append(int(value))
+print(max(builds) if builds else "")
+PYTHON
+}
+
 tag=""
 publish=false
+local_build=false
 
 while (($#)); do
   case "$1" in
+    --local-build|--local)
+      local_build=true
+      shift
+      ;;
     --tag)
       (($# >= 2)) || die "--tag requires a value"
       tag="$2"
@@ -75,6 +101,7 @@ while (($#)); do
   esac
 done
 
+[[ "$local_build" == true ]] || die "This release entrypoint requires --local-build so packaging and notarization happen locally"
 [[ "$tag" =~ ^v[0-9]+(\.[0-9]+)+$ ]] || die "--tag must look like v2026.7.311"
 [[ "$publish" == true ]] || die "Refusing to publish without --publish"
 
@@ -82,8 +109,8 @@ for command in xcodebuild xcrun codesign ditto hdiutil gh git curl python3 secur
   require_command "$command"
 done
 
-git diff --quiet || die "Working tree has unstaged changes"
-git diff --cached --quiet || die "Working tree has staged changes"
+working_tree_status="$(git status --porcelain --untracked-files=all)"
+[[ -z "$working_tree_status" ]] || die "Working tree is not clean; commit or remove all changes before releasing"
 
 default_branch="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@')"
 [[ -n "$default_branch" ]] || default_branch="main"
@@ -93,6 +120,19 @@ current_branch="$(git branch --show-current)"
 version="${tag#v}"
 source_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Hex/Info.plist)"
 [[ "$source_version" == "$version" ]] || die "Tag $tag does not match Hex/Info.plist version $source_version"
+
+source_build="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' Hex/Info.plist)"
+[[ "$source_build" =~ ^[1-9][0-9]*$ ]] || die "Hex/Info.plist CFBundleVersion must be a positive integer: $source_build"
+project_builds="$(sed -nE 's/^[[:space:]]*CURRENT_PROJECT_VERSION = ([0-9]+);/\1/p' Hex.xcodeproj/project.pbxproj | sort -u)"
+[[ "$project_builds" == "$source_build" ]] || die "Build metadata disagrees: Info.plist=$source_build, project settings=$project_builds"
+
+tag_exists=false
+if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+  [[ "$(git rev-list -n 1 "$tag")" == "$(git rev-parse HEAD)" ]] || die "Existing tag $tag does not point to HEAD"
+  tag_exists=true
+elif git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+  die "Remote tag $tag exists but is not available locally for verification"
+fi
 
 identity="${DEVELOPER_ID_IDENTITY:-}"
 if [[ -z "$identity" ]]; then
@@ -122,6 +162,41 @@ cleanup() {
   rm -rf "$work_directory"
 }
 trap cleanup EXIT
+
+published_appcast="$work_directory/published-appcast.xml"
+if ! curl --fail --location --silent --show-error --output "$published_appcast" "https://blackforestboi.github.io/Octo/appcast.xml"; then
+  cp docs/updates/appcast.xml "$published_appcast"
+fi
+
+repository_appcast="$work_directory/repository-appcast.xml"
+cp docs/updates/appcast.xml "$repository_appcast"
+live_published_build="$(read_latest_appcast_build "$published_appcast")"
+repository_published_build="$(read_latest_appcast_build "$repository_appcast")"
+latest_published_build="$live_published_build"
+if [[ -z "$latest_published_build" || ( -n "$repository_published_build" && "$repository_published_build" -gt "$latest_published_build" ) ]]; then
+  latest_published_build="$repository_published_build"
+fi
+
+if [[ -n "$latest_published_build" ]]; then
+  if [[ "$tag_exists" == false && "$source_build" -le "$latest_published_build" ]]; then
+    next_build=$((latest_published_build + 1))
+    /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $next_build" Hex/Info.plist
+    sed -E -i '' "s/^([[:space:]]*)CURRENT_PROJECT_VERSION = [0-9]+;/\1CURRENT_PROJECT_VERSION = $next_build;/" Hex.xcodeproj/project.pbxproj
+    source_build="$next_build"
+    project_builds="$(sed -nE 's/^[[:space:]]*CURRENT_PROJECT_VERSION = ([0-9]+);/\1/p' Hex.xcodeproj/project.pbxproj | sort -u)"
+    [[ "$project_builds" == "$source_build" ]] || die "Failed to update all project build settings to $source_build"
+    git add Hex/Info.plist Hex.xcodeproj/project.pbxproj
+    git commit -m "chore(release): increment build number to $source_build"
+    git push origin "HEAD:$default_branch"
+    printf 'Incremented release build number to %s\n' "$source_build"
+  fi
+
+  if [[ "$tag_exists" == true ]]; then
+    [[ "$source_build" -ge "$latest_published_build" ]] || die "Build $source_build is older than the published Sparkle build $latest_published_build"
+  else
+    [[ "$source_build" -gt "$latest_published_build" ]] || die "Build $source_build is not newer than the published Sparkle build $latest_published_build"
+  fi
+fi
 
 release_derived_data="$(pwd)/build/DerivedData-Release"
 dependency_fingerprint_file="$release_derived_data/.dependency-fingerprint"
@@ -255,6 +330,8 @@ done < <(find "$app_path" -type f -print0)
 
 archive_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app_path/Contents/Info.plist")"
 [[ "$archive_version" == "$version" ]] || die "Built app version $archive_version does not match tag $tag"
+archive_build="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app_path/Contents/Info.plist")"
+[[ "$archive_build" == "$source_build" ]] || die "Built app build $archive_build does not match source build $source_build"
 
 ditto -c -k --sequesterRsrc --keepParent "$app_path" "$notarization_zip"
 xcrun notarytool submit "$notarization_zip" "${notary_args[@]}" --wait
@@ -271,14 +348,12 @@ unzip -tqq "$zip_path" >/dev/null
 spctl --assess --type execute --verbose=4 "$app_path"
 spctl --assess --type open --context context:primary-signature --verbose=4 "$dmg_path"
 
-if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
-  [[ "$(git rev-list -n 1 "$tag")" == "$(git rev-parse HEAD)" ]] || die "Existing tag $tag does not point to HEAD"
-elif git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
-  die "Remote tag $tag exists locally but is not available locally for verification"
-else
+if [[ "$tag_exists" == false ]]; then
   git tag -a "$tag" -m "Release $tag"
 fi
-git push origin "$tag"
+if [[ "$tag_exists" == false ]]; then
+  git push origin "$tag"
+fi
 
 if gh release view "$tag" --repo "$repository" >/dev/null 2>&1; then
   gh release upload "$tag" --repo "$repository" --clobber "$zip_path" "$dmg_path"
@@ -325,6 +400,24 @@ cp "$dmg_path" "$update_site/"
   --maximum-deltas 0 \
   -o "$update_site/appcast.xml" \
   "$update_site"
+
+python3 - "$update_site/appcast.xml" "$version" "$source_build" <<'PYTHON'
+import sys
+import xml.etree.ElementTree as ET
+
+sparkle_namespace = "{http://www.andymatuschak.org/xml-namespaces/sparkle}"
+expected_version = sys.argv[2]
+expected_build = sys.argv[3]
+root = ET.parse(sys.argv[1]).getroot()
+for item in root.findall(".//item"):
+    short_version = item.findtext(f"{sparkle_namespace}shortVersionString")
+    build = item.findtext(f"{sparkle_namespace}version")
+    if short_version == expected_version and build == expected_build:
+        raise SystemExit(0)
+raise SystemExit(
+    f"Generated appcast has no item for version {expected_version} and build {expected_build}"
+)
+PYTHON
 
 cp "$update_site/appcast.xml" docs/updates/appcast.xml
 git add docs/updates/appcast.xml

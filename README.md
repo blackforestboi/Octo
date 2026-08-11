@@ -24,10 +24,11 @@ Octo supports both [Parakeet TDT v3](https://github.com/FluidInference/FluidAudi
 
 Once you open Octo, you'll need to grant it microphone and accessibility permissions—so it can record your voice and paste the transcribed text into any application, respectively.
 
-Once you've configured a global hotkey, there are **two recording modes**:
+Once you've configured a global hotkey, there are **three recording modes**:
 
 1. **Press-and-hold** the hotkey to begin recording, say whatever you want, and then release the hotkey to start the transcription process. 
-2. **Double-tap** the hotkey to *lock recording*, say whatever you want, and then **tap** the hotkey once more to start the transcription process.
+2. **Single-tap** the hotkey to start and lock recording, then tap it once more to finish.
+3. **Double-tap** the hotkey to *lock recording*, say whatever you want, and then **tap** the hotkey once more to start the transcription process.
 
 ## Contributing
 
@@ -41,7 +42,7 @@ Once you've configured a global hotkey, there are **two recording modes**:
 - **For humans:** Run `bunx changeset` when your PR needs release notes. Pick `patch`, `minor`, or `major` and write a short summary—this creates a `.changeset/*.md` fragment.
 - Check what will ship with `bunx changeset status --verbose`.
 - `npm run sync-changelog` (or `bun run tools/scripts/sync-changelog.ts`) mirrors the root `CHANGELOG.md` into `Hex/Resources/changelog.md` so the in-app sheet always matches GitHub releases.
-- Build and notarize releases locally with `bun run release:local -- --tag v<version> --publish`. It uploads the completed ZIP and DMG to GitHub Releases and commits the signed Sparkle appcast; GitHub Actions only deploys that static feed to Pages.
+- Build and notarize releases locally through the canonical flow with `bun run release -- --local-build --tag v<version> --publish`. It uploads the completed ZIP and DMG to GitHub Releases and commits the signed Sparkle appcast; GitHub Actions only deploys that static feed to Pages. `bun run release:local -- --tag v<version> --publish` is a convenience alias.
 - The local command is production-only and refuses to create a tag, GitHub Release, or appcast update without `--publish`.
 
 ## Attribution and license

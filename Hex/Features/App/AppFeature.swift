@@ -56,9 +56,10 @@ struct AppFeature {
 		case requestEndRecordingSession
 		case cancelEndRecordingSession
 		case confirmEndRecordingSession
-		case focusSpeakerProfile(UUID)
+    case focusSpeakerProfile(UUID)
     case task
     case pasteLastTranscript
+	case refinementHotkeyPressed
     case interruptedRecordingsRecovered([RecoveredRecording], [RecoveredSystemAudioRecording])
 
     // Permission actions
@@ -109,7 +110,7 @@ struct AppFeature {
 			}
 		}
         let startupEffects: [Effect<Action>] = [
-          startPasteLastTranscriptMonitoring(),
+		  startSecondaryHotkeyMonitoring(),
           ensureSelectedModelReadiness(),
           startPermissionMonitoring(),
 		  .run { [recording, systemAudioCapture] send in
@@ -147,6 +148,9 @@ struct AppFeature {
         return .run { _ in
           await pasteboard.paste(lastTranscript)
         }
+
+	  case .refinementHotkeyPressed:
+		return .send(.transcription(.refineMostRecentTranscription))
 
       case let .interruptedRecordingsRecovered(recordings, systemAudioRecordings):
 		guard !recordings.isEmpty || !systemAudioRecordings.isEmpty else { return .none }
@@ -429,30 +433,45 @@ struct AppFeature {
     }
   }
   
-  private func startPasteLastTranscriptMonitoring() -> Effect<Action> {
+  private func startSecondaryHotkeyMonitoring() -> Effect<Action> {
     .run { send in
+	  @Shared(.isSettingHotKey) var isSettingHotKey: Bool
       @Shared(.isSettingPasteLastTranscriptHotkey) var isSettingPasteLastTranscriptHotkey: Bool
+	  @Shared(.isSettingRefinementHotkey) var isSettingRefinementHotkey: Bool
       @Shared(.hexSettings) var hexSettings: HexSettings
 
       let token = keyEventMonitor.handleKeyEvent { keyEvent in
         // Skip if user is setting a hotkey
-        if isSettingPasteLastTranscriptHotkey {
+		if isSettingHotKey || isSettingPasteLastTranscriptHotkey || isSettingRefinementHotkey {
           return false
         }
 
-        // Check if this matches the paste last transcript hotkey
-        guard let pasteHotkey = hexSettings.pasteLastTranscriptHotkey,
-              let key = keyEvent.key,
-              key == pasteHotkey.key,
-              keyEvent.modifiers.matchesExactly(pasteHotkey.modifiers) else {
-          return false
-        }
+		if let pasteHotkey = hexSettings.pasteLastTranscriptHotkey,
+			let key = keyEvent.key,
+			key == pasteHotkey.key,
+			keyEvent.modifiers.matchesExactly(pasteHotkey.modifiers)
+		{
+			// Trigger paste action - use MainActor to avoid escaping send.
+			MainActor.assumeIsolated {
+				send(.pasteLastTranscript)
+			}
+			return true
+		}
 
-        // Trigger paste action - use MainActor to avoid escaping send
-        MainActor.assumeIsolated {
-          send(.pasteLastTranscript)
-        }
-        return true // Intercept the key event
+		guard hexSettings.refinementEnabled,
+			hexSettings.refinementHotkeyEnabled,
+			let refinementHotkey = hexSettings.refinementHotkey,
+			let key = keyEvent.key,
+			key == refinementHotkey.key,
+			keyEvent.modifiers.matchesExactly(refinementHotkey.modifiers)
+		else {
+			return false
+		}
+
+		MainActor.assumeIsolated {
+			send(.refinementHotkeyPressed)
+		}
+		return true
       }
 
       defer { token.cancel() }
