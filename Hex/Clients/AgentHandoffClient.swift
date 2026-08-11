@@ -861,7 +861,8 @@ private enum CodexHandoffCoordinator {
 		}
 
 		var arguments = [
-			"exec", "--ephemeral", "--sandbox", "read-only", "--skip-git-repo-check",
+			"exec", "--ignore-user-config", "--ignore-rules", "--ephemeral",
+			"--sandbox", "read-only", "--skip-git-repo-check",
 			"--output-schema", schemaURL.path,
 			"--output-last-message", resultURL.path,
 			HandoffPrompt.codexPlannerRequest(
@@ -2211,10 +2212,38 @@ enum HandoffPrompt {
 	}
 }
 
-private struct ProcessResult {
+struct ProcessResult {
 	let status: Int32
 	let output: String
 	let error: String
+}
+
+private final class ProcessTermination: @unchecked Sendable {
+	private let lock = NSLock()
+	private var status: Int32?
+	private var continuation: CheckedContinuation<Int32, Never>?
+
+	func finish(with status: Int32) {
+		let continuation = lock.withLock {
+			guard self.status == nil else { return nil as CheckedContinuation<Int32, Never>? }
+			self.status = status
+			let continuation = self.continuation
+			self.continuation = nil
+			return continuation
+		}
+		continuation?.resume(returning: status)
+	}
+
+	func wait() async -> Int32 {
+		await withCheckedContinuation { continuation in
+			let status = lock.withLock {
+				if let status { return status }
+				self.continuation = continuation
+				return nil
+			}
+			if let status { continuation.resume(returning: status) }
+		}
+	}
 }
 
 private func conciseProcessDiagnostic(_ error: String) -> String? {
@@ -2241,10 +2270,15 @@ private func executable(named name: String, fallback: String? = nil) throws -> U
 	return executable
 }
 
-private func runProcess(executable: URL, arguments: [String], currentDirectoryURL: URL) async throws -> ProcessResult {
+func runProcess(
+	executable: URL,
+	arguments: [String],
+	currentDirectoryURL: URL
+) async throws -> ProcessResult {
 	let process = Process()
 	let output = Pipe()
 	let error = Pipe()
+	let termination = ProcessTermination()
 	process.executableURL = executable
 	process.arguments = arguments
 	process.currentDirectoryURL = currentDirectoryURL
@@ -2253,25 +2287,35 @@ private func runProcess(executable: URL, arguments: [String], currentDirectoryUR
 	process.standardError = error
 
 	return try await withTaskCancellationHandler(operation: {
-		try await withCheckedThrowingContinuation { continuation in
-			process.terminationHandler = { completed in
-				let standardOutput = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-				let standardError = String(decoding: error.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-				continuation.resume(returning: .init(
-					status: completed.terminationStatus,
-					output: standardOutput,
-					error: standardError
-				))
-			}
-			do {
-				try process.run()
-			} catch {
-				continuation.resume(throwing: AgentHandoffError.launchFailed(
-					executable.lastPathComponent.capitalized,
-					diagnostic: "macOS could not start the executable: \(error.localizedDescription)"
-				))
-			}
+		process.terminationHandler = { completed in
+			termination.finish(with: completed.terminationStatus)
 		}
+		do {
+			try process.run()
+		} catch {
+			throw AgentHandoffError.launchFailed(
+				executable.lastPathComponent.capitalized,
+				diagnostic: "macOS could not start the executable: \(error.localizedDescription)"
+			)
+		}
+
+		// Drain both pipes while the child is running. Waiting until termination can
+		// deadlock when the child fills either pipe and blocks before it can exit.
+		let outputTask = Task.detached {
+			output.fileHandleForReading.readDataToEndOfFile()
+		}
+		let errorTask = Task.detached {
+			error.fileHandleForReading.readDataToEndOfFile()
+		}
+		let status = await termination.wait()
+		let standardOutput = await outputTask.value
+		let standardError = await errorTask.value
+
+		return .init(
+			status: status,
+			output: String(decoding: standardOutput, as: UTF8.self),
+			error: String(decoding: standardError, as: UTF8.self)
+		)
 	}, onCancel: {
 		if process.isRunning { process.terminate() }
 	})

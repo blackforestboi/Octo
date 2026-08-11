@@ -4,6 +4,22 @@ import XCTest
 @testable import Octo
 
 final class AgentHandoffClientTests: XCTestCase {
+	func testRunProcessDrainsLargeOutputWhileTheCommandIsRunning() async throws {
+		let result = try await runProcess(
+			executable: URL(fileURLWithPath: "/bin/sh"),
+			arguments: [
+				"-c",
+				"dd if=/dev/zero bs=1024 count=256 2>/dev/null; "
+					+ "dd if=/dev/zero bs=1024 count=256 1>&2 2>/dev/null",
+			],
+			currentDirectoryURL: FileManager.default.temporaryDirectory
+		)
+
+		XCTAssertEqual(result.status, 0)
+		XCTAssertEqual(result.output.utf8.count, 256 * 1024)
+		XCTAssertEqual(result.error.utf8.count, 256 * 1024)
+	}
+
 	func testLaunchFailureIncludesDiagnostic() {
 		let error = AgentHandoffError.launchFailed(
 			"Codex planner",
