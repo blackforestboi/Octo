@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026.8.111
+
+### Patch Changes
+
+- Prevent Codex agent handoffs from deadlocking while the planner emits output.
+- Move the separate refinement shortcut controls into the Hot Key settings section.
+
 ## 2026.8.11
 
 ### Patch Changes

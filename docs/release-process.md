@@ -1,10 +1,24 @@
 # Octo Release Process
 
 Releases are built for Apple Silicon (`arm64`), signed, notarized, stapled, and
-packaged locally. The local release command thins Sparkle's prebuilt universal
-binaries and verifies every Mach-O file is `arm64`-only, then creates or updates
-the GitHub Release and commits the signed Sparkle feed. GitHub Actions does not
-build or notarize the app; it only deploys the committed feed to GitHub Pages.
+packaged either through GitHub Actions or the local release command. Both paths
+publish the GitHub Release and a signed Sparkle feed.
+
+## GitHub-hosted release
+
+Update and commit the marketing version, build number, and changelog, then push
+the release commit and its tag:
+
+```bash
+git push origin main
+git tag -a v2026.8.111 -m "Release v2026.8.111"
+git push origin v2026.8.111
+```
+
+The tag starts `.github/workflows/release.yml`, which builds, signs, notarizes,
+packages, and publishes the release entirely on GitHub-hosted infrastructure.
+The workflow requires the repository's Apple signing, App Store Connect API,
+and Sparkle private-key secrets.
 
 ## Local prerequisites
 

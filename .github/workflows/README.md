@@ -5,6 +5,15 @@
 `publish-update-feed.yml` deploys `docs/updates/appcast.xml` to GitHub Pages.
 It runs when that file changes on `main` or when manually dispatched.
 
+## Hosted release pipeline
+
+`release.yml` builds, Developer ID-signs, notarizes, staples, and packages a
+tagged release on a GitHub-hosted macOS runner. It publishes the GitHub Release,
+generates the signed Sparkle appcast, and deploys the feed to GitHub Pages.
+
+Pushing a `v*` tag starts the workflow. An existing tag can be retried through
+the workflow's manual `tag` input.
+
 ## Local release pipeline
 
 The production release pipeline runs on the local release machine:
@@ -22,4 +31,5 @@ appcast commit triggers the Pages-only workflow above.
 `bun run release:local -- --tag v<version> --publish` is a convenience alias
 that supplies `--local-build` automatically.
 
-No GitHub Actions workflow builds or notarizes a release.
+The local pipeline remains available when a release should be built on the
+maintainer's Mac instead of GitHub Actions.

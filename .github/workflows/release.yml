@@ -1,0 +1,227 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to release (for example v2026.8.111)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: macos-15
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    env:
+      APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+      APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+      TEAM_ID: 5YUPQC9D96
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Verify release metadata
+        id: metadata
+        env:
+          INPUT_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Hex/Info.plist)
+          BUILD=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' Hex/Info.plist)
+          test "$INPUT_TAG" = "v$VERSION"
+          PROJECT_BUILDS=$(sed -nE 's/^[[:space:]]*CURRENT_PROJECT_VERSION = ([0-9]+);/\1/p' Hex.xcodeproj/project.pbxproj | sort -u)
+          test "$PROJECT_BUILDS" = "$BUILD"
+          echo "tag=$INPUT_TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "build=$BUILD" >> "$GITHUB_OUTPUT"
+
+      - name: Import Developer ID certificate
+        uses: apple-actions/import-codesign-certs@v3
+        with:
+          p12-file-base64: ${{ secrets.MACOS_CERTIFICATE }}
+          p12-password: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+
+      - name: Prepare App Store Connect API key
+        env:
+          APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$APPLE_API_KEY_CONTENT"
+          test -n "$APPLE_API_KEY_ID"
+          test -n "$APPLE_API_ISSUER"
+          APPLE_API_KEY_PATH="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY_ID}.p8"
+          printf '%s' "$APPLE_API_KEY_CONTENT" > "$APPLE_API_KEY_PATH"
+          chmod 600 "$APPLE_API_KEY_PATH"
+          echo "APPLE_API_KEY_PATH=$APPLE_API_KEY_PATH" >> "$GITHUB_ENV"
+
+      - name: Archive signed Apple Silicon app
+        run: |
+          set -euo pipefail
+          IDENTITY=$(security find-identity -v -p codesigning | awk -v team="$TEAM_ID" '/Developer ID Application:/ && index($0, team) {print $2; exit}')
+          test -n "$IDENTITY"
+          xcodebuild archive \
+            -scheme Octo \
+            -configuration Release \
+            -archivePath "$RUNNER_TEMP/Octo.xcarchive" \
+            -skipMacroValidation \
+            -skipPackagePluginValidation \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=YES \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="$IDENTITY" \
+            DEVELOPMENT_TEAM="$TEAM_ID"
+          echo "SIGNING_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+
+      - name: Preserve entitlements and sign Sparkle
+        run: |
+          set -euo pipefail
+          APP_PATH="$RUNNER_TEMP/Octo.xcarchive/Products/Applications/Octo.app"
+          test -d "$APP_PATH"
+          APP_ENTITLEMENTS="$RUNNER_TEMP/Octo.entitlements"
+          codesign -d --entitlements :- "$APP_PATH" > "$APP_ENTITLEMENTS"
+          plutil -lint "$APP_ENTITLEMENTS" >/dev/null
+          test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.device.audio-input' "$APP_ENTITLEMENTS")" = true
+
+          SPARKLE_PATH="$APP_PATH/Contents/Frameworks/Sparkle.framework"
+          for BINARY in \
+            "$SPARKLE_PATH/Versions/B/Autoupdate" \
+            "$SPARKLE_PATH/Versions/B/Updater.app/Contents/MacOS/Updater" \
+            "$SPARKLE_PATH/Versions/B/XPCServices/Downloader.xpc/Contents/MacOS/Downloader" \
+            "$SPARKLE_PATH/Versions/B/XPCServices/Installer.xpc/Contents/MacOS/Installer" \
+            "$SPARKLE_PATH/Versions/B/Sparkle"; do
+            test -f "$BINARY"
+            ARCHITECTURES=$(lipo -archs "$BINARY")
+            if [ "$ARCHITECTURES" != arm64 ]; then
+              case " $ARCHITECTURES " in
+                *" arm64 "*) ;;
+                *) echo "Sparkle binary has no arm64 slice: $BINARY ($ARCHITECTURES)" >&2; exit 1 ;;
+              esac
+              lipo "$BINARY" -thin arm64 -output "$BINARY.arm64"
+              mv "$BINARY.arm64" "$BINARY"
+            fi
+          done
+
+          for COMPONENT in \
+            "$SPARKLE_PATH/Versions/B/Autoupdate" \
+            "$SPARKLE_PATH/Versions/B/Updater.app" \
+            "$SPARKLE_PATH/Versions/B/XPCServices/Downloader.xpc" \
+            "$SPARKLE_PATH/Versions/B/XPCServices/Installer.xpc" \
+            "$SPARKLE_PATH"; do
+            codesign --force --options runtime --timestamp --sign "$SIGNING_IDENTITY" "$COMPONENT"
+          done
+          codesign \
+            --force \
+            --options runtime \
+            --timestamp \
+            --entitlements "$APP_ENTITLEMENTS" \
+            --sign "$SIGNING_IDENTITY" \
+            "$APP_PATH"
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+          test "$(lipo -archs "$APP_PATH/Contents/MacOS/Octo")" = arm64
+
+      - name: Notarize and package release
+        run: |
+          set -euo pipefail
+          APP_PATH="$RUNNER_TEMP/Octo.xcarchive/Products/Applications/Octo.app"
+          VERSION="${{ steps.metadata.outputs.version }}"
+          mkdir -p dist
+          ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "$RUNNER_TEMP/Octo-notarization.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/Octo-notarization.zip" \
+            --key "$APPLE_API_KEY_PATH" \
+            --key-id "$APPLE_API_KEY_ID" \
+            --issuer "$APPLE_API_ISSUER" \
+            --wait
+          xcrun stapler staple "$APP_PATH"
+          xcrun stapler validate "$APP_PATH"
+          ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "dist/Octo-$VERSION.zip"
+          hdiutil create -volname "Octo $VERSION" -srcfolder "$APP_PATH" -ov -format UDZO "dist/Octo-$VERSION.dmg"
+          xcrun notarytool submit "dist/Octo-$VERSION.dmg" \
+            --key "$APPLE_API_KEY_PATH" \
+            --key-id "$APPLE_API_KEY_ID" \
+            --issuer "$APPLE_API_ISSUER" \
+            --wait
+          xcrun stapler staple "dist/Octo-$VERSION.dmg"
+          xcrun stapler validate "dist/Octo-$VERSION.dmg"
+          unzip -tqq "dist/Octo-$VERSION.zip"
+          spctl --assess --type execute --verbose=4 "$APP_PATH"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.metadata.outputs.tag }}"
+          VERSION="${{ steps.metadata.outputs.version }}"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+              "dist/Octo-$VERSION.dmg" \
+              "dist/Octo-$VERSION.zip"
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag \
+              --title "Octo $VERSION" \
+              --generate-notes \
+              "dist/Octo-$VERSION.dmg" \
+              "dist/Octo-$VERSION.zip"
+          fi
+
+      - name: Generate signed Sparkle appcast
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$SPARKLE_PRIVATE_KEY"
+          GENERATE_APPCAST=$(find "$HOME/Library/Developer/Xcode/DerivedData" -path '*/Sparkle/bin/generate_appcast' -type f -print -quit)
+          test -n "$GENERATE_APPCAST"
+          mkdir update-site
+          if ! curl --fail --location --output update-site/appcast.xml \
+            https://blackforestboi.github.io/Octo/appcast.xml; then
+            cp docs/updates/appcast.xml update-site/appcast.xml
+          fi
+          cp "dist/Octo-${{ steps.metadata.outputs.version }}.dmg" update-site/
+          PRIVATE_KEY=$(printf '%s' "$SPARKLE_PRIVATE_KEY" | python3 -c 'import re, sys; value = sys.stdin.read().strip(); match = re.search(r"-----BEGIN [^-]+-----(.*?)-----END [^-]+-----", value, re.DOTALL); print("".join((match.group(1) if match else value).split()))')
+          test -n "$PRIVATE_KEY"
+          printf '%s' "$PRIVATE_KEY" | "$GENERATE_APPCAST" \
+            --ed-key-file - \
+            --download-url-prefix "https://github.com/$GITHUB_REPOSITORY/releases/download/${{ steps.metadata.outputs.tag }}/" \
+            --maximum-versions 0 \
+            --maximum-deltas 0 \
+            -o update-site/appcast.xml \
+            update-site
+          python3 - <<'PYTHON'
+          import xml.etree.ElementTree as ET
+
+          namespace = "{http://www.andymatuschak.org/xml-namespaces/sparkle}"
+          expected = ("${{ steps.metadata.outputs.version }}", "${{ steps.metadata.outputs.build }}")
+          root = ET.parse("update-site/appcast.xml").getroot()
+          entries = [
+              (item.findtext(f"{namespace}shortVersionString"), item.findtext(f"{namespace}version"))
+              for item in root.findall(".//item")
+          ]
+          if expected not in entries:
+              raise SystemExit(f"Generated appcast is missing version/build {expected}")
+          PYTHON
+
+      - name: Upload update feed
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: update-site
+
+      - name: Publish update feed
+        id: deployment
+        uses: actions/deploy-pages@v4

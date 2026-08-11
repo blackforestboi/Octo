@@ -7,9 +7,9 @@
 	<key>CFBundleIconFile</key>
 	<string>LegacyAppIcon</string>
 	<key>CFBundleShortVersionString</key>
-	<string>2026.8.11</string>
+	<string>2026.8.111</string>
 	<key>CFBundleVersion</key>
-	<string>95</string>
+	<string>96</string>
 	<key>NSAccessibilityUsageDescription</key>
 	<string>Octo needs accessibility access to monitor keyboard events for hotkey detection.</string>
 	<key>NSAppTransportSecurity</key>
