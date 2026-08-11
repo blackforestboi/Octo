@@ -82,12 +82,6 @@ struct RefinementSectionView: View {
 					}
 				}
 
-				Toggle("Enable Separate Hotkey for Refinement", isOn: $store.hexSettings.refinementHotkeyEnabled)
-
-				if store.hexSettings.refinementHotkeyEnabled {
-					RefinementHotkeyRow(store: store)
-				}
-
 				if store.hexSettings.refinementProvider == .apple {
 					LabeledContent("Model") {
 						Text("Apple Intelligence default")
@@ -765,67 +759,5 @@ struct RefinementSectionView: View {
 			get: { store.hexSettings.screenAwareDictationEnabled },
 			set: { store.send(.setScreenAwareDictationEnabled($0)) }
 		)
-	}
-}
-
-private struct RefinementHotkeyRow: View {
-	@ObserveInjection var inject
-	@Bindable var store: StoreOf<SettingsFeature>
-
-	var body: some View {
-		let refinementHotkey = store.hexSettings.refinementHotkey
-		let key = store.isSettingRefinementHotkey ? nil : refinementHotkey?.key
-		let modifiers = store.isSettingRefinementHotkey
-			? store.currentRefinementModifiers
-			: (refinementHotkey?.modifiers ?? .init(modifiers: []))
-
-		VStack(alignment: .leading, spacing: 8) {
-			Label {
-				VStack(alignment: .leading, spacing: 2) {
-					Text("Refinement Hotkey")
-						.font(.subheadline.weight(.semibold))
-					Text("Assign a shortcut to refine the most recently completed transcription.")
-						.settingsCaption()
-				}
-			} icon: {
-				Image(systemName: "wand.and.stars")
-			}
-
-			HStack {
-				Spacer()
-				ZStack {
-					HotKeyView(
-						modifiers: modifiers,
-						key: key,
-						isActive: store.isSettingRefinementHotkey
-					)
-
-					if !store.isSettingRefinementHotkey, refinementHotkey == nil {
-						Text("Not set")
-							.settingsCaption()
-					}
-				}
-				.contentShape(Rectangle())
-				.onTapGesture {
-					store.send(.startSettingRefinementHotkey)
-				}
-				Spacer()
-			}
-
-			if store.isSettingRefinementHotkey {
-				Text("Use at least one modifier (⌘, ⌥, ⇧, ⌃) plus a key.")
-					.settingsCaption()
-			} else if refinementHotkey != nil {
-				Button {
-					store.send(.clearRefinementHotkey)
-				} label: {
-					Label("Clear shortcut", systemImage: "xmark.circle")
-				}
-				.buttonStyle(.borderless)
-				.font(.caption)
-				.foregroundStyle(.secondary)
-			}
-		}
-		.enableInjection()
 	}
 }
