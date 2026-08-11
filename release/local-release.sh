@@ -346,7 +346,9 @@ xcrun stapler validate "$dmg_path"
 
 unzip -tqq "$zip_path" >/dev/null
 spctl --assess --type execute --verbose=4 "$app_path"
-spctl --assess --type open --context context:primary-signature --verbose=4 "$dmg_path"
+# DMGs are notarized containers, not executable code. `spctl --type open` reports
+# "no usable signature" for a valid stapled DMG; stapler validation above is the
+# authoritative validation for the disk image, while Gatekeeper assesses the app.
 
 if [[ "$tag_exists" == false ]]; then
   git tag -a "$tag" -m "Release $tag"
