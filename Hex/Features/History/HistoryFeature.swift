@@ -680,9 +680,9 @@ private struct AudioWaveformView: View {
 				let spacing = min(CGFloat(2), availableWidth / CGFloat(max(1, bars.count - 1)) / 2)
 				let barWidth = max(0.01, (availableWidth - spacing * CGFloat(bars.count - 1)) / CGFloat(bars.count))
 				for (index, sample) in bars.enumerated() {
-					let height = max(3, size.height * sample)
+					let height = max(CGFloat(3), size.height * sample)
 					let x = size.width * channelStart + CGFloat(index) * (barWidth + spacing)
-					let rect = CGRect(x: x, y: (size.height - height) / 2, width: barWidth, height: height)
+					let rect = CGRect(x: x, y: (size.height - height) / CGFloat(2), width: barWidth, height: height)
 					let sampleTime = startOffset + channelDuration * Double(index) / Double(max(1, bars.count - 1))
 					let color: Color = sampleTime <= progress ? .accentColor : .secondary.opacity(0.28)
 					context.fill(Path(roundedRect: rect, cornerRadius: barWidth / 2), with: .color(color))

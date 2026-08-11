@@ -2236,12 +2236,12 @@ private final class ProcessTermination: @unchecked Sendable {
 
 	func wait() async -> Int32 {
 		await withCheckedContinuation { continuation in
-			let status = lock.withLock {
-				if let status { return status }
+			let resolvedStatus: Int32? = lock.withLock {
+				if let finishedStatus = self.status { return finishedStatus }
 				self.continuation = continuation
 				return nil
 			}
-			if let status { continuation.resume(returning: status) }
+			if let resolvedStatus { continuation.resume(returning: resolvedStatus) }
 		}
 	}
 }
