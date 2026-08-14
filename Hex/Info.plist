@@ -9,7 +9,7 @@
 	<key>CFBundleShortVersionString</key>
 	<string>2026.8.112</string>
 	<key>CFBundleVersion</key>
-	<string>96</string>
+	<string>97</string>
 	<key>NSAccessibilityUsageDescription</key>
 	<string>Octo needs accessibility access to monitor keyboard events for hotkey detection.</string>
 	<key>NSAppTransportSecurity</key>
