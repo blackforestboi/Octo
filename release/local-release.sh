@@ -128,7 +128,7 @@ project_builds="$(sed -nE 's/^[[:space:]]*CURRENT_PROJECT_VERSION = ([0-9]+);/\1
 
 tag_exists=false
 if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
-  [[ "$(git rev-list -n 1 "$tag")" == "$(git rev-parse HEAD)" ]] || die "Existing tag $tag does not point to HEAD"
+  git merge-base --is-ancestor "$(git rev-list -n 1 "$tag")" HEAD || die "Existing tag $tag is not part of the current branch"
   tag_exists=true
 elif git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
   die "Remote tag $tag exists but is not available locally for verification"
