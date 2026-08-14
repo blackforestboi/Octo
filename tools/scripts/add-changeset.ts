@@ -40,7 +40,7 @@ const id = randomBytes(4).toString("hex");
 const filename = `.changeset/${id}.md`;
 
 const content = `---
-"hex-app": ${type}
+"octo-app": ${type}
 ---
 
 ${summary.trim()}

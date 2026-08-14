@@ -1,5 +1,51 @@
 # Changelog
 
+## 2026.8.112
+
+### Patch Changes
+
+- 11333f0: Make double-tap-only recording the default for new settings
+- 4fcd25a: Add a separate refinement hotkey
+- 11333f0: Connect OpenAI Subscription refinement through Codex's ChatGPT sign-in and show actionable failures without exposing the source transcript
+- 11333f0: Show missing microphone permission in the recording pill and let users click it to grant access
+- 11333f0: Keep accessibility permission prompts behind the Settings grant action
+- 10fede1: Prevent history audio controls from freezing Octo during macOS layout
+- 10fede1: Replace unstable cluster-centroid speaker matching with balanced end-to-end Sortformer diarization, immutable enrolled voice samples, fail-closed unknown speakers, and detailed enrollment and segment diagnostics
+- 11333f0: Keep Parakeet model download progress moving through installation
+- cbbef89: Prevent quick double taps from triggering Screen Aware
+- 11333f0: Only open completed Agent Handoff tasks from the menu
+- 4fcd25a: Prevent selected-text refinement from hanging when Accessibility stops responding
+- 4fcd25a: Restore selected text as refinement context in more apps
+- d6884e3: Keep dictation unavailable while a downloaded model is finalizing activation
+- 11333f0: Allow new Agent Handoff setups to accept Codex’s selected project-state file
+- 11333f0: Move the top transcription pill below the MacBook camera island
+- 10fede1: Keep hotkeys enabled after the selected model finishes loading
+- 10fede1: Reuse existing unsandboxed settings, models, history, and speaker profiles after removing App Sandbox
+- 11333f0: Show generated handoffs immediately in the Mac menu while keeping unfinished tasks non-openable
+- ff4788b: Move the separate refinement hotkey controls into the Hot Key settings section
+- 11333f0: Make Octo appear automatically in Accessibility permissions, avoid redundant Input Monitoring prompts, and read Codex project routing state without a file picker while preserving existing settings, history, recordings, and downloaded models
+- 11333f0: List every detected speaker in the local voice library as "Unknown Speaker N" so unnamed speakers can be renamed and recognized later, make unknown transcript speaker headers open and focus their name field, safely handle non-finite diarization embeddings, and retain complete voice samples without clipping speech at word-timestamp boundaries
+- 11333f0: Use Control as the default transcription hotkey
+- 11333f0: Show the native microphone prompt only after clicking Grant and preserve its required entitlement in signed releases
+- 4fcd25a: Add a single-tap hotkey start option
+- 3176210: Reuse cached OpenAI subscription models and refresh the catalog only when requested, missing, or rejected by Codex
+- 11333f0: Hide handoff pill text as it condenses to the departure ball
+- 11333f0: Show a blue background while recording
+- 11333f0: Connect OpenAI Subscription before agent handoffs and ask the active Codex runtime for its project-state location instead of assuming a workspace or data path
+- cbbef89: Make recording-session waveforms scroll live with independent microphone and system-audio levels
+- ded5465: Hide unpasted result previews during active recording sessions
+- 10fede1: Let Agent Handoff coordinators continue explicitly named Codex tasks
+- cbbef89: Add persistent recording sessions from Shift-started hotkeys
+- cbbef89: Show identified speakers in recording overviews
+- 3c61f6f: Prevent screen-aware capture from reopening the Settings window
+- e6f9a50: Prevent Codex handoff planning from deadlocking on planner output
+- e9b837e: Preserve Parakeet v2 audio through the exact stop boundary
+- 11333f0: Preserve all queued microphone audio through the physical stop event
+- 10fede1: Show separate microphone and system-audio waveforms for dual-source recordings
+- 61778ce: Replace the long-recording cancellation stepper with a text field and default it to one minute
+- c7b748f: Confirm session exits, pause session timers, and group session History takes
+- 11333f0: Ensure Agent Handoff research tasks receive extracted source URLs
+
 ## 2026.8.111
 
 ### Patch Changes
