@@ -8,7 +8,8 @@ set -euo pipefail
 
 readonly TEAM_ID="5YUPQC9D96"
 readonly NOTARY_PROFILE_DEFAULT="AC_PASSWORD"
-readonly SPARKLE_KEYCHAIN_SERVICE_DEFAULT="Octo Sparkle Private Key"
+readonly SPARKLE_KEYCHAIN_ACCOUNT_DEFAULT="octo-updates"
+readonly SPARKLE_KEYCHAIN_SERVICE_DEFAULT="https://sparkle-project.org"
 
 usage() {
   cat <<'USAGE'
@@ -34,7 +35,9 @@ Optional environment:
   SPARKLE_PRIVATE_KEY_FILE    Path to the Sparkle private Ed25519 key. If unset,
                               it is read from the Keychain service below.
   SPARKLE_KEYCHAIN_SERVICE    Keychain service holding the Sparkle private key
-                              (default: Octo Sparkle Private Key)
+                              (default: https://sparkle-project.org)
+  SPARKLE_KEYCHAIN_ACCOUNT    Keychain account holding the Sparkle private key
+                              (default: octo-updates)
 
 Prerequisites:
   - A clean checkout of the default branch with the release version committed.
@@ -370,7 +373,7 @@ if [[ -n "${SPARKLE_PRIVATE_KEY_FILE:-}" ]]; then
   cp "$SPARKLE_PRIVATE_KEY_FILE" "$raw_sparkle_key"
 else
   security find-generic-password \
-    -a "${USER}" \
+    -a "${SPARKLE_KEYCHAIN_ACCOUNT:-$SPARKLE_KEYCHAIN_ACCOUNT_DEFAULT}" \
     -s "${SPARKLE_KEYCHAIN_SERVICE:-$SPARKLE_KEYCHAIN_SERVICE_DEFAULT}" \
     -w > "$raw_sparkle_key" || die "Sparkle private key is unavailable from the Keychain"
 fi
