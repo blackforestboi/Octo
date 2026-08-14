@@ -68,7 +68,10 @@ struct SubscriptionModelPickerView: View {
 			} message: { Text(errorMessage ?? "Unknown error") }
 		}
 		.frame(minWidth: 620, minHeight: 520)
-		.task { refresh() }
+		.task {
+			models = CLIRefinementClient.cachedModels(for: provider)
+			if models.isEmpty { refresh() }
+		}
 	}
 
 	private var title: String {
@@ -87,7 +90,7 @@ struct SubscriptionModelPickerView: View {
 		Task {
 			defer { isRefreshing = false }
 			do {
-				models = try await CLIRefinementClient.models(for: provider)
+				models = try await CLIRefinementClient.refreshModels(for: provider)
 			} catch is CancellationError {
 				return
 			} catch {

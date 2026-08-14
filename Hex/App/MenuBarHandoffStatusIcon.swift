@@ -338,9 +338,17 @@ final class MenuBarStatusItemController: NSObject, NSMenuDelegate {
 
 	private func prepareModels(for target: RefinementModelMenuTarget) {
 		let provider = target.provider(in: hexSettings)
-		guard loadedModelProviders[target] != provider, modelLoadTasks[target] == nil else { return }
+		guard modelLoadTasks[target] == nil else { return }
 		let cachedOptions = RefinementModelMenuLoader.live.cachedOptions(provider)
 		var state = modelStates[target] ?? RefinementModelMenuState(provider: provider)
+		if !cachedOptions.isEmpty {
+			state.beginLoading(provider: provider, cachedOptions: cachedOptions)
+			state.finishLoading(provider: provider, options: cachedOptions)
+			modelStates[target] = state
+			loadedModelProviders[target] = provider
+			return
+		}
+		guard loadedModelProviders[target] != provider else { return }
 		state.beginLoading(provider: provider, cachedOptions: cachedOptions)
 		modelStates[target] = state
 

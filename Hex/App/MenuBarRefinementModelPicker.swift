@@ -225,17 +225,48 @@ struct RefinementModelMenuLoader: Sendable {
 
 	static let live = Self(
 		cachedOptions: { provider in
-			guard provider == .openRouter else { return [] }
-			return OpenRouterModelCatalog.cachedModels()
-				.filter { $0.supportsInput(.text) }
-				.map {
+			switch provider {
+			case .openRouter:
+				return OpenRouterModelCatalog.cachedModels()
+					.filter { $0.supportsInput(.text) }
+					.map {
+						.init(
+							provider: .openRouter,
+							modelID: $0.id,
+							name: $0.name,
+							isEnabled: true
+						)
+					}
+			case .codexCLI:
+				let models = CLIRefinementClient.cachedModels(for: .codex)
+				guard !models.isEmpty else { return [] }
+				return [
 					.init(
-						provider: .openRouter,
+						provider: .codexCLI,
+						modelID: nil,
+						name: "Codex default",
+						isEnabled: true
+					),
+				] + models.map {
+					.init(
+						provider: .codexCLI,
 						modelID: $0.id,
 						name: $0.name,
 						isEnabled: true
 					)
 				}
+			case .claudeCLI:
+				return CLIRefinementClient.cachedModels(for: .claude).map {
+					.init(
+						provider: .claudeCLI,
+						modelID: $0.id == "default" ? nil : $0.id,
+						name: $0.name,
+						isEnabled: true
+					)
+				}
+			case .apple, .gemini, .openAI, .anthropic:
+				return []
+			}
 		},
 		loadOptions: { provider in
 			switch provider {

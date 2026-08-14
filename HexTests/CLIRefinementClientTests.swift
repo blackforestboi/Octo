@@ -18,6 +18,20 @@ final class CLIRefinementClientTests: XCTestCase {
 		}
 	}
 
+	private actor ModelRefreshStub {
+		private(set) var callCount = 0
+		let models: [CLIRefinementClient.Model]
+
+		init(models: [CLIRefinementClient.Model]) {
+			self.models = models
+		}
+
+		func refresh() -> [CLIRefinementClient.Model] {
+			callCount += 1
+			return models
+		}
+	}
+
 	func testCodexCommandUsesOneShotReadOnlyInvocation() throws {
 		let command = try CLIRefinementClient.command(
 			for: .codex,
@@ -83,6 +97,51 @@ final class CLIRefinementClientTests: XCTestCase {
 		XCTAssertTrue(codex.arguments.contains("model_reasoning_effort=\"high\""))
 		XCTAssertTrue(claude.arguments.contains("--effort"))
 		XCTAssertTrue(claude.arguments.contains("low"))
+	}
+
+	func testSubscriptionModelsReuseCachedCatalogWithoutRefreshing() async throws {
+		let cached = [CLIRefinementClient.Model(id: "gpt-cached", name: "Cached")]
+		let refresher = ModelRefreshStub(models: [.init(id: "gpt-live", name: "Live")])
+
+		let models = try await CLIRefinementClient.models(
+			cachedModels: cached,
+			refresh: refresher.refresh
+		)
+		let refreshCount = await refresher.callCount
+
+		XCTAssertEqual(models, cached)
+		XCTAssertEqual(refreshCount, 0)
+	}
+
+	func testSubscriptionModelsRefreshWhenNoCatalogIsCached() async throws {
+		let live = [CLIRefinementClient.Model(id: "gpt-live", name: "Live")]
+		let refresher = ModelRefreshStub(models: live)
+
+		let models = try await CLIRefinementClient.models(
+			cachedModels: [],
+			refresh: refresher.refresh
+		)
+		let refreshCount = await refresher.callCount
+
+		XCTAssertEqual(models, live)
+		XCTAssertEqual(refreshCount, 1)
+	}
+
+	func testCodexModelCatalogPersistsAcrossLaunches() throws {
+		let cacheURL = FileManager.default.temporaryDirectory
+			.appendingPathComponent("codex-models-\(UUID().uuidString).json")
+		defer { try? FileManager.default.removeItem(at: cacheURL) }
+		let models = [CLIRefinementClient.Model(id: "gpt-5.6-sol", name: "GPT-5.6-Sol")]
+
+		try CLIRefinementClient.saveCodexModels(models, at: cacheURL)
+
+		XCTAssertEqual(CLIRefinementClient.cachedCodexModels(at: cacheURL), models)
+	}
+
+	func testModelAvailabilityFailuresTriggerCatalogRecovery() {
+		XCTAssertTrue(CLIRefinementClient.isModelAvailabilityFailure("Selected model is unavailable."))
+		XCTAssertTrue(CLIRefinementClient.isModelAvailabilityFailure("Unknown model gpt-retired"))
+		XCTAssertFalse(CLIRefinementClient.isModelAvailabilityFailure("Rate limit exceeded"))
 	}
 
 	func testClaudeResultExtractsOnlyTheTerminalResultField() {
