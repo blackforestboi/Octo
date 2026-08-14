@@ -154,7 +154,7 @@ fi
 generate_appcast="$(pwd)/bin/generate_appcast"
 [[ -x "$generate_appcast" ]] || die "Sparkle generate_appcast is unavailable at $generate_appcast"
 
-repository="$(gh repo view --json nameWithOwner --jq .nameWithOwner)"
+repository="$(git remote get-url origin | sed -E 's#^(git@github\.com:|https://github\.com/)##; s#\.git$##')"
 [[ -n "$repository" ]] || die "Unable to identify the GitHub repository"
 
 work_directory="$(mktemp -d "${TMPDIR:-/tmp}/octo-release.XXXXXX")"
