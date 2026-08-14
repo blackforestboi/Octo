@@ -6,6 +6,23 @@
         <description>Updates for Octo</description>
         <language>en</language>
         <item>
+            <title>2026.8.112</title>
+            <pubDate>Sat, 15 Aug 2026 01:00:14 +0200</pubDate>
+            <sparkle:version>97</sparkle:version>
+            <sparkle:shortVersionString>2026.8.112</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <enclosure url="https://github.com/blackforestboi/Octo/releases/download/v2026.8.112/Octo-2026.8.112.dmg" length="9990092" type="application/octet-stream" sparkle:edSignature="Sf2OVsoY+JzNQFQj9cgc/yx414vt+ynriBEJ3OFZGX42uTVmjaoc1yk/Rj2C7e0yXE84JQnpAVhX9C3MwvrHDQ=="/>
+        </item>
+        <item>
+            <title>2026.8.111</title>
+            <pubDate>Tue, 11 Aug 2026 20:45:44 +0000</pubDate>
+            <sparkle:version>96</sparkle:version>
+            <sparkle:shortVersionString>2026.8.111</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <enclosure url="https://github.com/blackforestboi/Octo/releases/download/v2026.8.111/Octo-2026.8.111.dmg" length="8849678" type="application/octet-stream" sparkle:edSignature="G/rfQGMrGV8m3w5vqU3tsEZArEQB12iXNvwt9gqgzB1TJquOFyyqh4UxMSwrQu2d1wNrKuv4rAVU4LA2RxbXAg=="/>
+        </item>
+        <item>
             <title>2026.8.11</title>
             <pubDate>Tue, 11 Aug 2026 19:55:31 +0200</pubDate>
             <sparkle:version>95</sparkle:version>
