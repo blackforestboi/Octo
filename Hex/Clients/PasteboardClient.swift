@@ -113,7 +113,7 @@ final class PasteboardClientLive {
 
 	private static let selectedTextQueryTimeout: Float = 0.2
 
-	private struct FocusedSelection: @unchecked Sendable {
+	struct FocusedSelection: @unchecked Sendable {
 		let element: AXUIElement
 		let text: String
 	}
@@ -244,18 +244,68 @@ final class PasteboardClientLive {
 	private static func focusedSelection(processIdentifier: pid_t) -> FocusedSelection? {
 		guard !Task.isCancelled else { return nil }
 		let focusedApplication = AXUIElementCreateApplication(processIdentifier)
-		AXUIElementSetMessagingTimeout(focusedApplication, selectedTextQueryTimeout)
+		let systemWideElement = AXUIElementCreateSystemWide()
+		return firstFocusedSelection(
+			applicationFocusedElement: {
+				AXUIElementSetMessagingTimeout(focusedApplication, selectedTextQueryTimeout)
+				return focusedElement(on: focusedApplication)
+			},
+			systemWideFocusedElement: {
+				focusedElementUsingTemporaryGlobalTimeout(on: systemWideElement)
+			},
+			isValidSystemWideFocusedElement: { focusedElement in
+				AXUIElementSetMessagingTimeout(focusedElement, selectedTextQueryTimeout)
+				return ownerProcessIdentifier(of: focusedElement) == processIdentifier
+			},
+			selectionStartingAt: { focusedElement in
+				focusedSelection(startingAt: focusedElement)
+			}
+		)
+	}
 
+	static func firstFocusedSelection(
+		applicationFocusedElement: () -> AXUIElement?,
+		systemWideFocusedElement: () -> AXUIElement?,
+		isValidSystemWideFocusedElement: (AXUIElement) -> Bool,
+		selectionStartingAt: (AXUIElement) -> FocusedSelection?
+	) -> FocusedSelection? {
+		if let focusedElement = applicationFocusedElement() {
+			return selectionStartingAt(focusedElement)
+		}
+		guard !Task.isCancelled,
+			let focusedElement = systemWideFocusedElement(),
+			isValidSystemWideFocusedElement(focusedElement)
+		else { return nil }
+		return selectionStartingAt(focusedElement)
+	}
+
+	private static func ownerProcessIdentifier(of element: AXUIElement) -> pid_t? {
+		var processIdentifier: pid_t = 0
+		guard AXUIElementGetPid(element, &processIdentifier) == .success else { return nil }
+		return processIdentifier
+	}
+
+	private static func focusedElement(on rootElement: AXUIElement) -> AXUIElement? {
 		var focusedElementRef: CFTypeRef?
 		guard AXUIElementCopyAttributeValue(
-			focusedApplication,
+			rootElement,
 			kAXFocusedUIElementAttribute as CFString,
 			&focusedElementRef
 		) == .success,
 		let focusedElementRef
 		else { return nil }
-		let focusedElement = focusedElementRef as! AXUIElement
+		return focusedElementRef as! AXUIElement
+	}
 
+	private static func focusedElementUsingTemporaryGlobalTimeout(
+		on systemWideElement: AXUIElement
+	) -> AXUIElement? {
+		AXUIElementSetMessagingTimeout(systemWideElement, selectedTextQueryTimeout)
+		defer { AXUIElementSetMessagingTimeout(systemWideElement, 0) }
+		return focusedElement(on: systemWideElement)
+	}
+
+	private static func focusedSelection(startingAt focusedElement: AXUIElement) -> FocusedSelection? {
 		var candidate: AXUIElement? = focusedElement
 		for _ in 0..<12 {
 			guard !Task.isCancelled, let element = candidate else { break }

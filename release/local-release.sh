@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 
-# Builds and notarizes Octo locally, then publishes only the completed assets
-# and signed Sparkle feed. Nothing runs on GitHub except the Pages deployment
-# triggered by the committed appcast update.
+# Builds and notarizes Octo locally. Publishing is explicit, so a completed
+# local artifact can be tested before its tag, GitHub Release, and Sparkle feed
+# are created.
 
 set -euo pipefail
 
@@ -16,8 +16,10 @@ usage() {
 Usage:
   bun run release -- --local-build --tag v<version> --publish
   bun run release:local -- --tag v<version> --publish
+  bun run release:local -- --tag v<version> --local-only --install
 
-Build, notarize, staple, and publish an Octo release from this Mac.
+Build, notarize, staple, package, and optionally publish an Octo release from
+this Mac.
 
 Required:
   --local-build    Perform the archive, Developer ID signing, notarization,
@@ -26,6 +28,11 @@ Required:
   --publish         Required acknowledgement that this command will create/push
                     the tag, create or update a GitHub Release, and push the
                     signed Sparkle appcast commit to the default branch.
+  --local-only      Build, notarize, staple, package, and validate locally
+                    without creating a tag, GitHub Release, or appcast entry.
+                    ZIP and DMG artifacts remain in build/releases/<version>/.
+  --install         Replace /Applications/Octo.app with the notarized app from
+                    a --local-only build after all validations succeed.
 
 Optional environment:
   DEVELOPER_ID_IDENTITY       Codesigning identity SHA-1 hash. If omitted, the
@@ -40,7 +47,8 @@ Optional environment:
                               (default: octo-updates)
 
 Prerequisites:
-  - A clean checkout of the default branch with the release version committed.
+  - A clean checkout with the release version committed. --publish additionally
+    requires the default branch.
   - A valid Developer ID Application identity for team 5YUPQC9D96.
   - A validated notarytool Keychain profile.
   - GitHub CLI authentication with repository write access.
@@ -78,6 +86,8 @@ PYTHON
 tag=""
 publish=false
 local_build=false
+local_only=false
+install=false
 
 while (($#)); do
   case "$1" in
@@ -94,6 +104,14 @@ while (($#)); do
       publish=true
       shift
       ;;
+    --local-only)
+      local_only=true
+      shift
+      ;;
+    --install)
+      install=true
+      shift
+      ;;
     --help|-h)
       usage
       exit 0
@@ -106,11 +124,18 @@ done
 
 [[ "$local_build" == true ]] || die "This release entrypoint requires --local-build so packaging and notarization happen locally"
 [[ "$tag" =~ ^v[0-9]+(\.[0-9]+)+$ ]] || die "--tag must look like v2026.7.311"
-[[ "$publish" == true ]] || die "Refusing to publish without --publish"
+[[ "$publish" != "$local_only" ]] || die "Choose exactly one of --publish or --local-only"
+[[ "$install" == false || "$local_only" == true ]] || die "--install requires --local-only"
 
-for command in xcodebuild xcrun codesign ditto hdiutil gh git curl python3 security lipo plutil shasum; do
+for command in xcodebuild xcrun codesign ditto hdiutil git curl python3 security lipo plutil shasum; do
   require_command "$command"
 done
+if [[ "$publish" == true ]]; then
+  require_command gh
+fi
+if [[ "$install" == true ]]; then
+  require_command osascript
+fi
 
 working_tree_status="$(git status --porcelain --untracked-files=all)"
 [[ -z "$working_tree_status" ]] || die "Working tree is not clean; commit or remove all changes before releasing"
@@ -118,7 +143,9 @@ working_tree_status="$(git status --porcelain --untracked-files=all)"
 default_branch="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@')"
 [[ -n "$default_branch" ]] || default_branch="main"
 current_branch="$(git branch --show-current)"
-[[ "$current_branch" == "$default_branch" ]] || die "Run from the default branch ($default_branch), not $current_branch"
+if [[ "$publish" == true ]]; then
+  [[ "$current_branch" == "$default_branch" ]] || die "Run from the default branch ($default_branch), not $current_branch"
+fi
 
 version="${tag#v}"
 source_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Hex/Info.plist)"
@@ -154,11 +181,13 @@ else
   xcrun notarytool history --keychain-profile "$notary_profile" >/dev/null 2>&1 || die "Notarytool Keychain profile '$notary_profile' is unavailable"
 fi
 
-generate_appcast="$(pwd)/bin/generate_appcast"
-[[ -x "$generate_appcast" ]] || die "Sparkle generate_appcast is unavailable at $generate_appcast"
+if [[ "$publish" == true ]]; then
+  generate_appcast="$(pwd)/bin/generate_appcast"
+  [[ -x "$generate_appcast" ]] || die "Sparkle generate_appcast is unavailable at $generate_appcast"
 
-repository="$(git remote get-url origin | sed -E 's#^(git@github\.com:|https://github\.com/)##; s#\.git$##')"
-[[ -n "$repository" ]] || die "Unable to identify the GitHub repository"
+  repository="$(git remote get-url origin | sed -E 's#^(git@github\.com:|https://github\.com/)##; s#\.git$##')"
+  [[ -n "$repository" ]] || die "Unable to identify the GitHub repository"
+fi
 
 work_directory="$(mktemp -d "${TMPDIR:-/tmp}/octo-release.XXXXXX")"
 cleanup() {
@@ -182,16 +211,20 @@ fi
 
 if [[ -n "$latest_published_build" ]]; then
   if [[ "$tag_exists" == false && "$source_build" -le "$latest_published_build" ]]; then
-    next_build=$((latest_published_build + 1))
-    /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $next_build" Hex/Info.plist
-    sed -E -i '' "s/^([[:space:]]*)CURRENT_PROJECT_VERSION = [0-9]+;/\1CURRENT_PROJECT_VERSION = $next_build;/" Hex.xcodeproj/project.pbxproj
-    source_build="$next_build"
-    project_builds="$(sed -nE 's/^[[:space:]]*CURRENT_PROJECT_VERSION = ([0-9]+);/\1/p' Hex.xcodeproj/project.pbxproj | sort -u)"
-    [[ "$project_builds" == "$source_build" ]] || die "Failed to update all project build settings to $source_build"
-    git add Hex/Info.plist Hex.xcodeproj/project.pbxproj
-    git commit -m "chore(release): increment build number to $source_build"
-    git push origin "HEAD:$default_branch"
-    printf 'Incremented release build number to %s\n' "$source_build"
+    if [[ "$local_only" == true ]]; then
+      die "Build $source_build is not newer than the published Sparkle build $latest_published_build; prepare the release metadata first"
+    else
+      next_build=$((latest_published_build + 1))
+      /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $next_build" Hex/Info.plist
+      sed -E -i '' "s/^([[:space:]]*)CURRENT_PROJECT_VERSION = [0-9]+;/\1CURRENT_PROJECT_VERSION = $next_build;/" Hex.xcodeproj/project.pbxproj
+      source_build="$next_build"
+      project_builds="$(sed -nE 's/^[[:space:]]*CURRENT_PROJECT_VERSION = ([0-9]+);/\1/p' Hex.xcodeproj/project.pbxproj | sort -u)"
+      [[ "$project_builds" == "$source_build" ]] || die "Failed to update all project build settings to $source_build"
+      git add Hex/Info.plist Hex.xcodeproj/project.pbxproj
+      git commit -m "chore(release): increment build number to $source_build"
+      git push origin "HEAD:$default_branch"
+      printf 'Incremented release build number to %s\n' "$source_build"
+    fi
   fi
 
   if [[ "$tag_exists" == true ]]; then
@@ -352,6 +385,31 @@ spctl --assess --type execute --verbose=4 "$app_path"
 # DMGs are notarized containers, not executable code. `spctl --type open` reports
 # "no usable signature" for a valid stapled DMG; stapler validation above is the
 # authoritative validation for the disk image, while Gatekeeper assesses the app.
+
+if [[ "$local_only" == true ]]; then
+  if [[ "$install" == true ]]; then
+    install_path="/Applications/Octo.app"
+    [[ -d /Applications ]] || die "/Applications is unavailable"
+    if [[ -e "$install_path" && ! -O "$install_path" ]]; then
+      die "$install_path is not owned by $USER; replace it once with administrator privileges, then rerun this command"
+    fi
+
+    osascript -e 'tell application id "io.github.blackforestboi.Octo" to quit' >/dev/null 2>&1 || true
+    previous_app_path=""
+    if [[ -e "$install_path" ]]; then
+      previous_app_path="$work_directory/Previous Octo.app"
+      mv "$install_path" "$previous_app_path"
+    fi
+    if ! ditto "$app_path" "$install_path"; then
+      [[ -n "$previous_app_path" && -e "$previous_app_path" ]] && mv "$previous_app_path" "$install_path"
+      die "Could not install the notarized app; the previous app was restored"
+    fi
+  fi
+
+  printf '\nLocal release complete (not published):\n  ZIP: %s\n  DMG: %s\n  Installed app: %s\n' \
+    "$zip_path" "$dmg_path" "${install_path:-not requested}"
+  exit 0
+fi
 
 if [[ "$tag_exists" == false ]]; then
   git tag -a "$tag" -m "Release $tag"

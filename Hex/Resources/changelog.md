@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026.8.113
+
+### Patch Changes
+
+- Restore selected-text refinement when app-scoped focus lookup fails
+
 ## 2026.8.112
 
 ### Patch Changes
