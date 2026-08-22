@@ -1,0 +1,27 @@
+name: Publish staged release assets
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/publish-release-blobs-v2026.8.113
+      - name: Reassemble and upload the notarized artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p .release-assets
+          cat .release-chunks/zip.* > .release-assets/Octo-2026.8.113.zip
+          cat .release-chunks/dmg.* > .release-assets/Octo-2026.8.113.dmg
+          echo "867a05b5744c7f6145dca1e9c7aa9f910f09bfcd0450db181ff9433b9be2a44f  .release-assets/Octo-2026.8.113.zip" | sha256sum --check
+          echo "c137d8d84c71b9e4bb12d6126a4f94b47dbb9e06a9a6398b16cfedef74abaeb3  .release-assets/Octo-2026.8.113.dmg" | sha256sum --check
+          gh release upload v2026.8.113 --repo "$GITHUB_REPOSITORY" --clobber \
+            .release-assets/Octo-2026.8.113.zip \
+            .release-assets/Octo-2026.8.113.dmg
